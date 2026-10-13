@@ -39,7 +39,7 @@ jobs:
           Invoke-WebRequest $asset.browser_download_url -OutFile mpv.7z
           7z e mpv.7z mpv.exe -osrc-tauri/mpv -y
 
-      # 含 bundled_config_loads：在真 Windows 上验证自带 mpv 配置 / ModernZ 能加载（含中文空格路径、配置零报错）
+      # 含 bundled_config_loads：在真 Windows 上验证自带 mpv 配置 / ModernZ 能加载（含中文空格路径、配置零报错（d3d11-adapter 在无 N 卡机器上的报错除外））
       - run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: mpv 实际渲染截图（ModernZ、选集菜单；无显卡时走 WARP）
@@ -50,7 +50,7 @@ jobs:
           $env:SHOT_DIR = Join-Path $PWD 'smoke'; New-Item -ItemType Directory -Force $env:SHOT_DIR | Out-Null
           $p = Start-Process -FilePath "$PWD\src-tauri\mpv\mpv.exe" -PassThru -ArgumentList @(
             "--config-dir=$PWD\src-tauri\mpv", "--script=$PWD\tools\mpv-shot.lua", '--force-window=yes', '--ao=null',
-            "--log-file=$env:SHOT_DIR\mpv-render.log", '--force-media-title=浴血黑帮 S01E01 测试', 'av://lavfi:testsrc2=duration=60:size=1920x1080')
+            "--log-file=$env:SHOT_DIR\mpv-render.log", '--force-media-title="浴血黑帮 S01E01 测试"', 'av://lavfi:testsrc2=duration=60:size=1920x1080')
           if (-not $p.WaitForExit(60000)) { Stop-Process $p.Id; Write-Host 'mpv 60 秒没退出（截图脚本没跑完），已结束' }
           else { Write-Host "mpv 退出码 $($p.ExitCode)" }
           Select-String -Path "$env:SHOT_DIR\mpv-render.log" -Pattern '\]\[e\]\[|d3d11|Using hardware|VO:' | ForEach-Object Line

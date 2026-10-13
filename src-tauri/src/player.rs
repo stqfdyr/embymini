@@ -1475,7 +1475,7 @@ mod tests {
     }
 
     /// 安装后的真实路径链：资源目录（Windows 上带 `\\?\`）→ bundled_dir → mpv 读到自带配置、加载 ModernZ、
-    /// 不加载自带 OSC、配置没有报错。另测一次装在「中文 + 空格」目录下（中文用户名时 %LOCALAPPDATA% 就是这样）。
+    /// 不加载自带 OSC、配置没有报错（d3d11-adapter 在没有 N 卡的机器上必报错，除外）。另测一次装在「中文 + 空格」目录下（中文用户名时 %LOCALAPPDATA% 就是这样）。
     #[test]
     #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
     fn bundled_config_loads() {
@@ -1505,8 +1505,14 @@ mod tests {
                 "自带配置没生效：{got:?}"
             );
             if cfg!(windows) {
-                // Linux 的 mpv 没有 d3d11-adapter 选项会报一行错，只在 Windows 上要求零错误
-                assert!(got.errors.is_empty(), "mpv 报错：{:#?}", got.errors);
+                // d3d11-adapter=NVIDIA 在没有 N 卡的机器上（CI）必报错，取决于机器而不是配置写错，放过；
+                // Linux 的 mpv 没有这个选项，所以只在 Windows 上要求其余零错误
+                let errors: Vec<_> = got
+                    .errors
+                    .iter()
+                    .filter(|l| !l.contains("d3d11-adapter") && !l.contains("No adapter matching"))
+                    .collect();
+                assert!(errors.is_empty(), "mpv 报错：{errors:#?}");
             }
         };
         // 和 Tauri 一样用 canonicalize 得到资源目录（Windows 上会带 \\?\ 前缀）

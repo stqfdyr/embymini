@@ -1,6 +1,6 @@
 [package]
 name = "embymini"
-version = "0.2.0"
+version = "0.2.1"
 description = "Emby 桌面客户端：浏览 + mpv 播放"
 edition = "2024"
 rust-version = "1.90"

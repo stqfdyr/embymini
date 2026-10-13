@@ -4,6 +4,7 @@
   import { Check, LogIn, Pencil, Plus, Trash2 } from '@lucide/svelte'
   import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
+  import { ask } from '../lib/Dialog.svelte'
 
   const blank = { url: '', port: '', user: '', password: '' }
   let form = $state({ ...blank })
@@ -69,7 +70,8 @@
     }, '已重新登录')
   }
   const use = (id: string) => run(() => invoke('server_use', { id }).then(() => go('/')))
-  const remove = (id: string, name: string) => confirm(`删除服务器「${name}」？`) && run(() => invoke('server_remove', { id }))
+  const remove = async (id: string, name: string) =>
+    (await ask('删除服务器', `删除「${name}」？登录信息会一起删掉。`, '删除', true)) && run(() => invoke('server_remove', { id }))
   /** 界面实际用的 GPU（WebView2 底下是 Chromium，ANGLE 渲染器名里带显卡型号），方便确认是不是在用显卡加速。 */
   function gpu() {
     try {

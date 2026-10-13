@@ -4,20 +4,18 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { Check, Heart, Link, Play, RotateCcw, User } from '@lucide/svelte'
   import Dropdown from '../lib/Dropdown.svelte'
+  import Episode from '../lib/Episode.svelte'
   import MediaInfo from '../lib/MediaInfo.svelte'
   import Poster from '../lib/Poster.svelte'
   import Row from '../lib/Row.svelte'
-  import Wide from '../lib/Wide.svelte'
-  import { DETAIL_FIELDS, LIST_FIELDS, errText, get, img, itemDetail, itemMenu, loader, peek, play, session, setFavorite, setPlayed, uid } from '../lib/api.svelte'
+  import { DETAIL_FIELDS, EP_FIELDS, LIST_FIELDS, errText, get, img, itemDetail, loader, peek, play, session, setFavorite, setPlayed, uid } from '../lib/api.svelte'
   import { fade } from '../lib/fade'
   import { clock, date, minutes, rating, techLine } from '../lib/fmt'
-  import { openMenu } from '../lib/menu.svelte'
   import { restoreScrollWhen } from '../lib/router.svelte'
   import type { Item, Page } from '../lib/types'
 
   let { id }: { id: string } = $props()
 
-  const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'
   const ROLE: Record<string, string> = { Actor: '演员', Director: '导演', Writer: '编剧', Producer: '制片', GuestStar: '客串', Composer: '作曲' }
 
   /** 列表里已有的条目：从单集进来就看它所属的剧集。 */
@@ -164,7 +162,7 @@
     {#if loaded}
       {@const d = loaded}
       {#if d.item.Type === 'Series'}
-        <Row count={eps.length || undefined}>
+        <Row count={eps.length || undefined} href={eps.length && seasonId ? `#/season/${d.item.Id}/${seasonId}` : undefined}>
           {#snippet head()}
             {#if d.seasons.length > 1}
               <Dropdown big value={seasonId} items={d.seasons.map((s) => ({ value: s.Id, label: s.Name, hint: s.UserData?.UnplayedItemCount ? `${s.UserData.UnplayedItemCount} 集未看` : '' }))} onselect={(v) => (pickedSeason = v)} />
@@ -173,19 +171,7 @@
             {/if}
           {/snippet}
           {#each eps as ep (ep.Id)}
-            <Wide
-              src={img(ep.Id, 'Primary', ep.ImageTags?.Primary, 288) || bd}
-              title={`${ep.IndexNumber ?? ''}. ${ep.Name}`}
-              desc={ep.Overview ?? ''}
-              score={rating(ep.CommunityRating)}
-              time={ep.UserData?.PlaybackPositionTicks ? `${clock(ep.UserData.PlaybackPositionTicks)} / ${clock(ep.RunTimeTicks)}` : ''}
-              played={ep.UserData?.Played}
-              progress={ep.UserData?.PlayedPercentage ?? 0}
-              selected={ep.Id === t?.Id}
-              onplay={() => play(ep.Id)}
-              onmenu={(e) => openMenu(e, itemMenu(ep))}
-              width={288}
-            />
+            <Episode {ep} fallback={bd} selected={ep.Id === t?.Id} />
           {:else}
             {#if epsLoading}{#each { length: 5 } as _, k (k)}<div class="skeleton ep"></div>{/each}{:else if epsError}<span class="muted">单集加载失败：{epsError}（按 F5 重试）</span>{:else}<span class="muted">这一季还没有剧集</span>{/if}
           {/each}
@@ -195,13 +181,13 @@
       {#if d.item.People?.length}
         <Row title="演职人员">
           {#each d.item.People as p (p.Id + p.Type)}
-            <div class="person">
+            <a class="person" href={`#/person/${p.Id}`} title={p.Name}>
               <div class="face ph">
                 {#if p.PrimaryImageTag}<img src={img(p.Id, 'Primary', p.PrimaryImageTag, 96)} alt="" loading="lazy" use:fade />{:else}<User size={32} />{/if}
               </div>
               <div class="pn clamp-1">{p.Name}</div>
               <div class="pr clamp-1">{p.Role || ROLE[p.Type] || p.Type}</div>
-            </div>
+            </a>
           {/each}
         </Row>
       {/if}
@@ -289,7 +275,8 @@
   .ov { margin: 8px 0 0; font-size: 14px; line-height: 1.7; max-width: 1100px; }
   .ov.clamp-3 { cursor: default; }
   .skeleton.ep { width: 288px; aspect-ratio: 16 / 9; }
-  .person { width: 96px; font-size: 12px; line-height: 1.45; }
+  .person { display: block; width: 96px; font-size: 12px; line-height: 1.45; }
+  .person:hover .pn { color: var(--accent); }
   .face { width: 96px; height: 96px; border-radius: 50%; overflow: hidden; display: grid; place-items: center; color: var(--text-3); margin-bottom: 8px; }
   .face img { width: 100%; height: 100%; object-fit: cover; }
   .pn { font-weight: 500; text-align: center; }

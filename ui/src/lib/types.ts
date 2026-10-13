@@ -65,6 +65,8 @@ export interface Item {
   ProductionYear?: number
   PremiereDate?: string
   EndDate?: string | null
+  /** 人物：出生地。 */
+  ProductionLocations?: string[]
   Status?: string
   CommunityRating?: number | null
   OfficialRating?: string | null

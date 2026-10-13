@@ -4,7 +4,7 @@
   import LibraryRow from '../lib/LibraryRow.svelte'
   import Row from '../lib/Row.svelte'
   import Wide from '../lib/Wide.svelte'
-  import { LIST_FIELDS, errText, get, img, itemMenu, loader, play, prefetch, session, uid, wideImg } from '../lib/api.svelte'
+  import { LIST_FIELDS, errText, get, img, loader, play, prefetch, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
   import { openMenu } from '../lib/menu.svelte'
   import { clock, episodeLabel } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
@@ -49,7 +49,7 @@
           progress={it.UserData?.PlayedPercentage ?? 0}
           time={`${clock(it.UserData?.PlaybackPositionTicks)} / ${clock(it.RunTimeTicks)}`}
           onplay={() => play(it.Id)}
-          onmenu={(e) => openMenu(e, itemMenu(it))}
+          onmenu={(e) => openMenu(e, resumeMenu(it))}
           onhover={() => prefetch(it.SeriesId ?? it.Id)}
           href={`#/item/${it.SeriesId ?? it.Id}`}
           width={300}

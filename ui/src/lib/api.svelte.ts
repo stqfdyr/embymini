@@ -1,8 +1,9 @@
 // 前端唯一的数据入口：invoke 封装 + GET 会话内缓存 + 图片地址。token 永远留在 Rust 里。
+import { untrack } from 'svelte'
 import { invoke } from '@tauri-apps/api/core'
-import { Check, Circle, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
+import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
 import type { MenuItem } from './menu.svelte'
-import type { Item } from './types'
+import type { Item, Page } from './types'
 
 export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; loggedIn: boolean }
 export type ConfigView = { active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string }
@@ -14,17 +15,21 @@ export const errText = (e: unknown) => String((e as { message?: unknown } | null
 /** 列表卡片要的字段；详情另加 People / MediaSources 等重字段。 */
 export const LIST_FIELDS = 'ProductionYear,EndDate,CommunityRating,UserData,PrimaryImageAspectRatio,RunTimeTicks,Overview,Genres,OfficialRating'
 export const DETAIL_FIELDS = `${LIST_FIELDS},People,ExternalUrls,ProviderIds,MediaSources,Studios,PremiereDate,Status`
+/** 单集卡要的字段。 */
+export const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'
 
-/** 右下角提示（播放失败等），8 秒后自动消失。 */
-export const toasts = $state<{ id: number; text: string }[]>([])
+/** 右下角提示（播放失败等），8 秒后自动消失，点一下也会消失；可带一个按钮（如「撤销」）。 */
+export type Toast = { id: number; text: string; action?: { label: string; run: () => unknown } }
+export const toasts = $state<Toast[]>([])
 let toastSeq = 0
-export function notify(text: string) {
+export function dismiss(id: number) {
+  const i = toasts.findIndex((t) => t.id === id)
+  if (i >= 0) toasts.splice(i, 1)
+}
+export function notify(text: string, action?: Toast['action']) {
   const id = ++toastSeq
-  toasts.push({ id, text })
-  setTimeout(() => {
-    const i = toasts.findIndex((t) => t.id === id)
-    if (i >= 0) toasts.splice(i, 1)
-  }, 8000)
+  toasts.push({ id, text, action })
+  setTimeout(() => dismiss(id), 8000)
 }
 
 /** refresh：手动刷新（顶栏按钮、F5）；quiet：后台刷新（播放结束、收藏或已看变化后），页面原地更新，不闪不跳。 */
@@ -121,9 +126,9 @@ export function prefetch(id: string) {
 }
 export const cancelPrefetch = () => clearTimeout(hoverTimer)
 
-export function send(method: 'POST' | 'DELETE', path: string, body?: unknown) {
+export function send(method: 'POST' | 'DELETE', path: string, query?: Record<string, unknown>) {
   cache.clear()
-  return call<unknown>(method, path, undefined, body)
+  return call<unknown>(method, path, query)
 }
 
 /** 收藏 / 已看：成功后后台刷新；失败（上游 502 之类）弹提示，不能点了没反应。 */
@@ -131,6 +136,18 @@ const mark = (kind: 'FavoriteItems' | 'PlayedItems', what: string) => (id: strin
   send(on ? 'POST' : 'DELETE', `/Users/${uid()}/${kind}/${id}`).then(refreshQuiet, (e) => notify(`${what}失败：${errText(e)}`))
 export const setFavorite = mark('FavoriteItems', '收藏')
 export const setPlayed = mark('PlayedItems', '标记已看')
+/** 从「继续观看」移除（服务端 HideFromResume，进度保留），提示条里可撤销。 */
+function hideResume(it: Item, hide = true): Promise<unknown> {
+  return send('POST', `/Users/${uid()}/Items/${it.Id}/HideFromResume`, { Hide: hide }).then(
+    () => {
+      refreshQuiet()
+      if (hide) notify(`已从继续观看中移除「${it.SeriesName ?? it.Name}」`, { label: '撤销', run: () => hideResume(it, false) })
+    },
+    (e) => notify(`${hide ? '移除' : '撤销'}失败：${errText(e)}`),
+  )
+}
+export const resumeMenu = (it: Item): MenuItem[] => [...itemMenu(it), 'sep', { label: '从继续观看中移除', icon: EyeOff, action: () => hideResume(it) }]
+
 /** 起播。出错（服务器拒绝、找不到 mpv 等）直接弹提示；加载失败由播放事件 failed 另行提示。 */
 export const play = (itemId: string, fromStart = false) =>
   invoke('play', { itemId, fromStart }).catch((e: ApiError) => {
@@ -154,6 +171,41 @@ export function itemMenu(it: Item, open?: () => void): MenuItem[] {
   const fav = it.UserData?.IsFavorite
   items.push({ label: fav ? '取消收藏' : '收藏', icon: fav ? HeartOff : Heart, action: () => setFavorite(it.Id, !fav) })
   return items
+}
+
+/**
+ * 分页列表（媒体库、人物作品）：`more()` 取下一页（网格滚到底时调用）。
+ * `query()` 里读到的响应式值（排序、筛选、id）或手动刷新变了，就从第一页重来；旧请求晚到的结果按代次丢弃。
+ * 只能在组件初始化时调用。
+ */
+export function pager(query: () => Record<string, unknown>, size = 60) {
+  const s = $state({ items: [] as Item[], total: 0, busy: false, error: '', loaded: false })
+  let gen = 0
+  let q: Record<string, unknown> = {}
+  async function more() {
+    if (s.busy || (s.loaded && s.items.length >= s.total)) return
+    s.busy = true
+    const mine = gen
+    try {
+      const p = await get<Page>(`/Users/${uid()}/Items`, { ...q, StartIndex: s.items.length, Limit: size })
+      if (mine !== gen) return
+      s.items.push(...p.Items)
+      s.total = p.TotalRecordCount
+      s.loaded = true
+    } catch (e) {
+      if (mine === gen) s.error = errText(e)
+    } finally {
+      if (mine === gen) s.busy = false
+    }
+  }
+  $effect(() => {
+    void session.refresh
+    q = query()
+    gen++
+    Object.assign(s, { items: [], total: 0, busy: false, error: '', loaded: false })
+    untrack(more)
+  })
+  return { s, more }
 }
 
 /** 图片地址：带 tag 的 URL 不会变，上游给 1 年缓存，交给 WebView 的 HTTP 缓存。没有 tag 返回空串。 */

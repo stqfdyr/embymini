@@ -408,7 +408,9 @@ pub async fn start(
     ] {
         cmd.env_remove(k);
     }
-    cmd.args(&args)
+    // 起播途中放弃（程序退出、出错）时丢掉 Child 就杀掉 mpv，不留空窗口
+    cmd.kill_on_drop(true)
+        .args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

@@ -1,14 +1,14 @@
-<!-- 横版卡（16:9）：继续观看、单集、媒体库共用。点图片 onplay（悬停出播放键），点文字 href。 -->
+<!-- 横版卡（16:9）：继续观看、单集、媒体库共用。点图片 onplay（悬停出播放键），点文字 href，点简介 ondesc。 -->
 <script lang="ts">
   import { Check, Play } from '@lucide/svelte'
   import { fade } from './fade'
 
   let {
-    src, title, sub = '', desc = '', href, onplay, onmenu, onhover, progress = 0, time = '', played = false, score = '',
+    src, title, sub = '', desc = '', href, onplay, onmenu, onhover, ondesc, progress = 0, time = '', played = false, score = '',
     selected = false, width = 300,
   }: {
     src: string; title: string; sub?: string; desc?: string; href?: string; onplay?: () => void
-    onmenu?: (e: MouseEvent) => void; onhover?: () => void
+    onmenu?: (e: MouseEvent) => void; onhover?: () => void; ondesc?: () => void
     progress?: number; time?: string; played?: boolean; score?: string; selected?: boolean; width?: number
   } = $props()
 </script>
@@ -30,8 +30,9 @@
   <a class="text" href={href}>
     <div class="name clamp-1">{title}</div>
     {#if sub}<div class="sub clamp-1">{sub}</div>{/if}
-    {#if desc}<div class="desc clamp-3">{desc}</div>{/if}
   </a>
+  {#if desc && ondesc}<button class="desc clamp-3" title="查看完整简介" onclick={ondesc}>{desc}</button>
+  {:else if desc}<div class="desc clamp-3">{desc}</div>{/if}
 </div>
 
 <style>
@@ -66,5 +67,6 @@
   .text { display: block; padding: 8px 2px 0; }
   .name { font-size: 13px; font-weight: 500; }
   .sub { font-size: 12px; color: var(--text-2); margin-top: 1px; }
-  .desc { font-size: 12px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
+  .desc { display: block; width: 100%; padding: 0 2px; text-align: left; font-size: 12px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
+  button.desc:hover { color: var(--text); }
 </style>

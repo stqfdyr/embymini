@@ -5,14 +5,17 @@
   import { getCurrentWindow } from '@tauri-apps/api/window'
   import { ChevronLeft, Copy, Minus, RefreshCw, Settings as Gear, Square, X } from '@lucide/svelte'
   import ContextMenu from './lib/ContextMenu.svelte'
+  import Dialog from './lib/Dialog.svelte'
   import Dropdown from './lib/Dropdown.svelte'
-  import { errText, loadConfig, notify, refresh, refreshQuiet, session, setUnauthorizedHandler, toasts } from './lib/api.svelte'
+  import { dismiss, errText, loadConfig, notify, refresh, refreshQuiet, session, setUnauthorizedHandler, toasts } from './lib/api.svelte'
   import { back, go, route } from './lib/router.svelte'
   import Favorites from './routes/Favorites.svelte'
   import Home from './routes/Home.svelte'
   import Item from './routes/Item.svelte'
   import Library from './routes/Library.svelte'
+  import Person from './routes/Person.svelte'
   import Search from './routes/Search.svelte'
+  import Season from './routes/Season.svelte'
   import Settings from './routes/Settings.svelte'
 
   const TABS = [['home', '/', '媒体'], ['search', '/search', '搜索'], ['favorites', '/favorites', '收藏']] as const
@@ -99,9 +102,16 @@
 </header>
 
 <ContextMenu />
+<Dialog />
 
 <div class="toasts">
-  {#each toasts as t (t.id)}<div class="toast flyout">{t.text}</div>{/each}
+  {#each toasts as t (t.id)}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="toast flyout" title="点击关闭" onclick={() => dismiss(t.id)}>
+      <span>{t.text}</span>
+      {#if t.action}{@const a = t.action}<button class="btn" onclick={(e) => (e.stopPropagation(), dismiss(t.id), a.run())}>{a.label}</button>{/if}
+    </div>
+  {/each}
 </div>
 
 <main>
@@ -113,6 +123,10 @@
     {#key session.server.id}
       {#if route.name === 'item'}
         {#key route.id}<Item id={route.id} />{/key}
+      {:else if route.name === 'person'}
+        {#key route.id}<Person id={route.id} />{/key}
+      {:else if route.name === 'season'}
+        {#key route.hash}<Season seriesId={route.id} seasonId={route.sub} />{/key}
       {:else if route.name === 'library'}
         {#key route.id}<Library id={route.id} />{/key}
       {:else if route.name === 'search'}
@@ -152,5 +166,7 @@
   .win .close:hover { background: #c42b1c; color: #fff; }
   .win .close:active { background: #b22a1d; color: #fff; }
   .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 40; display: flex; flex-direction: column; gap: 10px; max-width: 420px; }
-  .toast { padding: 12px 16px; line-height: 1.5; }
+  .toast { display: flex; align-items: center; gap: 12px; padding: 12px 16px; line-height: 1.5; }
+  .toast span { flex: 1; }
+  .toast .btn { flex: none; color: var(--accent); }
 </style>

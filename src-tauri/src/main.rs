@@ -11,12 +11,12 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_log::{Target, TargetKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 struct App {
     path: PathBuf,
@@ -29,6 +29,26 @@ struct App {
     player: Mutex<Option<Player>>,
     /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
     play_seq: AtomicU64,
+    /// 程序要退出了：起播中的 `play` 收到后放弃起播（见 [`App::unless_quit`]）。
+    quit: watch::Sender<bool>,
+    /// 还没返回的 `play` 个数（[`Starting`]），退出时等它们收尾。
+    starting: AtomicUsize,
+}
+
+/// 进入 `play` 时加一、离开时减一。
+struct Starting<'a>(&'a AtomicUsize);
+
+impl<'a> Starting<'a> {
+    fn enter(n: &'a AtomicUsize) -> Self {
+        n.fetch_add(1, Ordering::SeqCst);
+        Self(n)
+    }
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// 正在进行的一次播放：发控制命令的通道 + 转发播放事件的任务（会话结束后才结束）。
@@ -59,17 +79,35 @@ impl App {
         Some(p.task)
     }
 
+    /// 起播要等几秒（取 PlaybackInfo、连 IPC），这期间 mpv 窗口已经开着。程序退出时丢掉起播的 future，
+    /// mpv 随 `Child` 一起被杀（`kill_on_drop`），不留一个没人管的空窗口。
+    async fn unless_quit<F: Future>(&self, f: F) -> Option<F::Output> {
+        let mut quit = self.quit.subscribe();
+        tokio::select! {
+            biased; // 已经在退出时，即使 f 也就绪了也放弃
+            _ = quit.wait_for(|q| *q) => None,
+            r = f => Some(r),
+        }
+    }
+
     /// 程序退出前调用：mpv 是独立进程，不会跟着 EmbyMini 退出，而回传进度的任务会随进程消失，
-    /// 续播点就丢了。所以先让 mpv 退出、回传 Stopped，最多等 `wait`。
+    /// 续播点就丢了。所以先叫停起播中的 `play` 并等它们返回（否则可能刚起播完又登记一个播放器），
+    /// 再让正在播的 mpv 退出、回传 Stopped。总共最多等 `wait`。
     fn shutdown(&self, wait: Duration) {
-        if let Some(task) = self.stop_player() {
-            log::info!("程序退出，先关闭播放器并回传进度");
-            tauri::async_runtime::block_on(async {
-                if tokio::time::timeout(wait, task).await.is_err() {
+        self.quit.send_replace(true);
+        tauri::async_runtime::block_on(async {
+            let deadline = tokio::time::Instant::now() + wait;
+            while self.starting.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if let Some(task) = self.stop_player() {
+                log::info!("程序退出，先关闭播放器并回传进度");
+                if tokio::time::timeout_at(deadline, task).await.is_err() {
                     log::warn!("关闭播放器超时（{wait:?}），进度可能没回传");
                 }
-            });
-        }
+            }
+        });
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, Error> {
@@ -310,6 +348,7 @@ async fn play(
     item_id: String,
     from_start: bool,
 ) -> Result<(), Error> {
+    let _starting = Starting::enter(&app.starting);
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = app.stop_player(); // 换片：旧的 mpv 自己退出、回传，不用等
@@ -326,7 +365,18 @@ async fn play(
         user_conf: Some(app.user_mpv_conf()),
         extra_args: Vec::new(),
     };
-    let session = player::start(client, &item_id, from_start, opts).await?;
+    let Some(session) = app
+        .unless_quit(player::start(client, &item_id, from_start, opts))
+        .await
+    else {
+        log::info!("程序退出，放弃起播：{item_id}");
+        return Ok(());
+    };
+    let session = session?;
+    if *app.quit.borrow() {
+        session.abort().await;
+        return Ok(());
+    }
     if app.play_seq.load(Ordering::SeqCst) != seq {
         log::info!("起播期间又点了别的，作废这一次：{item_id}");
         session.abort().await;
@@ -424,6 +474,8 @@ fn main() {
                 mpv_cache,
                 player: Mutex::new(None),
                 play_seq: AtomicU64::new(0),
+                quit: watch::Sender::new(false),
+                starting: AtomicUsize::new(0),
             });
             Ok(())
         })
@@ -460,18 +512,46 @@ mod tests {
         assert_eq!(clean_path("  "), "");
     }
 
-    /// 退出时要等播放任务收尾（回传 Stopped），但不能无限等。
-    #[test]
-    fn shutdown_waits_for_player_then_gives_up() {
-        let app = |task, ctl| App {
+    fn test_app(player: Option<Player>) -> App {
+        App {
             path: PathBuf::new(),
             cfg: Mutex::new(Config::default()),
             http: reqwest::Client::new(),
             mpv_dir: None,
             mpv_cache: None,
-            player: Mutex::new(Some(Player { ctl, task })),
+            player: Mutex::new(player),
             play_seq: AtomicU64::new(0),
-        };
+            quit: watch::Sender::new(false),
+            starting: AtomicUsize::new(0),
+        }
+    }
+
+    /// 起播中退出：起播被放弃（mpv 随之被杀），shutdown 等到 play 返回，不白等满 wait。
+    #[test]
+    fn shutdown_cancels_starting_play() {
+        let app = std::sync::Arc::new(test_app(None));
+        let a = app.clone();
+        let task = tauri::async_runtime::spawn(async move {
+            let _g = Starting::enter(&a.starting);
+            a.unless_quit(std::future::pending::<()>()).await
+        });
+        while app.starting.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        let t0 = std::time::Instant::now();
+        app.shutdown(Duration::from_secs(3));
+        assert!(t0.elapsed() < Duration::from_secs(1));
+        assert_eq!(app.starting.load(Ordering::SeqCst), 0);
+        assert!(tauri::async_runtime::block_on(task).unwrap().is_none());
+        // 已经在退出：再点播放直接放弃
+        let late = tauri::async_runtime::block_on(app.unless_quit(async { 1 }));
+        assert_eq!(late, None);
+    }
+
+    /// 退出时要等播放任务收尾（回传 Stopped），但不能无限等。
+    #[test]
+    fn shutdown_waits_for_player_then_gives_up() {
+        let app = |task, ctl| test_app(Some(Player { ctl, task }));
         // 收到 Quit 后 200ms 才收尾：shutdown 应等到它结束
         let (tx, mut rx) = mpsc::unbounded_channel();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

@@ -58,7 +58,7 @@ export function devBridge(): Plugin {
           const cmd = (req.url ?? '').replace(/^\//, '')
           if (cmd === 'config_get') {
             return reply(200, {
-              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: '%APPDATA%\\com.stqfdyr.embymini\\mpv.conf',
+              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf',
               servers: [{ id: 'dev', name: s.name, url: s.url, port: s.port, user: process.env.EMBY_USER, userId: s.userId, base: s.base, loggedIn: true }],
             })
           }

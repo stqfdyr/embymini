@@ -8,8 +8,10 @@ local done = false
 mp.register_event("file-loaded", function()
     if done then return end
     done = true
+    -- 开播就切到常显：ModernZ 开播时先显示、随后自动淡出，淡出过程中再要求显示会被忽略，
+    -- 所以要赶在自动隐藏之前关掉它，截图时控制条才一定在
+    mp.commandv("script-message-to", "modernz", "osc-visibility", "always", "no_osd")
     mp.add_timeout(2, function()
-        mp.commandv("script-message-to", "modernz", "osc-visibility", "always", "no_osd")
         mp.add_timeout(1.5, function()
             shot("1-modernz")
             mp.commandv("script-message-to", "embymini", "episodes",

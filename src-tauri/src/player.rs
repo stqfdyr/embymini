@@ -723,6 +723,8 @@ struct Tel {
     /// 换集：发起时刻、是否不用等接口（已预加载 / 已准备好）、原因（next / prev / menu / auto）；首帧时记 `switch`。
     switch: Option<(Instant, bool, &'static str)>,
     stall: Option<Instant>,
+    /// 这一集加载完了、还没取解码 / 渲染信息：等首帧再取（`file-loaded` 时解码器还没建，`hwdec-current` 是空的）。
+    render_due: bool,
     cache_s: f64,
     /// 本分钟的下载速度采样（字节 / 秒）。
     speeds: Vec<f64>,
@@ -997,7 +999,7 @@ impl State {
                         if let Some((t0, m)) = &mut self.tel.first {
                             m.insert("loaded_ms".into(), (t0.elapsed().as_millis() as u64).into());
                         }
-                        self.probe("render", RENDER_PROPS).await;
+                        self.tel.render_due = true;
                     }
                     self.report(i, "", json!({}));
                     let _ = self.events.send(Event::Started {
@@ -1007,6 +1009,9 @@ impl State {
             }
             // 首帧（也会在 seek 后触发，只在等首帧时处理）
             "playback-restart" if self.tel.on => {
+                if std::mem::take(&mut self.tel.render_due) {
+                    self.probe("render", RENDER_PROPS).await;
+                }
                 if let Some((t0, mut m)) = self.tel.first.take() {
                     m.insert("frame_ms".into(), (t0.elapsed().as_millis() as u64).into());
                     self.tel_rec("play", Value::Object(m));
@@ -1550,6 +1555,27 @@ mod tests {
         assert_eq!(second["frame-drop-count"], json!(7.0));
         assert_eq!(second["vsync-jitter"], json!(0.2));
         assert!(second.get("kbps").is_none());
+    }
+
+    /// 解码 / 渲染信息等首帧（playback-restart）才取：file-loaded 时解码器还没建，hwdec-current 是空的。
+    #[tokio::test]
+    async fn render_probe_waits_for_first_frame() {
+        let (mut st, mpv, _ev) = offline_state(1);
+        st.tel.on = true;
+        st.cur = Some(0);
+        st.on_message(json!({ "event": "file-loaded" })).await;
+        let after_load = st.tel.probes.len();
+        st.on_message(json!({ "event": "playback-restart" })).await;
+        st.on_message(json!({ "event": "playback-restart" })).await; // seek 后再触发：不重复取
+        assert_eq!(after_load, 0);
+        assert_eq!(st.tel.probes.len(), RENDER_PROPS.len());
+        let asked: Vec<Value> = commands(st, mpv)
+            .await
+            .into_iter()
+            .filter(|c| c[0] == "get_property")
+            .map(|c| c[1].clone())
+            .collect();
+        assert_eq!(asked, RENDER_PROPS);
     }
 
     /// 下一集追加进列表后按钮变绿（yes），换到下一集或追加失败后恢复（no），状态没变不重复发。

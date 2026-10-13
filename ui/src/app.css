@@ -92,6 +92,7 @@ h2 { font-size: 18px; }
 .ph { background: var(--ph); }
 img.fade { opacity: 0; transition: opacity 0.25s var(--ease); }
 img.fade.in { opacity: 1; }
+img.fade.instant { opacity: 1; transition: none; }
 
 /* 平面按钮：悬停浅底色，按下更深并轻微缩小 */
 .btn {

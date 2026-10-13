@@ -8,7 +8,7 @@
   const q = loader(() => {
     void (session.refresh + session.quiet)
     return get<Page>(`/Users/${uid()}/Items`, { Recursive: true, Filters: 'IsFavorite', IncludeItemTypes: 'Movie,Series', SortBy: 'SortName', Fields: LIST_FIELDS })
-  })
+  }, () => 'favorites')
   restoreScrollWhen(() => q.data)
 </script>
 

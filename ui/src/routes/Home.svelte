@@ -17,7 +17,7 @@
   const hero = loader(() => {
     void session.refresh
     return get<Page>(`/Users/${uid()}/Items`, { Recursive: true, IncludeItemTypes: 'Movie,Series', SortBy: 'Random', ImageTypes: 'Backdrop', Limit: 8, Fields: LIST_FIELDS })
-  })
+  }, () => 'home:hero')
   const q = loader(() => {
     void (session.refresh + session.quiet)
     const u = uid()
@@ -25,7 +25,7 @@
       get<Page>(`/Users/${u}/Views`),
       get<Page>(`/Users/${u}/Items/Resume`, { Limit: 16, MediaTypes: 'Video', Fields: LIST_FIELDS }),
     ]).then(([views, resume]) => ({ views: views.Items.filter((v) => BROWSABLE.has(v.CollectionType)), resume: resume.Items }))
-  })
+  }, () => 'home')
   restoreScrollWhen(() => q.data)
 </script>
 

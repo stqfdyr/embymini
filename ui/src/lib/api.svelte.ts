@@ -1,9 +1,10 @@
 // 前端唯一的数据入口：invoke 封装 + GET 会话内缓存 + 图片地址。token 永远留在 Rust 里。
 import { untrack } from 'svelte'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
 import type { MenuItem } from './menu.svelte'
 import { op, setTel } from './tel'
+import { readSnap, writeSnap } from './snap'
 import type { Item, Page } from './types'
 
 export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; tag: string; loggedIn: boolean }
@@ -77,19 +78,29 @@ export function refreshQuiet() {
   session.quiet++
 }
 
+/** 快照的键带上当前服务器（不同服务器的数据不混）。 */
+export const snapKey = (k: string) => `${session.server?.id}|${k}`
+
 /**
  * 取数并保留上一次的结果：重新取数期间继续显示旧数据，新数据到了原地替换。
  * `fn` 里同步读到的响应式值（id、session.refresh 等）变化时自动重取。只能在组件初始化时调用。
+ * 给了 `key` 就先用本地快照把页面画出来（见 snap.ts），取到新数据再替换并更新快照；取数失败时继续显示快照。
  */
-export function loader<T>(fn: () => Promise<T>) {
+export function loader<T>(fn: () => Promise<T>, key?: () => string) {
   const s = $state<{ data?: T; error?: unknown }>({})
   $effect(() => {
     let alive = true
+    const k = key && snapKey(key())
+    if (k && untrack(() => s.data) === undefined) {
+      const snap = readSnap<T>(k)
+      if (snap !== undefined) s.data = snap
+    }
     fn().then(
       (d) => {
         if (!alive) return
         s.data = d
         s.error = undefined
+        if (k) writeSnap(k, d)
       },
       (e) => {
         if (alive && s.data === undefined) s.error = e
@@ -128,7 +139,16 @@ export const itemDetail = (id: string) => get<Item>(`/Users/${uid()}/Items/${id}
 let hoverTimer: ReturnType<typeof setTimeout> | undefined
 export function prefetch(id: string) {
   clearTimeout(hoverTimer)
-  hoverTimer = setTimeout(() => void itemDetail(id).catch(() => {}), 150)
+  hoverTimer = setTimeout(() => {
+    // 详情和详情页的背景图（大图 + 模糊底图）一起预取，点进去时多半已经在缓存里
+    itemDetail(id).then((d) => {
+      const tag = d.BackdropImageTags?.[0]
+      for (const w of [1600, 320]) {
+        const src = img(d.Id, 'Backdrop', tag, w)
+        if (src) new Image().src = src
+      }
+    }, () => {})
+  }, 150)
 }
 export const cancelPrefetch = () => clearTimeout(hoverTimer)
 
@@ -193,14 +213,22 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
   const s = $state({ items: [] as Item[], total: 0, busy: false, error: '', loaded: false })
   let gen = 0
   let q: Record<string, unknown> = {}
+  /** 第一页的本地快照（见 snap.ts）：先显示它，第一次取数从头取并替换。 */
+  let fromSnap = false
+  const key = () => snapKey(`pager|${JSON.stringify(q)}`)
   async function more() {
-    if (s.busy || (s.loaded && s.items.length >= s.total)) return
+    if (s.busy || (s.loaded && !fromSnap && s.items.length >= s.total)) return
     s.busy = true
     const mine = gen
+    const start = fromSnap ? 0 : s.items.length
     try {
-      const p = await get<Page>(`/Users/${uid()}/Items`, { ...q, StartIndex: s.items.length, Limit: size })
+      const p = await get<Page>(`/Users/${uid()}/Items`, { ...q, StartIndex: start, Limit: size })
       if (mine !== gen) return
-      s.items.push(...p.Items)
+      if (start === 0) {
+        s.items = p.Items
+        fromSnap = false
+        writeSnap(key(), { items: p.Items, total: p.TotalRecordCount })
+      } else s.items.push(...p.Items)
       s.total = p.TotalRecordCount
       s.loaded = true
     } catch (e) {
@@ -213,17 +241,33 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
     void session.refresh
     q = query()
     gen++
-    Object.assign(s, { items: [], total: 0, busy: false, error: '', loaded: false })
+    const snap = readSnap<{ items: Item[]; total: number }>(key())
+    fromSnap = !!snap
+    Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap })
     untrack(more)
   })
   return { s, more }
 }
 
-/** 图片地址：带 tag 的 URL 不会变，上游给 1 年缓存，交给 WebView 的 HTTP 缓存。没有 tag 返回空串。 */
-export function img(id: string | undefined, type: string, tag: string | undefined | null, width: number) {
+/** 宽度档位：按 DPR 放大后向上取档，换缩放比例、不同卡片尺寸也能命中同一份缓存。 */
+const WIDTHS = [120, 160, 240, 320, 480, 640, 960, 1280, 1600, 1920, 2560, 3840]
+const IN_TAURI = '__TAURI_INTERNALS__' in globalThis
+
+/**
+ * 图片地址（`index`：同类图的第几张，如第几张背景图）。没有 tag 返回空串。
+ * 桌面版走 Rust 的图片缓存（`emby-img` 协议：磁盘缓存 → 上游，见 src-tauri/src/images.rs）；浏览器里开发时直连上游。
+ */
+export function img(id: string | undefined, type: string, tag: string | undefined | null, width: number, index = 0) {
   if (!id || !tag || !session.server) return ''
-  const w = Math.round(width * (globalThis.devicePixelRatio || 1))
-  return `${session.server.base}/Items/${id}/Images/${type}?tag=${tag}&maxWidth=${w}&quality=90`
+  const want = Math.round(width * (globalThis.devicePixelRatio || 1))
+  const w = WIDTHS.find((x) => x >= want) ?? WIDTHS[WIDTHS.length - 1]
+  if (IN_TAURI) return convertFileSrc(`${session.server.id}/${id}/${type}/${index}/${tag}/${w}`, 'emby-img')
+  return `${session.server.base}/Items/${id}/Images/${type}/${index}?tag=${tag}&maxWidth=${w}&quality=90`
+}
+
+/** 原图的上游地址：给外部浏览器打开用（不走缓存、不缩图）。 */
+export function imgOriginal(id: string, type: string, tag: string, index = 0) {
+  return session.server ? `${session.server.base}/Items/${id}/Images/${type}/${index}?tag=${tag}` : ''
 }
 
 /** 横图：自身背景图 → 所属剧集的背景图 → 自身主图（单集截图）。 */

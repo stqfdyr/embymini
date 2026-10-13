@@ -16,7 +16,7 @@
       get<Page>(`/Shows/${seriesId}/Seasons`, { UserId: u, Fields: 'UserData' }),
       get<Page>(`/Shows/${seriesId}/Episodes`, { UserId: u, SeasonId: seasonId, Fields: EP_FIELDS }),
     ]).then(([series, seasons, eps]) => ({ series, seasons: seasons.Items, eps: eps.Items }))
-  })
+  }, () => `season:${seriesId}:${seasonId}`)
   restoreScrollWhen(() => q.data)
 
   // 切季替换当前历史记录：返回键回到详情页，而不是上一季

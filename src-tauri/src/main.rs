@@ -3,6 +3,7 @@
 
 mod config;
 mod emby;
+mod images;
 mod player;
 mod telemetry;
 
@@ -29,6 +30,8 @@ struct App {
     /// mpv 的缓存目录：数据目录下的 `mpv-cache`，卸载时勾选「删除应用程序数据」会一起删掉。
     mpv_cache: Option<PathBuf>,
     player: Mutex<Option<Player>>,
+    /// 海报、背景图的磁盘缓存（`emby-img` 协议）。
+    images: std::sync::Arc<images::Images>,
     /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
     play_seq: AtomicU64,
     /// 程序要退出了：起播中的 `play` 收到后放弃起播（见 [`App::unless_quit`]）。
@@ -462,6 +465,27 @@ fn scrub(s: &str) -> String {
     out
 }
 
+/// `emby-img` 协议：界面要的图交给 [`images::Images`]（磁盘缓存 → 上游）。路径里是服务器 id，这里换成那台服务器的 API 根；
+/// 不认识的服务器回 404，不会去别的地址取。
+async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Vec<u8>> {
+    let Some(req) = images::Req::parse(path) else {
+        return images::response(Err(400));
+    };
+    let app = handle.state::<App>();
+    let base = {
+        let c = app.cfg();
+        c.servers
+            .iter()
+            .find(|s| s.id == req.server)
+            .map(config::Server::api_base)
+    };
+    let Some(base) = base else {
+        return images::response(Err(404));
+    };
+    let srv = config::server_tag(&base);
+    images::response(app.images.get(&req, &base, &srv).await)
+}
+
 /// 更新代理：`http://`、`https://`、`socks5://`、`socks5h://` 加主机和端口。
 fn proxy_url(p: &str) -> Result<reqwest::Url, Error> {
     let bad = || {
@@ -667,6 +691,13 @@ fn main() {
         )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .register_asynchronous_uri_scheme_protocol(images::SCHEME, |ctx, req, responder| {
+            let handle = ctx.app_handle().clone();
+            let path = req.uri().path().to_owned();
+            tauri::async_runtime::spawn(async move {
+                responder.respond(serve_image(&handle, &path).await);
+            });
+        })
         .setup(move |app| {
             let p = app.path();
             let old = [
@@ -719,10 +750,15 @@ fn main() {
                     .map_or("（无）".into(), |d| d.display().to_string())
             );
             let mpv_cache = Some(root.join("mpv-cache"));
+            let http = emby::http_client()?;
+            let images =
+                images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
+            images.start();
             app.manage(App {
                 path,
                 cfg: Mutex::new(cfg),
-                http: emby::http_client()?,
+                http,
+                images,
                 mpv_dir,
                 mpv_cache,
                 player: Mutex::new(None),
@@ -798,6 +834,11 @@ mod tests {
             mpv_dir: None,
             mpv_cache: None,
             player: Mutex::new(player),
+            images: images::Images::new(
+                std::env::temp_dir().join("embymini-test-images"),
+                images::CAP,
+                reqwest::Client::new(),
+            ),
             play_seq: AtomicU64::new(0),
             quit: watch::Sender::new(false),
             starting: AtomicUsize::new(0),

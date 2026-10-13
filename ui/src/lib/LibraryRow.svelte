@@ -14,7 +14,7 @@
       get<Item[]>(`/Users/${u}/Items/Latest`, { ParentId: view.Id, Limit: 16, Fields: LIST_FIELDS }),
       get<Page>(`/Users/${u}/Items`, { ParentId: view.Id, Recursive: true, IncludeItemTypes: 'Movie,Series', Limit: 0 }),
     ]).then(([latest, page]) => ({ latest, total: page.TotalRecordCount }))
-  })
+  }, () => `row:${view.Id}`)
 </script>
 
 {#if q.data?.latest.length}

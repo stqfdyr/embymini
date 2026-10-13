@@ -13,7 +13,7 @@
   const p = loader(() => {
     void session.refresh
     return get<Item>(`/Users/${uid()}/Items/${id}`)
-  })
+  }, () => `person:${id}`)
   const { s: pg, more } = pager(() => ({
     PersonIds: id, Recursive: true, IncludeItemTypes: 'Movie,Series', Fields: LIST_FIELDS,
     SortBy: 'ProductionYear,PremiereDate,SortName', SortOrder: 'Descending',

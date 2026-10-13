@@ -17,7 +17,13 @@
     update()
     const ro = new ResizeObserver(update)
     ro.observe(el)
-    return () => ro.disconnect()
+    // 整行快进入视口时，行里屏幕右边看不到的海报也开始加载（懒加载只管视口内的，往右滑才开始取会看到空卡）
+    const io = new IntersectionObserver((es) => {
+      if (!es[0].isIntersecting) return
+      el.querySelectorAll<HTMLImageElement>('img[loading="lazy"]').forEach((i) => (i.loading = 'eager'))
+    }, { rootMargin: '600px 0px' })
+    io.observe(el)
+    return () => (ro.disconnect(), io.disconnect())
   })
 </script>
 

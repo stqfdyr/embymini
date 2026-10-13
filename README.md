@@ -51,7 +51,8 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | `data\config.json` | 服务器列表（含登录 token，不存密码）、播放设置 |
 | `data\mpv.conf` | 个人 mpv 配置：自己新建，在自带配置之后加载，同名选项以它为准，升级不覆盖 |
 | `data\logs\` | 日志 |
-| `data\webview\` | 界面数据（含海报磁盘缓存） |
+| `data\webview\` | 界面数据（含上次浏览的列表快照，启动时先显示） |
+| `data\cache\images\` | 海报、背景图缓存（上限 1 GB，按最近使用淘汰） |
 | `data\mpv-cache\` | mpv 着色器缓存 |
 | `data\telemetry\` | 诊断数据的待上传批次（打开「发送诊断数据」才有，上限 20 MB） |
 

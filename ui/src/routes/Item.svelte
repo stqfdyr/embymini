@@ -8,7 +8,8 @@
   import MediaInfo from '../lib/MediaInfo.svelte'
   import Poster from '../lib/Poster.svelte'
   import Row from '../lib/Row.svelte'
-  import { DETAIL_FIELDS, EP_FIELDS, LIST_FIELDS, errText, get, img, itemDetail, loader, peek, play, session, setFavorite, setPlayed, uid } from '../lib/api.svelte'
+  import { DETAIL_FIELDS, EP_FIELDS, LIST_FIELDS, errText, get, img, imgOriginal, itemDetail, loader, peek, play, session, setFavorite, setPlayed, snapKey, uid } from '../lib/api.svelte'
+  import { readSnap, writeSnap } from '../lib/snap'
   import { fade } from '../lib/fade'
   import { clock, date, minutes, rating, techLine } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
@@ -58,14 +59,14 @@
   const q = loader(() => {
     void (session.refresh + session.quiet)
     return load(id)
-  })
+  }, () => `item:${id}`)
   const loaded = $derived(q.data)
   const item = $derived(q.data?.item ?? known(id))
   let pickedSeason = $state<string>()
   let expanded = $state(false)
   restoreScrollWhen(() => q.data)
 
-  // 单集行单独加载。换季才清空；同一季重新取数时先保留旧列表
+  // 单集行单独加载。换季才换内容（先用这一季的本地快照，没有就清空）；同一季重新取数时先保留旧列表
   let eps = $state<Item[]>([])
   let epsLoading = $state(true)
   /** 单集列表取失败：要明说，不能显示成「这一季还没有剧集」。 */
@@ -76,10 +77,12 @@
     const seriesId = loaded?.item.Type === 'Series' ? loaded.item.Id : undefined
     const season = seasonId
     const key = `${seriesId}|${season}`
+    const snap = snapKey(`eps:${key}`)
     if (key !== epsKey) {
       epsKey = key
-      eps = []
-      epsLoading = true
+      const cached = readSnap<Item[]>(snap) ?? [] // 不读 eps：effect 里读了它，取数回来写 eps 会让这里反复重跑
+      eps = cached
+      epsLoading = !cached.length
     }
     epsError = ''
     if (!seriesId || !season) return
@@ -87,7 +90,9 @@
     get<Page>(`/Shows/${seriesId}/Episodes`, { UserId: uid(), SeasonId: season, Fields: EP_FIELDS })
       .then(
         (p) => {
-          if (alive) eps = p.Items
+          if (!alive) return
+          eps = p.Items
+          writeSnap(snap, p.Items)
         },
         (e) => {
           if (alive && !eps.length) epsError = errText(e)
@@ -194,9 +199,9 @@
 
       {#if d.item.BackdropImageTags?.length}
         <Row title="艺术图">
-          {#each d.item.BackdropImageTags as tag (tag)}
-            <button class="art ph" title="用浏览器打开原图" onclick={() => openUrl(img(d.item.Id, 'Backdrop', tag, 3840))}>
-              <img src={img(d.item.Id, 'Backdrop', tag, 288)} alt="" loading="lazy" use:fade />
+          {#each d.item.BackdropImageTags as tag, k (tag)}
+            <button class="art ph" title="用浏览器打开原图" onclick={() => openUrl(imgOriginal(d.item.Id, 'Backdrop', tag, k))}>
+              <img src={img(d.item.Id, 'Backdrop', tag, 288, k)} alt="" loading="lazy" use:fade />
             </button>
           {/each}
         </Row>

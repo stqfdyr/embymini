@@ -68,11 +68,7 @@ export function pageReady() {
 
 // ---------- 聚合统计（每 30 秒一条） ----------
 
-const pct = (sorted: number[], p: number) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]) : 0)
-
 function install() {
-  const imgs: { ms: number; type: string; w: number }[] = []
-  let imgFail = 0
   let longN = 0, longMax = 0
   let jankN = 0, jankMax = 0
   let slowN = 0, slowMax = 0
@@ -85,15 +81,7 @@ function install() {
       /* 不支持这类条目就不记 */
     }
   }
-  // 图片耗时。海报是跨域加载的，浏览器不给协议和传输字节数（没有 Timing-Allow-Origin），只有总耗时；
-  // 所以「命中磁盘缓存」按耗时判断（< 10 ms），统计分位数时去掉这些
-  observe('resource', (e) => {
-    const r = e as PerformanceResourceTiming
-    if (r.initiatorType !== 'img') return
-    const m = /\/Images\/(\w+)\?.*maxWidth=(\d+)/.exec(r.name)
-    imgs.push({ ms: r.duration, type: m?.[1] ?? '', w: Number(m?.[2] ?? 0) })
-  })
-  addEventListener('error', (e) => e.target instanceof HTMLImageElement && imgFail++, true)
+  // 图片耗时、命中率在 Rust 的图片缓存里按上游统计（src-tauri/src/images.rs），这里不再重复
   // 主线程长任务（>50 ms）
   observe('longtask', (e) => ((longN++), (longMax = Math.max(longMax, e.duration))))
   // 交互延迟（点击到画面更新 >100 ms）
@@ -121,14 +109,6 @@ function install() {
   addEventListener('unhandledrejection', (e) => tel('js_error', { msg: String((e.reason as Error)?.message ?? e.reason).slice(0, 300) }))
 
   setInterval(() => {
-    if (imgs.length || imgFail) {
-      const fresh = imgs.filter((i) => i.ms >= 10)
-      const ms = fresh.map((i) => i.ms).sort((a, b) => a - b)
-      const slow = [...fresh].sort((a, b) => b.ms - a.ms).slice(0, 5).map((i) => ({ type: i.type, w: i.w, ms: Math.round(i.ms) }))
-      tel('img', { n: imgs.length, cached: imgs.length - fresh.length, fail: imgFail, p50: pct(ms, 0.5), p90: pct(ms, 0.9), p99: pct(ms, 0.99), max: pct(ms, 1), slow })
-      imgs.length = 0
-      imgFail = 0
-    }
     if (longN || jankN || slowN) {
       tel('perf', { long_n: longN, long_max: Math.round(longMax), jank_n: jankN, jank_max: Math.round(jankMax), slow_n: slowN, slow_max: Math.round(slowMax), slow_events: [...slowNames] })
       longN = longMax = jankN = jankMax = slowN = slowMax = 0

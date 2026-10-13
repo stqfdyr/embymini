@@ -1,0 +1,101 @@
+# Windows 安装包：前端检查 → 下载 mpv（shinchiro 构建，mpv 官网推荐的 Windows 版本）放进资源目录 →
+# Rust 测试（含自带 mpv 配置在 Windows 上的加载检查）→ mpv 渲染截图 → clippy → tauri build（NSIS）→
+# 上传安装包 → 冒烟测试（静默安装、启动、查日志、截图）。
+name: windows
+# 只在需要安装包时跑（Windows release 构建 15–25 分钟）：手动触发，或推送 v* 标签。平时推送 main 不构建。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+        working-directory: ui
+      - run: npm run check
+        working-directory: ui
+
+      - name: 下载 mpv.exe 到 src-tauri/mpv/
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          # x86_64-v3：AVX2 优化的构建（2013 年以后的 CPU 都支持），软解和缩放更快
+          $asset = $rel.assets | Where-Object name -match '^mpv-x86_64-v3-\d{8}-git-.*\.7z$' | Select-Object -First 1
+          if (-not $asset) { throw '没找到 mpv 构建' }
+          Write-Host "mpv: $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv.7z
+          7z e mpv.7z mpv.exe -osrc-tauri/mpv -y
+
+      # 含 bundled_config_loads：在真 Windows 上验证自带 mpv 配置 / ModernZ 能加载（含中文空格路径、配置零报错）
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: mpv 实际渲染截图（ModernZ、选集菜单；无显卡时走 WARP）
+        shell: pwsh
+        continue-on-error: true # 只为留证据，runner 没有桌面时不影响出包
+        timeout-minutes: 3
+        run: |
+          $env:SHOT_DIR = Join-Path $PWD 'smoke'; New-Item -ItemType Directory -Force $env:SHOT_DIR | Out-Null
+          $p = Start-Process -FilePath "$PWD\src-tauri\mpv\mpv.exe" -PassThru -ArgumentList @(
+            "--config-dir=$PWD\src-tauri\mpv", "--script=$PWD\tools\mpv-shot.lua", '--force-window=yes', '--ao=null',
+            "--log-file=$env:SHOT_DIR\mpv-render.log", '--force-media-title=浴血黑帮 S01E01 测试', 'av://lavfi:testsrc2=duration=60:size=1920x1080')
+          if (-not $p.WaitForExit(60000)) { Stop-Process $p.Id; Write-Host 'mpv 60 秒没退出（截图脚本没跑完），已结束' }
+          else { Write-Host "mpv 退出码 $($p.ExitCode)" }
+          Select-String -Path "$env:SHOT_DIR\mpv-render.log" -Pattern '\]\[e\]\[|d3d11|Using hardware|VO:' | ForEach-Object Line
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: 打包
+        shell: cmd
+        run: ui\node_modules\.bin\tauri.cmd build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EmbyMini-setup
+          path: src-tauri/target/release/bundle/nsis/*.exe
+
+      # 冒烟：像用户一样静默安装、启动，确认程序起得来、资源路径正确（资源目录带 \\?\ 前缀导致 mpv 读不到自带配置时，这一步会直接失败）
+      - name: 冒烟测试：静默安装 → 启动 → 查日志、截图
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\EmbyMini" -Recurse -Filter embymini.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { throw "安装后找不到 embymini.exe（$env:LOCALAPPDATA\EmbyMini）" }
+          Write-Host "已安装：$($exe.FullName)"
+          $app = Start-Process $exe.FullName -PassThru
+          Start-Sleep 15
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          try {
+            Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+            $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+            [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+            $bmp.Save("$PWD\smoke\app.png")
+          } catch { Write-Host "截图失败（不影响判断）：$_" }
+          $logFile = "$env:LOCALAPPDATA\com.stqfdyr.embymini\logs\EmbyMini.log"
+          $log = Get-Content $logFile -Raw -Encoding utf8
+          Write-Host $log
+          Copy-Item $logFile smoke/
+          if ($app.HasExited) { throw "程序启动后退出了（退出码 $($app.ExitCode)）" }
+          Stop-Process $app.Id
+          if ($log -notmatch '自带 mpv 配置：([A-Z]:\\[^\r\n]*)') { throw '日志里没有正确的自带 mpv 配置路径（带 \\?\ 前缀或没找到）' }
+          if (-not (Test-Path "$($Matches[1])\scripts\modernz.lua")) { throw "配置目录里没有 ModernZ：$($Matches[1])" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke
+          path: smoke/

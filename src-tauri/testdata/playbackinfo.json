@@ -1,0 +1,73 @@
+{
+ "PlaySessionId": "0123456789abcdef0123456789abcdef",
+ "MediaSources": [
+  {
+   "Id": "mediasource_1153511",
+   "Container": "mkv",
+   "DirectStreamUrl": "/videos/1153511/stream.mkv?UserId=<UID>&IsPlayback=false&AutoOpenLiveStream=false&MaxStreamingBitrate=200000000&MediaSourceId=mediasource_1153511&Static=true&api_key=<TOKEN>",
+   "DefaultAudioStreamIndex": 1,
+   "DefaultSubtitleStreamIndex": 5,
+   "MediaStreams": [
+    {
+     "Index": 0,
+     "Type": "Video",
+     "Codec": "h264",
+     "DisplayTitle": "1080i H264",
+     "Title": "MPEG-4 AVC Video / 27999 kbps / 1080i / 25 fps / 16:9 / High Profile 4.1",
+     "IsExternal": false,
+     "IsDefault": true
+    },
+    {
+     "Index": 1,
+     "Type": "Audio",
+     "Codec": "dts",
+     "Language": "eng",
+     "DisplayTitle": "English DTS-HD MA 5.1 (默认)",
+     "Title": "DTS-HD Master Audio / 5.1 / 48 kHz / 2153 kbps / 16-bit",
+     "IsExternal": false,
+     "IsDefault": true
+    },
+    {
+     "Index": 2,
+     "Type": "Subtitle",
+     "Codec": "subrip",
+     "Language": "eng",
+     "DisplayTitle": "English (默认 SUBRIP)",
+     "Title": "English",
+     "IsExternal": false,
+     "IsDefault": true
+    },
+    {
+     "Index": 3,
+     "Type": "Subtitle",
+     "Codec": "subrip",
+     "Language": "eng",
+     "DisplayTitle": "English (SUBRIP)",
+     "Title": "English SDH",
+     "IsExternal": false,
+     "IsDefault": false
+    },
+    {
+     "Index": 4,
+     "Type": "Subtitle",
+     "Codec": "PGSSUB",
+     "Language": "eng",
+     "DisplayTitle": "English (PGSSUB)",
+     "Title": "SDH",
+     "IsExternal": false,
+     "IsDefault": false
+    },
+    {
+     "Index": 5,
+     "Type": "Subtitle",
+     "Codec": "ass",
+     "Language": "zh-CN",
+     "DisplayTitle": "Chinese Simplified (ASS)",
+     "Title": "chi",
+     "IsExternal": true,
+     "IsDefault": false
+    }
+   ]
+  }
+ ]
+}

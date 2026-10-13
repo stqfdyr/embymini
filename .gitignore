@@ -1,0 +1,11 @@
+node_modules/
+ui/dist/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/mpv/mpv.exe
+__pycache__/
+
+# 私有文档与本地 AI 配置，不进开源仓库
+/docs/
+/CLAUDE.md
+/.claude/

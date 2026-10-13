@@ -1,0 +1,38 @@
+{
+ "Items": [
+  {
+   "Id": "1354592",
+   "Name": "忍耐的人必有福",
+   "Type": "Episode",
+   "SeriesId": "1354590",
+   "SeasonId": "1354591",
+   "SeriesName": "中头奖还是要上班",
+   "IndexNumber": 1,
+   "ParentIndexNumber": 1,
+   "RunTimeTicks": 28491520000
+  },
+  {
+   "Id": "1354593",
+   "Name": "8,145,060分之1",
+   "Type": "Episode",
+   "SeriesId": "1354590",
+   "SeasonId": "1354591",
+   "SeriesName": "中头奖还是要上班",
+   "IndexNumber": 2,
+   "ParentIndexNumber": 1,
+   "RunTimeTicks": 29781540000
+  },
+  {
+   "Id": "1358723",
+   "Name": "我所相信的",
+   "Type": "Episode",
+   "SeriesId": "1354590",
+   "SeasonId": "1354591",
+   "SeriesName": "中头奖还是要上班",
+   "IndexNumber": 3,
+   "ParentIndexNumber": 1,
+   "RunTimeTicks": 26255140000
+  }
+ ],
+ "TotalRecordCount": 3
+}

@@ -171,6 +171,43 @@ async fn server_add(
     Ok(view)
 }
 
+/// 编辑服务器（id 不变，是当前服务器的话仍是当前）：改地址、端口、用户名，或者重新登录。
+/// 先用新地址连一次服务器（顺带更新服务器名），连不上就不保存。
+/// 只改地址时（换域名、换端口、换反代）沿用原来的 token，不用输密码；
+/// 改了用户名、填了密码或者原来就没登录时，用这里的用户名和密码重新登录。
+#[tauri::command]
+async fn server_edit(
+    app: State<'_, App>,
+    id: String,
+    url: String,
+    port: Option<u16>,
+    user: String,
+    password: String,
+) -> Result<ServerView, Error> {
+    let (url, port) = config::normalize(&url, port).map_err(Error::Other)?;
+    let (mut s, device_id) = {
+        let c = app.cfg();
+        let s = c.servers.iter().find(|s| s.id == id).cloned();
+        (s.ok_or_else(|| Error::Other("服务器不存在".into()))?, c.device_id.clone())
+    };
+    let relogin = !password.is_empty() || user != s.user || s.token.is_empty();
+    (s.url, s.port, s.user) = (url, port, user);
+    let base = s.api_base();
+    s.name = emby::server_name(&app.http, &base).await?;
+    if relogin {
+        (s.user_id, s.token) = emby::login(&app.http, &base, &device_id, &s.user, &password).await?;
+    }
+    let view = s.view();
+    app.update(|c| {
+        let t = c.servers.iter_mut().find(|t| t.id == id)?;
+        *t = s;
+        Some(())
+    })?
+    .ok_or_else(|| Error::Other("服务器不存在".into()))?;
+    Ok(view)
+}
+
+/// 重新登录（只要密码）：token 失效或者想换一个新 token 时用。
 #[tauri::command]
 async fn server_login(
     app: State<'_, App>,
@@ -357,6 +394,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             config_get,
             server_add,
+            server_edit,
             server_login,
             server_remove,
             server_use,

@@ -1,11 +1,14 @@
-<!-- 设置：服务器（添加 / 切换 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、个人 mpv 配置的位置）+ 关于（界面用哪块 GPU）。分组列表样式。 -->
+<!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、个人 mpv 配置的位置）+ 关于（界面用哪块 GPU）。分组列表样式。 -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
-  import { Check, LogIn, Plus, Trash2 } from '@lucide/svelte'
+  import { Check, LogIn, Pencil, Plus, Trash2 } from '@lucide/svelte'
   import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
 
-  let form = $state({ url: '', port: '', user: '', password: '' })
+  const blank = { url: '', port: '', user: '', password: '' }
+  let form = $state({ ...blank })
+  /** 正在编辑的服务器 id；和「添加」共用 form。 */
+  let editing = $state<string | null>(null)
   let relogin = $state<{ id: string; password: string } | null>(null)
   let busy = $state(false)
   let msg = $state<{ text: string; ok: boolean } | null>(null)
@@ -28,14 +31,35 @@
     }
   }
 
+  function formPort() {
+    const port = form.port.trim() ? Number(form.port) : null
+    if (port !== null && !(port > 0 && port < 65536)) throw { message: '端口应为 1–65535' }
+    return port
+  }
   const add = () =>
     run(async () => {
-      const port = form.port.trim() ? Number(form.port) : null
-      if (port !== null && !(port > 0 && port < 65536)) throw { message: '端口应为 1–65535' }
-      await invoke('server_add', { url: form.url, port, user: form.user, password: form.password })
-      form = { url: '', port: '', user: '', password: '' }
+      await invoke('server_add', { url: form.url, port: formPort(), user: form.user, password: form.password })
+      form = { ...blank }
       go('/')
     })
+  function startEdit(s: { id: string; url: string; port: number; user: string }) {
+    form = { url: s.url, port: String(s.port), user: s.user, password: '' }
+    editing = s.id
+    adding = false
+    relogin = null
+  }
+  function startAdd() {
+    form = { ...blank }
+    editing = null
+    adding = true
+  }
+  /** 只改地址时后端沿用原 token，不用填密码；改了用户名或填了密码就重新登录。 */
+  const save = (id: string) =>
+    run(async () => {
+      await invoke('server_edit', { id, url: form.url, port: formPort(), user: form.user, password: form.password })
+      editing = null
+      form = { ...blank }
+    }, '已保存')
   function login() {
     const r = relogin
     if (!r) return
@@ -72,7 +96,22 @@
 
   <h3>服务器</h3>
   <div class="group">
+    {#snippet serverForm(submit: () => void, label: string, pwHint: string, cancel: (() => void) | null)}
+      <form class="row form" onsubmit={(e) => { e.preventDefault(); submit() }}>
+        <input class="url" placeholder="地址，如 https://emby.example.com" bind:value={form.url} required spellcheck="false" />
+        <input class="port" placeholder="端口（默认按协议）" bind:value={form.port} inputmode="numeric" />
+        <input placeholder="用户名" bind:value={form.user} required autocomplete="username" spellcheck="false" />
+        <input type="password" placeholder={pwHint} bind:value={form.password} autocomplete="current-password" />
+        <div class="btns">
+          <button class="btn primary" disabled={busy}>{label}</button>
+          {#if cancel}<button type="button" class="btn ghost" onclick={cancel}>取消</button>{/if}
+        </div>
+      </form>
+    {/snippet}
     {#each session.cfg?.servers ?? [] as s (s.id)}
+      {#if editing === s.id}
+        {@render serverForm(() => save(s.id), '保存', '密码（只改地址可不填）', () => (editing = null))}
+      {:else}
       <div class="row">
         <div class="grow">
           <div class="name">{s.name}{#if s.id === session.cfg?.active}<span class="tag">当前</span>{/if}</div>
@@ -85,24 +124,17 @@
           <button class="btn ghost" onclick={() => (relogin = null)}>取消</button>
         {:else}
           {#if s.id !== session.cfg?.active}<button class="btn" disabled={busy} onclick={() => use(s.id)}><Check size={15} /> 使用</button>{/if}
-          <button class="btn" disabled={busy} onclick={() => (relogin = { id: s.id, password: '' })}><LogIn size={15} /> 重新登录</button>
+          <button class="btn" disabled={busy} onclick={() => startEdit(s)}><Pencil size={15} /> 编辑</button>
+          <button class="btn" disabled={busy} onclick={() => ((relogin = { id: s.id, password: '' }), (editing = null))}><LogIn size={15} /> 重新登录</button>
           <button class="btn icon danger" title="删除" disabled={busy} onclick={() => remove(s.id, s.name)}><Trash2 size={15} /></button>
         {/if}
       </div>
+      {/if}
     {/each}
     {#if adding}
-      <form class="row add" onsubmit={(e) => { e.preventDefault(); add() }}>
-        <input class="url" placeholder="地址，如 https://emby.example.com" bind:value={form.url} required spellcheck="false" />
-        <input class="port" placeholder="端口（默认按协议）" bind:value={form.port} inputmode="numeric" />
-        <input placeholder="用户名" bind:value={form.user} required autocomplete="username" spellcheck="false" />
-        <input type="password" placeholder="密码" bind:value={form.password} autocomplete="current-password" />
-        <div class="btns">
-          <button class="btn primary" disabled={busy}><Plus size={15} /> 添加并登录</button>
-          {#if session.cfg?.servers.length}<button type="button" class="btn ghost" onclick={() => (adding = false)}>取消</button>{/if}
-        </div>
-      </form>
+      {@render serverForm(add, '添加并登录', '密码', session.cfg?.servers.length ? () => (adding = false) : null)}
     {:else}
-      <button class="row link" onclick={() => (adding = true)}><Plus size={16} /> 添加服务器</button>
+      <button class="row link" onclick={startAdd}><Plus size={16} /> 添加服务器</button>
     {/if}
   </div>
 
@@ -155,8 +187,8 @@
   }
   input:not([type='range']):focus { background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
   input[type='range'] { accent-color: var(--accent); }
-  .add { display: grid; grid-template-columns: 170px 1fr 1fr; gap: 10px; }
-  .add .url, .add .btns { grid-column: 1 / -1; }
+  .form { display: grid; grid-template-columns: 170px 1fr 1fr; gap: 10px; }
+  .form .url, .form .btns { grid-column: 1 / -1; }
   .btns { display: flex; gap: 8px; }
   code { font-family: ui-monospace, Consolas, monospace; font-size: 11px; padding: 0 4px; border-radius: 4px; background: var(--fill); }
   .note { margin: 10px var(--gutter); font-size: 12px; color: var(--text-3); line-height: 1.8; }

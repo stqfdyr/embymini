@@ -74,8 +74,8 @@ export function devBridge(): Plugin {
             if (!r.ok) return reply(500, { kind: r.status === 401 ? 'unauthorized' : 'status', message: `服务器返回 ${r.status}：${text.slice(0, 200)}` })
             return reply(200, text ? JSON.parse(text) : null)
           }
-          // play / server_* / settings_set：浏览器里没有 mpv，也不改本地配置，只记一笔
-          console.log(`[dev-bridge] ${cmd}`, JSON.stringify(args))
+          // play / server_* / settings_set：浏览器里没有 mpv，也不改本地配置，只记一笔（密码不打印）
+          console.log(`[dev-bridge] ${cmd}`, JSON.stringify(args, (k, v) => (k === 'password' ? '***' : v)))
           return reply(200, null)
         } catch (e) {
           return reply(500, { kind: 'other', message: String(e) })

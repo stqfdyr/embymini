@@ -49,6 +49,8 @@ jobs:
         working-directory: ui
       - run: npm run check
         working-directory: ui
+      - run: npm test
+        working-directory: ui
 
       - name: 下载 mpv.exe 到 src-tauri/mpv/
         shell: pwsh

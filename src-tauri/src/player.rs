@@ -1980,6 +1980,59 @@ mod tests {
         test_opts(base.into_iter().chain(extra.iter().cloned()).collect())
     }
 
+    /// 本进程起的、还活着的 mpv（按命令行里本进程专属的 IPC 名字找）。
+    #[cfg(target_os = "linux")]
+    fn our_mpvs() -> usize {
+        let tag = format!("embymini-{}-", std::process::id());
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
+            .filter(|c| String::from_utf8_lossy(c).contains(&tag))
+            .count()
+    }
+
+    /// 起播途中放弃（程序退出时丢掉起播的 future）：mpv 窗口已经开着，必须随之被杀掉，不能留下空窗口。
+    /// 上游只收连接不回话，起播一直卡在取 PlaybackInfo。
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "需要 PATH 里的 mpv"]
+    async fn abandoned_start_kills_mpv() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let server = crate::config::Server {
+            id: "s".into(),
+            name: String::new(),
+            url: "http://127.0.0.1".into(),
+            port,
+            user: "u".into(),
+            user_id: "uid".into(),
+            token: "tok".into(),
+        };
+        let emby = Emby::new(emby::http_client().unwrap(), &server, "dev");
+        let starting = start(emby, "1", false, headless(&[]));
+        // 1.5 秒后还在起播（上游不回话），这时 mpv 已经起来了；然后放弃
+        let r = tokio::time::timeout(Duration::from_millis(1500), async {
+            let mut starting = Box::pin(starting);
+            tokio::select! {
+                _ = &mut starting => panic!("上游不回话，起播不该完成"),
+                _ = tokio::time::sleep(Duration::from_millis(1200)) => {}
+            }
+            assert_eq!(our_mpvs(), 1, "起播途中 mpv 应该已经在运行");
+            drop(starting);
+        })
+        .await;
+        assert!(r.is_ok());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(our_mpvs(), 0, "放弃起播后 mpv 应该被杀掉");
+    }
+
     /// 测试自己另开一个 IPC 连接给 mpv 发命令，返回 data。
     async fn mpv_cmd(ipc: &Path, cmd: Value) -> Value {
         let io = open(ipc).await.unwrap();

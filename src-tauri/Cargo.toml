@@ -25,6 +25,7 @@ thiserror = "2"
 tauri-plugin-updater = "2"
 flate2 = "1"
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [profile.release]
 lto = true

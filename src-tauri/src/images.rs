@@ -1,6 +1,7 @@
 //! 海报、背景图的本地缓存（原生客户端的做法，同 Nuke / Kingfisher / Coil 一类图片库）：
 //! 界面用 `emby-img` 协议要图 → 先查磁盘缓存 → 没有再向上游要服务端缩好的尺寸，存下来再给界面。
 //!
+//! - 上游给的图比要的宽很多时（有的服务器不理会 maxWidth，一律给原图）先缩到要的宽度再存（[`downsample`]，主流图片库的下采样）。
 //! - 键 = 服务器 + 条目 + 图片类型 + 序号 + tag + 宽度。tag 变了就是新图，所以缓存的图永远不用重新验证。
 //! - 磁盘上限 [`CAP`]，超了按最近使用时间（命中时刷新文件修改时间）删最旧的，删到 90%。
 //! - 同一张图同时被要多次只向上游取一次；同时向上游取最多 [`PARALLEL`] 张，不把中继压垮。
@@ -102,6 +103,46 @@ pub fn content_type(b: &[u8]) -> &'static str {
     }
 }
 
+/// 比要的宽这么多倍以上才缩（服务器已按 maxWidth 缩好的图原样存，不重新编码）。
+const RESIZE_OVER: f64 = 1.2;
+
+/// 上游给的图明显比要的宽时缩到要的宽度（等比），带透明的存 PNG、其余存 JPEG（质量 90）：
+/// 小卡片不用解码整张原图（省内存、滚动不卡），磁盘缓存也存得下更多。
+/// 认不出格式、解码失败、缩完反而更大时原样返回。
+pub fn downsample(bytes: Vec<u8>, width: u32) -> Vec<u8> {
+    use image::{ImageFormat, imageops::FilterType};
+    let Ok(fmt) = image::guess_format(&bytes) else {
+        return bytes;
+    };
+    if !matches!(
+        fmt,
+        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP
+    ) {
+        return bytes;
+    }
+    let Ok(img) = image::load_from_memory_with_format(&bytes, fmt) else {
+        return bytes;
+    };
+    if f64::from(img.width()) <= f64::from(width) * RESIZE_OVER {
+        return bytes;
+    }
+    let small = img.resize(width, u32::MAX, FilterType::CatmullRom);
+    let mut out = std::io::Cursor::new(Vec::new());
+    let ok = if small.color().has_alpha() {
+        small.write_to(&mut out, ImageFormat::Png).is_ok()
+    } else {
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+            .encode_image(&small.to_rgb8())
+            .is_ok()
+    };
+    let out = out.into_inner();
+    if ok && out.len() < bytes.len() {
+        out
+    } else {
+        bytes
+    }
+}
+
 /// 一次取图的结果：图片字节，或者给界面的 HTTP 状态码。
 type Got = Result<Arc<Vec<u8>>, u16>;
 
@@ -179,7 +220,15 @@ impl Images {
             .clone();
         let got = cell
             .get_or_init(|| async {
-                let r = self.fetch(&req.upstream(api_base)).await;
+                let width = req.width;
+                let r = match self.fetch(&req.upstream(api_base)).await {
+                    // 解码、缩放是 CPU 活，不占异步线程
+                    Ok(b) => tokio::task::spawn_blocking(move || downsample(b, width))
+                        .await
+                        .map(Arc::new)
+                        .map_err(|_| 500u16),
+                    Err(s) => Err(s),
+                };
                 if let Ok(b) = &r {
                     self.store(&path, b).await;
                 }
@@ -197,7 +246,7 @@ impl Images {
         got
     }
 
-    async fn fetch(&self, url: &str) -> Got {
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, u16> {
         let _slot = self.slots.acquire().await.map_err(|_| 503u16)?;
         let resp = self.http.get(url).send().await.map_err(|e| {
             log::warn!("取图失败：{}", e.without_url());
@@ -207,8 +256,7 @@ impl Images {
         if !status.is_success() {
             return Err(status.as_u16());
         }
-        let b = resp.bytes().await.map_err(|_| 502u16)?;
-        Ok(Arc::new(b.to_vec()))
+        resp.bytes().await.map(|b| b.to_vec()).map_err(|_| 502u16)
     }
 
     /// 先写临时文件再改名：写到一半断电不会留下半张图被当成命中。
@@ -343,6 +391,51 @@ mod tests {
         ] {
             assert!(Req::parse(bad).is_none(), "{bad}");
         }
+    }
+
+    fn encode(img: image::DynamicImage, fmt: image::ImageFormat) -> Vec<u8> {
+        let mut c = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut c, fmt).unwrap();
+        c.into_inner()
+    }
+
+    /// 服务器给原图时：缩到要的宽度、保持比例；带透明的仍是 PNG；本来就够小的、认不出的原样返回。
+    #[test]
+    fn downsample_big_images_only() {
+        use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage, RgbaImage};
+        // 有纹理的原图（纯色图压缩得太好，缩完不一定更小）
+        let poster = DynamicImage::ImageRgb8(RgbImage::from_fn(1000, 1500, |x, y| {
+            image::Rgb([(x * 7) as u8, (y * 13) as u8, ((x ^ y) * 3) as u8])
+        }));
+        let big = encode(poster, ImageFormat::Jpeg);
+        let small = downsample(big.clone(), 240);
+        let img = image::load_from_memory(&small).unwrap();
+        assert_eq!(img.dimensions(), (240, 360));
+        assert_eq!(content_type(&small), "image/jpeg");
+        assert!(
+            small.len() < big.len() / 4,
+            "{} → {}",
+            big.len(),
+            small.len()
+        );
+
+        let logo = DynamicImage::ImageRgba8(RgbaImage::from_fn(1200, 400, |x, y| {
+            image::Rgba([(x % 255) as u8, (y % 255) as u8, 0, (x % 2 * 255) as u8])
+        }));
+        let small = downsample(encode(logo, ImageFormat::Png), 480);
+        assert_eq!(content_type(&small), "image/png", "带透明的要保留 PNG");
+        assert_eq!(
+            image::load_from_memory(&small).unwrap().dimensions(),
+            (480, 160)
+        );
+
+        // 已经是要的尺寸（服务器缩好的）：原样，不重新编码
+        let fit = encode(
+            DynamicImage::ImageRgb8(RgbImage::new(260, 390)),
+            ImageFormat::Jpeg,
+        );
+        assert_eq!(downsample(fit.clone(), 240), fit);
+        assert_eq!(downsample(b"not an image".to_vec(), 240), b"not an image");
     }
 
     #[test]

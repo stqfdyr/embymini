@@ -108,7 +108,9 @@ jobs:
             [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
             $bmp.Save("$PWD\smoke\app.png")
           } catch { Write-Host "截图失败（不影响判断）：$_" }
-          $logFile = "$env:LOCALAPPDATA\com.stqfdyr.embymini\logs\EmbyMini.log"
+          # 所有数据在安装目录下的 data\，系统盘的旧位置不应再出现
+          $logFile = Join-Path $exe.DirectoryName 'data\logs\EmbyMini.log'
+          if (-not (Test-Path $logFile)) { throw "日志不在安装目录的 data\logs 下：$logFile" }
           $log = Get-Content $logFile -Raw -Encoding utf8
           Write-Host $log
           Copy-Item $logFile smoke/
@@ -116,6 +118,9 @@ jobs:
           Stop-Process $app.Id
           if ($log -notmatch '自带 mpv 配置：([A-Z]:\\[^\r\n]*)') { throw '日志里没有正确的自带 mpv 配置路径（带 \\?\ 前缀或没找到）' }
           if (-not (Test-Path "$($Matches[1])\scripts\modernz.lua")) { throw "配置目录里没有 ModernZ：$($Matches[1])" }
+          foreach ($d in "$env:APPDATA\com.stqfdyr.embymini", "$env:LOCALAPPDATA\com.stqfdyr.embymini") {
+            if (Test-Path $d) { throw "系统盘上还有数据目录：$d" }
+          }
 
       - uses: actions/upload-artifact@v4
         if: always()

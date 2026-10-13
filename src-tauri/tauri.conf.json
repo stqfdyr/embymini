@@ -20,7 +20,9 @@
         "minHeight": 600,
         "center": true,
         "decorations": false,
-        "shadow": true
+        "shadow": true,
+        "create": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --no-proxy-server"
       }
     ],
     "security": {
@@ -46,7 +48,8 @@
       "nsis": {
         "languages": [
           "SimpChinese"
-        ]
+        ],
+        "installerHooks": "windows/hooks.nsh"
       }
     }
   }

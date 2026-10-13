@@ -1,8 +1,51 @@
-//! 本地配置：服务器列表、当前服务器、播放设置。存成一个 JSON 文件（应用配置目录下的 config.json）。
+//! 本地配置：服务器列表、当前服务器、播放设置。存成一个 JSON 文件（数据目录下的 config.json，见 [`data_root`]）。
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::Path};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+/// 数据目录里的标记文件。卸载时只有它在，才删 `data\`：防止用户把程序直接装在一个
+/// 本来就有 `data` 文件夹的目录里，卸载时误删别人的东西。改名要同步改 `windows/hooks.nsh`。
+pub const MARKER: &str = ".embymini";
+
+/// 数据根目录：所有数据（配置、日志、界面缓存、mpv 缓存）都放程序旁边的 `data\`，系统盘不留东西。
+/// 安装器默认按当前用户安装、不提权，用户选的安装目录一定可写；
+/// 不可写时（例如手动拷到只读位置）退回 `%LOCALAPPDATA%\<identifier>`。
+pub fn data_root(identifier: &str) -> PathBuf {
+    let beside_exe = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| dunce::simplified(d).join("data")));
+    beside_exe
+        .filter(|d| fs::create_dir_all(d).is_ok() && fs::write(d.join(MARKER), b"").is_ok())
+        .unwrap_or_else(|| {
+            std::env::var_os("LOCALAPPDATA")
+                .map_or_else(std::env::temp_dir, PathBuf::from)
+                .join(identifier)
+        })
+}
+
+/// 旧版本的配置（config.json、mpv.conf）在 `%APPDATA%\<id>`，日志、界面缓存、mpv 缓存在 `%LOCALAPPDATA%\<id>`。
+/// 新位置还没有 config.json 时把那两个文件搬过来（可能跨盘，所以复制），都成功后删掉 `old_dirs`
+/// （包含数据根目录的那个除外）。config.json 最后复制：它出现在新位置就代表搬完了。返回是否搬了。
+pub fn migrate(root: &Path, old_config: &Path, old_dirs: &[PathBuf]) -> io::Result<bool> {
+    if root.join("config.json").exists() || !old_config.join("config.json").is_file() {
+        return Ok(false);
+    }
+    fs::create_dir_all(root)?;
+    for f in ["mpv.conf", "config.json"] {
+        let src = old_config.join(f);
+        if src.is_file() {
+            fs::copy(&src, root.join(f))?;
+        }
+    }
+    for d in old_dirs.iter().filter(|d| !root.starts_with(d)) {
+        let _ = fs::remove_dir_all(d);
+    }
+    Ok(true)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
@@ -232,5 +275,31 @@ mod tests {
         assert_eq!(load(&path).preload_percent, 80);
         assert!(path.with_extension("json.bad").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_moves_config_once_and_cleans_old_dirs() {
+        let t = std::env::temp_dir().join(format!("embymini-mig-{}", std::process::id()));
+        let (root, old_cfg, old_local) = (t.join("data"), t.join("roaming"), t.join("local"));
+        fs::create_dir_all(&old_cfg).unwrap();
+        fs::create_dir_all(old_local.join("logs")).unwrap();
+        fs::write(old_cfg.join("config.json"), b"{}").unwrap();
+        fs::write(old_cfg.join("mpv.conf"), b"volume=50").unwrap();
+        let old = [old_cfg.clone(), old_local.clone()];
+        assert!(migrate(&root, &old_cfg, &old).unwrap());
+        assert_eq!(fs::read(root.join("mpv.conf")).unwrap(), b"volume=50");
+        assert!(root.join("config.json").is_file());
+        assert!(!old_cfg.exists() && !old_local.exists());
+        // 新位置已有配置：什么都不做
+        fs::create_dir_all(&old_cfg).unwrap();
+        fs::write(old_cfg.join("config.json"), b"{}").unwrap();
+        assert!(!migrate(&root, &old_cfg, &old).unwrap());
+        assert!(old_cfg.exists());
+        // 退回旧的 LOCALAPPDATA 目录当数据根时，不能把它自己删了
+        let root2 = old_local.join("data");
+        fs::create_dir_all(&old_local).unwrap();
+        assert!(migrate(&root2, &old_cfg, &[old_cfg.clone(), old_local.clone()]).unwrap());
+        assert!(root2.join("config.json").is_file());
+        fs::remove_dir_all(t).unwrap();
     }
 }

@@ -20,9 +20,10 @@ pub const NO_QUERY: &[(&str, &str)] = &[];
 pub enum Error {
     #[error("未登录或登录已失效")]
     Unauthorized,
-    #[error("服务器返回 {0}：{1}")]
+    #[error("{}", status_msg(*.0, .1))]
     Status(u16, String),
-    #[error("网络错误：{0}")]
+    /// 文案已按连不上 / 超时 / 证书分好类，见 [`net`]。
+    #[error("{0}")]
     Network(String),
     #[error("{0}")]
     Other(String),
@@ -43,13 +44,59 @@ impl Serialize for Error {
     }
 }
 
-/// reqwest 的错误信息里带完整 URL（含查询参数，如搜索词），去掉再上报。
-fn net(e: reqwest::Error) -> Error {
-    Error::Network(e.without_url().to_string())
+/// 5xx 多是上游或反代临时出错，回包是一页 HTML，不展示。
+fn status_msg(code: u16, body: &str) -> String {
+    match code {
+        500..=599 => format!("服务器暂时出错（{code}），稍后再试"),
+        _ => format!("服务器返回 {code}：{body}"),
+    }
 }
 
+/// 网络层错误按连不上 / 超时 / 证书分类，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
+/// 只取 source 链，不取顶层：顶层带完整 URL（含查询参数，如搜索词）。
+fn net(e: reqwest::Error) -> Error {
+    let mut chain = Vec::new();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        chain.push(s.to_string());
+        src = s.source();
+    }
+    let detail = chain.join("：");
+    let lower = detail.to_ascii_lowercase();
+    let what = if e.is_timeout() {
+        "服务器响应超时"
+    } else if ["certificate", "tls", "ssl"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        "证书或 TLS 握手失败"
+    } else if e.is_connect() {
+        "连不上服务器"
+    } else {
+        "网络错误"
+    };
+    Error::Network(if detail.is_empty() {
+        what.into()
+    } else {
+        format!("{what}（{detail}）")
+    })
+}
+
+/// 失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）。
+fn log_result<T>(method: &str, path: &str, t0: Instant, r: &Result<T, Error>) {
+    let took = t0.elapsed();
+    match r {
+        Err(e) => log::warn!("{method} {path} 失败（{took:.1?}）：{e}"),
+        Ok(_) if took >= SLOW => log::info!("{method} {path} 慢请求：{took:.1?}"),
+        Ok(_) => {}
+    }
+}
+
+/// Emby 请求一律直连，不读系统代理：reqwest 只在建 Client 时读一次系统代理，
+/// 之后代理软件开关、换端口都不会跟着变，读到的旧地址会让请求一直失败到重启。
 pub fn http_client() -> reqwest::Result<Client> {
     Client::builder()
+        .no_proxy()
         .user_agent(UA)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
@@ -96,14 +143,14 @@ fn decode<T: DeserializeOwned>(what: &str, v: Value) -> Result<T, Error> {
 
 /// 服务器名称（`/System/Info/Public`，无需登录），添加服务器时顺便校验地址可达。
 pub async fn server_name(http: &Client, base: &str) -> Result<String, Error> {
-    let v = json_or_error(
-        http.get(format!("{base}/System/Info/Public"))
-            .send()
-            .await
-            .map_err(net)?,
-    )
-    .await?;
-    Ok(v["ServerName"].as_str().unwrap_or("Emby").to_owned())
+    const PATH: &str = "/System/Info/Public";
+    let t0 = Instant::now();
+    let r = match http.get(format!("{base}{PATH}")).send().await {
+        Ok(resp) => json_or_error(resp).await,
+        Err(e) => Err(net(e)),
+    };
+    log_result("GET", PATH, t0, &r);
+    Ok(r?["ServerName"].as_str().unwrap_or("Emby").to_owned())
 }
 
 /// 用户名密码换 token，返回 `(user_id, token)`。
@@ -114,17 +161,24 @@ pub async fn login(
     user: &str,
     password: &str,
 ) -> Result<(String, String), Error> {
-    let resp = http
-        .post(format!("{base}/Users/AuthenticateByName"))
+    const PATH: &str = "/Users/AuthenticateByName";
+    let t0 = Instant::now();
+    let r = match http
+        .post(format!("{base}{PATH}"))
         .header("X-Emby-Authorization", auth_header(device_id, "", ""))
         .json(&serde_json::json!({ "Username": user, "Pw": password }))
         .send()
         .await
-        .map_err(net)?;
-    let v = match json_or_error(resp).await {
-        Err(Error::Unauthorized) => return Err(Error::Other("用户名或密码错误".into())),
-        r => r?,
+    {
+        Ok(resp) => json_or_error(resp).await,
+        Err(e) => Err(net(e)),
     };
+    let r = match r {
+        Err(Error::Unauthorized) => Err(Error::Other("用户名或密码错误".into())),
+        r => r,
+    };
+    log_result("POST", PATH, t0, &r);
+    let v = r?;
     match (v["User"]["Id"].as_str(), v["AccessToken"].as_str()) {
         (Some(uid), Some(token)) if !uid.is_empty() && !token.is_empty() => {
             Ok((uid.to_owned(), token.to_owned()))
@@ -155,7 +209,7 @@ impl Emby {
     }
 
     /// 通用请求。`path` 是 `/emby` 之后的部分，必须以 `/` 开头；查询参数单独传（键值对列表）。
-    /// 失败和慢请求写日志（只记方法和路径，不记查询参数和 token）。
+    /// 失败和慢请求写日志（[`log_result`]）。
     pub async fn call<Q: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -178,12 +232,7 @@ impl Emby {
             Ok(resp) => json_or_error(resp).await,
             Err(e) => Err(net(e)),
         };
-        let took = t0.elapsed();
-        match &r {
-            Err(e) => log::warn!("{method} {path} 失败（{took:.1?}）：{e}"),
-            Ok(_) if took >= SLOW => log::info!("{method} {path} 慢请求：{took:.1?}"),
-            Ok(_) => {}
-        }
+        log_result(method.as_str(), path, t0, &r);
         r
     }
 
@@ -490,6 +539,35 @@ pub(crate) mod tests {
         for bad in ["Users", "/a/../b", "https://evil/x", "/a?b=1", "/a#x"] {
             assert!(check_path(bad).is_err(), "{bad}");
         }
+    }
+
+    /// 连不上、超时要分开说；5xx 不展示 HTML 回包。
+    #[tokio::test]
+    async fn network_errors_are_classified() {
+        let http = http_client().unwrap();
+        // 端口 1 没人监听：连接被拒
+        let e = server_name(&http, "http://127.0.0.1:1/emby")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().starts_with("连不上服务器（"), "{e}");
+        // 收下连接但不回话：超时
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let base = format!("http://{}/emby", l.local_addr().unwrap());
+        let e = server_name(&slow, &base).await.unwrap_err();
+        assert!(e.to_string().starts_with("服务器响应超时"), "{e}");
+        assert_eq!(
+            Error::Status(502, "<html>".into()).to_string(),
+            "服务器暂时出错（502），稍后再试"
+        );
+        assert_eq!(
+            Error::Status(404, "x".into()).to_string(),
+            "服务器返回 404：x"
+        );
     }
 
     #[test]

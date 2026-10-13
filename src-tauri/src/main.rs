@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_log::{Target, TargetKind};
 use tokio::sync::mpsc;
 
 struct App {
@@ -23,8 +24,7 @@ struct App {
     http: reqwest::Client,
     /// 资源目录里的 mpv 自带配置（ModernZ 等）；打包时若附带了 mpv.exe 也在这里。
     mpv_dir: Option<PathBuf>,
-    /// mpv 的缓存目录：应用自己的缓存目录下（Windows 上是 `%LOCALAPPDATA%\com.stqfdyr.embymini\mpv`），
-    /// 卸载时勾选「删除应用程序数据」会一起删掉。
+    /// mpv 的缓存目录：数据目录下的 `mpv-cache`，卸载时勾选「删除应用程序数据」会一起删掉。
     mpv_cache: Option<PathBuf>,
     player: Mutex<Option<Player>>,
     /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
@@ -93,8 +93,7 @@ impl App {
         Ok((s.id.clone(), Emby::new(self.http.clone(), s, &c.device_id)))
     }
 
-    /// 个人 mpv 配置文件：和 config.json 同目录（Windows 上是 `%APPDATA%\com.stqfdyr.embymini\mpv.conf`），
-    /// 升级不覆盖。由用户自己创建，存在才加载。
+    /// 个人 mpv 配置文件：和 config.json 同在数据目录，升级不覆盖。由用户自己创建，存在才加载。
     fn user_mpv_conf(&self) -> PathBuf {
         self.path.with_file_name("mpv.conf")
     }
@@ -188,14 +187,18 @@ async fn server_edit(
     let (mut s, device_id) = {
         let c = app.cfg();
         let s = c.servers.iter().find(|s| s.id == id).cloned();
-        (s.ok_or_else(|| Error::Other("服务器不存在".into()))?, c.device_id.clone())
+        (
+            s.ok_or_else(|| Error::Other("服务器不存在".into()))?,
+            c.device_id.clone(),
+        )
     };
     let relogin = !password.is_empty() || user != s.user || s.token.is_empty();
     (s.url, s.port, s.user) = (url, port, user);
     let base = s.api_base();
     s.name = emby::server_name(&app.http, &base).await?;
     if relogin {
-        (s.user_id, s.token) = emby::login(&app.http, &base, &device_id, &s.user, &password).await?;
+        (s.user_id, s.token) =
+            emby::login(&app.http, &base, &device_id, &s.user, &password).await?;
     }
     let view = s.view();
     app.update(|c| {
@@ -349,6 +352,8 @@ async fn play(
 }
 
 fn main() {
+    let ctx = tauri::generate_context!();
+    let root = config::data_root(&ctx.config().identifier);
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(w) = app.get_webview_window("main") {
@@ -359,11 +364,41 @@ fn main() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
+                .clear_targets()
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::Folder {
+                        path: root.join("logs"),
+                        file_name: None,
+                    }),
+                ])
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let path = app.path().app_config_dir()?.join("config.json");
+        .setup(move |app| {
+            let p = app.path();
+            let old = [
+                p.app_config_dir()?,
+                p.app_local_data_dir()?,
+                p.app_cache_dir()?,
+            ];
+            match config::migrate(&root, &old[0], &old) {
+                Ok(true) => log::info!("已把旧版本的配置搬到数据目录"),
+                Ok(false) => {}
+                Err(e) => log::warn!("搬旧版本的配置失败：{e}"),
+            }
+            // WebView2 的数据（含图片磁盘缓存）默认在 %LOCALAPPDATA%，只能在建窗口时改，所以主窗口在这里建
+            let win = app
+                .config()
+                .app
+                .windows
+                .first()
+                .cloned()
+                .ok_or("缺少主窗口配置")?;
+            tauri::WebviewWindowBuilder::from_config(app.handle(), &win)?
+                .data_directory(root.join("webview"))
+                .build()?;
+            let path = root.join("config.json");
             let cfg = config::load(&path);
             config::save(&path, &cfg)?; // 首次启动把生成的 device_id 落盘
             let mpv_dir = app
@@ -373,13 +408,14 @@ fn main() {
                 .and_then(|d| player::bundled_dir(&d));
             // CI 冒烟测试按这一行判断安装后的路径是否正确（不能带 \\?\ 前缀），改措辞要同步改 windows.yml
             log::info!(
-                "EmbyMini {} 启动；自带 mpv 配置：{}",
+                "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
                 emby::VERSION,
+                root.display(),
                 mpv_dir
                     .as_deref()
                     .map_or("（无）".into(), |d| d.display().to_string())
             );
-            let mpv_cache = app.path().app_cache_dir().ok().map(|d| d.join("mpv"));
+            let mpv_cache = Some(root.join("mpv-cache"));
             app.manage(App {
                 path,
                 cfg: Mutex::new(cfg),
@@ -402,7 +438,7 @@ fn main() {
             emby,
             play
         ])
-        .build(tauri::generate_context!())
+        .build(ctx)
         .unwrap_or_else(|e| panic!("EmbyMini 启动失败：{e}"))
         .run(|handle, ev| {
             if let tauri::RunEvent::Exit = ev {

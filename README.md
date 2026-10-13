@@ -42,14 +42,19 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 
 ## 数据位置与卸载
 
-| 位置 | 内容 |
-|---|---|
-| `%LOCALAPPDATA%\EmbyMini` | 程序与自带的 mpv |
-| `%APPDATA%\com.stqfdyr.embymini\config.json` | 服务器列表（含登录 token，不存密码）、播放设置 |
-| `%APPDATA%\com.stqfdyr.embymini\mpv.conf` | 个人 mpv 配置：自己新建，在自带配置之后加载，同名选项以它为准，升级不覆盖 |
-| `%LOCALAPPDATA%\com.stqfdyr.embymini` | 日志（`logs\`）、界面缓存、mpv 着色器缓存 |
+所有数据都在安装目录下的 `data\`，系统盘不留东西（默认安装目录是 `%LOCALAPPDATA%\EmbyMini`，安装时可以改到别的盘）：
 
-卸载走「设置 → 应用 → 已安装的应用」。卸载时勾选「删除应用程序数据」，上表后三项一并删除。
+| 位置（相对安装目录） | 内容 |
+|---|---|
+| `data\config.json` | 服务器列表（含登录 token，不存密码）、播放设置 |
+| `data\mpv.conf` | 个人 mpv 配置：自己新建，在自带配置之后加载，同名选项以它为准，升级不覆盖 |
+| `data\logs\` | 日志 |
+| `data\webview\` | 界面数据（含海报磁盘缓存） |
+| `data\mpv-cache\` | mpv 着色器缓存 |
+
+安装目录不可写时（例如手动拷到只读位置）退回 `%LOCALAPPDATA%\com.stqfdyr.embymini`。旧版本放在 `%APPDATA%` / `%LOCALAPPDATA%` 下的配置，新版首次启动时自动搬过来并删掉旧目录。
+
+卸载走「设置 → 应用 → 已安装的应用」。勾选「删除应用程序数据」时 `data\` 一并删除；自动更新不动它。
 
 ## 第三方
 

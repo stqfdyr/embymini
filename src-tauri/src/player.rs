@@ -46,7 +46,7 @@ pub struct Options {
     /// mpv 运行时自己写的文件（显卡着色器缓存等）放这里。不指定的话，即使给了 `--config-dir`，
     /// mpv 也会写到它自己的 `%LOCALAPPDATA%\mpv\cache`，卸载 EmbyMini 时清不掉。
     pub cache_dir: Option<PathBuf>,
-    /// 个人 mpv 配置（存在才加载）：在自带配置之后读，同名选项以它为准；放在应用配置目录，升级不覆盖。
+    /// 个人 mpv 配置（存在才加载）：在自带配置之后读，同名选项以它为准；放在数据目录，升级不覆盖。
     pub user_conf: Option<PathBuf>,
     pub extra_args: Vec<String>,
 }
@@ -397,6 +397,17 @@ pub async fn start(
     // 参数里只有路径和开关，没有 token（token 经 IPC 设置），可以整串记日志
     log::info!("启动 mpv：{} {}", opts.mpv.display(), args.join(" "));
     let mut cmd = tokio::process::Command::new(&opts.mpv);
+    // 播放直连，不走代理：mpv（ffmpeg）只认这类环境变量，用户的终端或代理软件可能设过
+    for k in [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ] {
+        cmd.env_remove(k);
+    }
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

@@ -8,6 +8,9 @@
 -- It is based on the official osc.lua from mpv, licensed under the
 -- GNU Lesser General Public License v2.1 (LGPLv2.1).
 -- Full license: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+--
+-- Modified for EmbyMini (changes marked "EmbyMini:"): the top bar shows the
+-- window title centered and the network speed next to the window controls.
 
 local assdraw = require "mp.assdraw"
 local msg = require "mp.msg"
@@ -2078,14 +2081,25 @@ local function window_controls()
         lo.button.hoverstyle = osc_styles.element_hover
     end
 
-    -- Window Title
+    -- EmbyMini: network speed, right-aligned next to the window controls
+    local speed_w = 120
+    local speed_right = controlbox_left - (user_opts.window_controls and 10 or 25)
+    lo = add_layout("netspeed")
+    lo.geometry = {x = speed_right, y = button_y + 14, an = 3, w = speed_w, h = wc_geo.h}
+    lo.group = "top"
+    lo.alpha[3] = 0
+    lo.style = osc_styles.window_title
+
+    -- Window Title (EmbyMini: centered, kept clear of the speed on both sides)
     if user_opts.show_window_title then
+        local center = osc_param.playresx / 2
+        local half = math.max(0, math.min(center - math.max(20, titlebox_left + 4), speed_right - speed_w - 10 - center))
         lo = add_layout("windowtitle")
-        lo.geometry = {x = math.max(20, titlebox_left + 4), y = button_y + 14, an = 1, w = osc_param.playresx - 50, h = wc_geo.h}
+        lo.geometry = {x = center, y = button_y + 14, an = 2, w = half * 2, h = wc_geo.h}
         lo.group = "top"
         lo.alpha[3] = 0
-        lo.style = string.format("%s{\\clip(%f,%f,%f,%f)}", osc_styles.window_title, titlebox_left, wc_geo.y - wc_geo.h, controlbox_left, wc_geo.y + wc_geo.h)
-        state.windowtitle_max_w = controlbox_left - math.max(20, titlebox_left + 4)
+        lo.style = string.format("%s{\\clip(%f,%f,%f,%f)}", osc_styles.window_title, center - half, wc_geo.y - wc_geo.h, center + half, wc_geo.y + wc_geo.h)
+        state.windowtitle_max_w = half * 2
     end
 
     -- only add top areas and margin if one of the elements is enabled
@@ -3169,6 +3183,16 @@ local function osc_init()
     ne.content = function ()
         local t = make_escaped_title(mp.get_property("title"))
         return user_opts.truncate_title and truncate_title(t, state.windowtitle_max_w, osc_styles.window_title) or t
+    end
+
+    -- EmbyMini: network speed (bytes actually read from the network per second)
+    ne = new_element("netspeed", "button")
+    ne.content = function ()
+        local dcs = state.demuxer_cache_state
+        local rate = dcs and dcs["raw-input-rate"]
+        if not rate then return "" end
+        if rate >= 1048576 then return string.format("%.1f MB/s", rate / 1048576) end
+        return string.format("%d KB/s", math.floor(rate / 1024))
     end
 
     -- OSC title

@@ -4,7 +4,7 @@ Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给
 
 - 多服务器：地址、端口分开填，随时切换；支持反向代理挂在子路径下的服务器
 - 浏览：首页轮播、继续观看、各媒体库最新；媒体库分页、搜索、收藏；剧集详情（季、集、演职人员、类似作品、媒体信息）
-- 播放：mpv + ModernZ 界面；续播、整季连播、按进度预加载下一集、选集菜单（F8）、换集沿用音轨与字幕、外挂字幕
+- 播放：mpv + ModernZ 界面（顶栏居中标题 + 网速）；续播、整季连播、按进度预加载下一集、选集菜单（F8）、换集沿用音轨与字幕、外挂字幕
 - 进度用 Emby 标准的 Sessions 接口回传，其他客户端同步可见；token 不出现在 mpv 的播放列表与统计页里
 
 ## 安装
@@ -54,4 +54,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 ## 第三方
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
-- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）
+- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速），改动处标 `EmbyMini:`

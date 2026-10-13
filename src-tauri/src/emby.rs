@@ -59,7 +59,7 @@ fn net(e: reqwest::Error) -> Error {
 }
 
 /// 网络错误的类别（诊断数据用：connect / timeout / tls / net）和给人看的错误。
-fn net_classified(e: &reqwest::Error) -> (&'static str, Error) {
+pub(crate) fn net_classified(e: &reqwest::Error) -> (&'static str, Error) {
     let mut chain = Vec::new();
     let mut src = std::error::Error::source(e);
     while let Some(s) = src {
@@ -88,11 +88,13 @@ fn net_classified(e: &reqwest::Error) -> (&'static str, Error) {
     (class, err)
 }
 
-/// 路径模板：id 段（纯数字，或 16 位以上的十六进制）换成 `{id}`，诊断数据按接口聚合。
+/// 路径模板：id 段换成 `{id}`，诊断数据按接口聚合，也不把用户 id 发出去。
+/// 服务器的 id 格式各不相同（纯数字、32 位十六进制、`m01KXAMQ…` 这类带前缀的 ULID），
+/// 而 Emby 的路由名都不含数字：段里有数字，或是 16 位以上的十六进制，就当 id。
 fn template(path: &str) -> String {
     path.split('/')
         .map(|seg| {
-            let id = (!seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
+            let id = seg.bytes().any(|b| b.is_ascii_digit())
                 || (seg.len() >= 16 && seg.bytes().all(|b| b.is_ascii_hexdigit()));
             if id { "{id}" } else { seg }
         })
@@ -474,6 +476,9 @@ pub struct PlaybackInfo {
 pub struct MediaSource {
     pub id: String,
     pub container: Option<String>,
+    /// 总码率（bit/s）、文件大小（字节），诊断数据用。
+    pub bitrate: Option<i64>,
+    pub size: Option<i64>,
     pub direct_stream_url: Option<String>,
     pub default_audio_stream_index: Option<i32>,
     pub default_subtitle_stream_index: Option<i32>,
@@ -596,6 +601,19 @@ pub(crate) mod tests {
         assert_eq!(
             template("/Items/12/PlaybackInfo"),
             "/Items/{id}/PlaybackInfo"
+        );
+        // ULID 样式的用户 id、带前缀的条目 id
+        assert_eq!(
+            template("/Users/01KHGE98GAAPFWP1M30XY3KRS8/Items/m01M3H8YV26WE88S0W5BEM88JBW"),
+            "/Users/{id}/Items/{id}"
+        );
+        assert_eq!(
+            template("/Users/01KHGE98GAAPFWP1M30XY3KRS8/Items/Latest"),
+            "/Users/{id}/Items/Latest"
+        );
+        assert_eq!(
+            template("/Sessions/Playing/Progress"),
+            "/Sessions/Playing/Progress"
         );
     }
 

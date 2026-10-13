@@ -9,6 +9,7 @@
   import Dropdown from './lib/Dropdown.svelte'
   import { dismiss, errText, loadConfig, notify, refresh, refreshQuiet, session, setUnauthorizedHandler, toasts } from './lib/api.svelte'
   import { back, go, route } from './lib/router.svelte'
+  import { flushTel } from './lib/tel'
   import Favorites from './routes/Favorites.svelte'
   import Home from './routes/Home.svelte'
   import Item from './routes/Item.svelte'
@@ -96,7 +97,7 @@
       <button title={maximized ? '向下还原' : '最大化'} onclick={() => win.toggleMaximize()}>
         {#if maximized}<Copy size={13} strokeWidth={1.5} style="transform:scaleX(-1)" />{:else}<Square size={13} strokeWidth={1.5} />{/if}
       </button>
-      <button class="close" title="关闭" onclick={() => win.close()}><X size={18} strokeWidth={1.5} /></button>
+      <button class="close" title="关闭" onclick={() => flushTel().finally(() => win.close())}><X size={18} strokeWidth={1.5} /></button>
     </div>
   </div>
 </header>

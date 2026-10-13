@@ -3,7 +3,7 @@ import { untrack } from 'svelte'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
 import type { MenuItem } from './menu.svelte'
-import { op, setTel } from './tel'
+import { op, pageFresh, pageSnap, setTel } from './tel'
 import { readSnap, writeSnap } from './snap'
 import type { Item, Page } from './types'
 
@@ -11,7 +11,7 @@ export type ServerView = { id: string; name: string; url: string; port: number; 
 export type ConfigView = {
   active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string
   updateProxy: string | null; version: string
-  telemetryAvailable: boolean; telemetry: boolean; telemetryName: string
+  telemetryAvailable: boolean; telemetry: boolean; telemetryName: string; startMs: number
 }
 export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }
 
@@ -59,7 +59,7 @@ export async function loadConfig() {
   const c = await invoke<ConfigView>('config_get')
   session.cfg = c
   session.server = c.servers.find((s) => s.id === c.active) ?? null
-  setTel(c.telemetry)
+  setTel(c.telemetry, c.startMs)
   cache.clear()
   seen.clear()
 }
@@ -91,13 +91,15 @@ export function loader<T>(fn: () => Promise<T>, key?: () => string) {
   $effect(() => {
     let alive = true
     const k = key && snapKey(key())
+    let fromSnap = false
     if (k && untrack(() => s.data) === undefined) {
       const snap = readSnap<T>(k)
-      if (snap !== undefined) s.data = snap
+      if (snap !== undefined) ((s.data = snap), (fromSnap = true), pageSnap())
     }
     fn().then(
       (d) => {
         if (!alive) return
+        if (fromSnap) pageFresh()
         s.data = d
         s.error = undefined
         if (k) writeSnap(k, d)
@@ -225,6 +227,7 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
       const p = await get<Page>(`/Users/${uid()}/Items`, { ...q, StartIndex: start, Limit: size })
       if (mine !== gen) return
       if (start === 0) {
+        if (fromSnap) pageFresh()
         s.items = p.Items
         fromSnap = false
         writeSnap(key(), { items: p.Items, total: p.TotalRecordCount })
@@ -245,6 +248,7 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
     gen++
     const snap = readSnap<{ items: Item[]; total: number }>(key())
     fromSnap = !!snap
+    if (snap) pageSnap()
     Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap })
     untrack(more)
   })

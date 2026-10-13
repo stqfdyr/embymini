@@ -76,6 +76,23 @@ pub fn rec(k: &str, v: Value) {
 
 /// 写入任务收到它就清空暂存（见 [`purge`]）；不是真的记录类别。
 const PURGE: &str = "__purge";
+/// 写入任务收到它就立刻落盘（见 [`flush_now`]）。
+const FLUSH: &str = "__flush";
+static FLUSHED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// 程序退出前调用：写入任务平时 5 秒才落一次盘，最后几秒（这一集的结束、mpv 退出码、Stopped 请求）
+/// 不落盘就丢了。让它立刻写，最多等 `wait`。没开过诊断数据时什么都不做。
+pub fn flush_now(wait: Duration) {
+    let Some(tx) = TX.get() else { return };
+    tauri::async_runtime::block_on(async {
+        let done = FLUSHED.notified();
+        tokio::pin!(done);
+        done.as_mut().enable(); // 先登记再发，写入任务通知得再快也收得到
+        if tx.try_send(json!({ "k": FLUSH })).is_ok() {
+            let _ = tokio::time::timeout(wait, done).await;
+        }
+    });
+}
 
 /// 用户关掉诊断数据：没送出去的也不送了，删掉暂存（交给写入任务做，不和它正在写的文件冲突）。
 pub fn purge() {
@@ -125,7 +142,7 @@ pub fn start(dir: PathBuf, meta: Meta) {
 
 // ---------- 限流 ----------
 
-/// 每类每分钟的上限；`log` / `js_error` 同文案每分钟只记一条，其余计数。超限的每分钟汇总成一条 `capped`。
+/// 每类每分钟的上限；`log` / `ui_js_error` / `mpv_log` 同文案每分钟只记一条，其余计数。超限的每分钟汇总成一条 `capped`。
 struct Caps {
     minute: u64,
     counts: HashMap<String, u32>,
@@ -166,8 +183,10 @@ impl Caps {
             self.minute = minute;
         }
         let kind = v["k"].as_str().unwrap_or("").to_owned();
-        let dedup = matches!(kind.as_str(), "log" | "js_error")
-            && !self.seen.insert(v["msg"].as_str().unwrap_or("").to_owned());
+        let dedup = matches!(kind.as_str(), "log" | "ui_js_error" | "mpv_log")
+            && !self
+                .seen
+                .insert(format!("{kind}\0{}", v["msg"].as_str().unwrap_or("")));
         let n = self.counts.entry(kind.clone()).or_default();
         *n += 1;
         if dedup || *n > Self::limit(&kind) || self.total >= TOTAL_LIMIT {
@@ -194,6 +213,17 @@ impl Spool {
     fn push(&mut self, v: &Value) {
         let _ = serde_json::to_writer(&mut self.buf, v);
         self.buf.push(b'\n');
+    }
+
+    /// 定时（和退出前）落盘：补上队列满丢弃的计数，追加到文件。
+    fn write_out(&mut self) {
+        let dropped = DROPPED.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            self.push(&json!({ "k": "dropped", "t": now_ms(), "n": dropped }));
+        }
+        if let Err(e) = self.flush() {
+            log::warn!("诊断数据写盘失败：{e}");
+        }
     }
 
     /// 丢掉内存里的行和目录里所有暂存、批次。
@@ -312,18 +342,14 @@ async fn write_loop(dir: PathBuf, meta: Value, mut rx: mpsc::Receiver<Value>) {
         tokio::select! {
             v = rx.recv() => match v {
                 Some(v) if v["k"] == PURGE => spool.purge(),
+                Some(v) if v["k"] == FLUSH => {
+                    spool.write_out();
+                    FLUSHED.notify_waiters();
+                }
                 Some(v) => for line in caps.admit(v) { spool.push(&line) },
                 None => break,
             },
-            _ = tick.tick() => {
-                let dropped = DROPPED.swap(0, Ordering::Relaxed);
-                if dropped > 0 {
-                    spool.push(&json!({ "k": "dropped", "t": now_ms(), "n": dropped }));
-                }
-                if let Err(e) = spool.flush() {
-                    log::warn!("诊断数据写盘失败：{e}");
-                }
-            }
+            _ = tick.tick() => spool.write_out(),
         }
     }
 }
@@ -370,7 +396,11 @@ async fn send(http: &reqwest::Client, url: &str, token: &str, batch: &Path) -> S
         Ok(s) if (200..300).contains(&s) => Sent::Ok,
         Ok(s @ (400 | 413)) => Sent::Rejected(s),
         Ok(s) => Sent::Retry(format!("HTTP {s}")),
-        Err(e) => Sent::Retry(e.without_url().to_string()),
+        // 分类 + 错误链（顶层只有一句 error sending request），同 Emby 请求的错误文案
+        Err(e) => {
+            let (class, err) = crate::emby::net_classified(&e);
+            Sent::Retry(format!("{class}: {err}"))
+        }
     }
 }
 
@@ -446,6 +476,21 @@ mod tests {
         assert_eq!(c.admit(at("log", 60_000, json!({ "msg": "x" }))).len(), 1);
         assert_eq!(c.admit(at("log", 60_000, json!({ "msg": "x" }))).len(), 0);
         assert_eq!(c.admit(at("log", 60_000, json!({ "msg": "y" }))).len(), 1);
+        // 界面 JS 错误、mpv 警告同样去重，不同类别的同文案互不影响
+        assert_eq!(
+            c.admit(at("ui_js_error", 60_000, json!({ "msg": "x" })))
+                .len(),
+            1
+        );
+        assert_eq!(
+            c.admit(at("ui_js_error", 60_000, json!({ "msg": "x" })))
+                .len(),
+            0
+        );
+        assert_eq!(
+            c.admit(at("mpv_log", 60_000, json!({ "msg": "x" }))).len(),
+            1
+        );
         // 下一分钟：先补上一分钟的汇总，再放行
         let out = c.admit(at("api", 120_000, json!({})));
         let capped: HashMap<String, u64> = out
@@ -460,7 +505,11 @@ mod tests {
             .collect();
         assert_eq!(
             capped,
-            HashMap::from([("api".into(), 100), ("log".into(), 1)])
+            HashMap::from([
+                ("api".into(), 100),
+                ("log".into(), 1),
+                ("ui_js_error".into(), 1)
+            ])
         );
         assert_eq!(out.last().unwrap()["k"], "api");
     }
@@ -520,6 +569,20 @@ mod tests {
         s.flush().unwrap();
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 连不上时的重试原因带分类和错误链，不是一句笼统的 error sending request。
+    #[tokio::test]
+    async fn send_failure_is_classified() {
+        let dir = std::env::temp_dir().join(format!("embymini-tel-send-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let batch = dir.join("batch-1-abc.gz");
+        fs::write(&batch, b"x").unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let r = send(&http, "http://127.0.0.1:1/ingest", "t", &batch).await;
+        fs::remove_dir_all(dir).unwrap();
+        let Sent::Retry(e) = r else { panic!("{r:?}") };
+        assert!(e.starts_with("connect: 连不上服务器（"), "{e}");
     }
 
     /// 上传带 token 和批次 id；2xx 算成功，400 / 413 丢弃，其余重试。

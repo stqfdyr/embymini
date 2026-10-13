@@ -11,7 +11,7 @@ use config::{Config, Server, ServerView};
 use emby::{Emby, Error};
 use reqwest::Method;
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -47,6 +47,18 @@ struct App {
 // 下次启动作为诊断数据 `exit` 上报，用来查「关闭时卡一下」卡在哪一段。
 
 static CLOSE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// 进程启动的时刻（单调时钟 + 墙上时间毫秒）：使用时长、启动耗时都从这里算。
+static START: std::sync::OnceLock<(std::time::Instant, u64)> = std::sync::OnceLock::new();
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn uptime_s() -> u64 {
+    START.get().map_or(0, |(t, _)| t.elapsed().as_secs())
+}
 static CLOSE_MARKS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
 /// 开始计时（重复调用以第一次为准）。
@@ -68,13 +80,69 @@ fn exit_file(root: &std::path::Path) -> PathBuf {
 
 /// 退出前把各阶段耗时存盘（进程马上结束，诊断数据的写入任务来不及落盘）。
 fn exit_save(root: &std::path::Path) {
-    let marks: Map<String, Value> = lock(&CLOSE_MARKS)
+    let mut marks: Map<String, Value> = lock(&CLOSE_MARKS)
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).into()))
         .collect();
     if !marks.is_empty() {
+        // 下次启动才报，那时可能已经升级：带上这次的版本；运行时长是使用时长的分母
+        marks.insert("version".into(), emby::VERSION.into());
+        marks.insert("uptime_s".into(), uptime_s().into());
         let _ = std::fs::write(exit_file(root), Value::Object(marks).to_string());
     }
+}
+
+// ---------- 异常退出检测 ----------
+// 启动时写 data\running.json（版本、启动时刻、最后存活时刻），每分钟刷新存活时刻，正常退出（含自动更新）删掉。
+// 下次启动时它还在 = 上次没走正常退出：崩溃、被结束进程、关机时被杀，记一条 `crash`。
+
+fn running_file(root: &std::path::Path) -> PathBuf {
+    root.join("running.json")
+}
+
+fn running_write(root: &std::path::Path) {
+    let started = START.get().map_or(0, |(_, ms)| *ms);
+    let v = serde_json::json!({ "version": emby::VERSION, "started": started, "alive": now_ms() });
+    let _ = std::fs::write(running_file(root), v.to_string());
+}
+
+/// 启动时：上次的标记还在就补记 `crash`，然后写这次的标记，并每分钟刷新一次。
+fn running_check(root: &std::path::Path) {
+    let f = running_file(root);
+    if let Some(v) = std::fs::read(&f)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    {
+        let (started, alive) = (
+            v["started"].as_u64().unwrap_or(0),
+            v["alive"].as_u64().unwrap_or(0),
+        );
+        log::warn!(
+            "上次没有正常退出（版本 {}）",
+            v["version"].as_str().unwrap_or("?")
+        );
+        telemetry::rec(
+            "crash",
+            serde_json::json!({
+                "version": v["version"], "uptime_s": alive.saturating_sub(started) / 1000,
+                "ago_s": now_ms().saturating_sub(alive) / 1000,
+            }),
+        );
+    }
+    running_write(root);
+    let root = root.to_owned();
+    tauri::async_runtime::spawn(async move {
+        let mut t = tokio::time::interval(Duration::from_secs(60));
+        t.tick().await;
+        loop {
+            t.tick().await;
+            running_write(&root);
+        }
+    });
+}
+
+fn running_clear(root: &std::path::Path) {
+    let _ = std::fs::remove_file(running_file(root));
 }
 
 /// 启动时把上次退出的耗时补记成诊断数据（没开诊断就只删文件）。
@@ -237,6 +305,8 @@ struct ConfigView {
     telemetry_available: bool,
     telemetry: bool,
     telemetry_name: String,
+    /// 进程启动的墙上时间（毫秒），界面据此报启动耗时。
+    start_ms: u64,
 }
 
 #[tauri::command]
@@ -253,6 +323,7 @@ fn config_get(app: State<'_, App>) -> ConfigView {
         telemetry_available: telemetry::AVAILABLE,
         telemetry: c.telemetry,
         telemetry_name: tel_name(&c),
+        start_ms: START.get().map_or(0, |(_, ms)| *ms),
     }
 }
 
@@ -588,7 +659,15 @@ fn updater(handle: &AppHandle, app: &App) -> Result<tauri_plugin_updater::Update
 /// 有新版本时返回版本号和更新说明（Release 里的 latest.json，签名用编进程序的公钥校验）。
 #[tauri::command]
 async fn update_check(handle: AppHandle, app: State<'_, App>) -> Result<Option<UpdateInfo>, Error> {
-    let u = updater(&handle, &app)?.check().await.map_err(|e| {
+    let t0 = std::time::Instant::now();
+    let proxy = app.cfg().update_proxy.is_some();
+    let r = updater(&handle, &app)?.check().await;
+    update_rec("check", proxy, t0, r.as_ref().err(), |m| {
+        if let Ok(u) = &r {
+            m.insert("found".into(), json!(u.as_ref().map(|u| u.version.clone())));
+        }
+    });
+    let u = r.map_err(|e| {
         log::warn!("检查更新失败：{e}");
         Error::Other(format!("检查更新失败：{e}"))
     })?;
@@ -612,8 +691,10 @@ async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Er
         .map_err(fail)?
         .ok_or_else(|| Error::Other("已是最新版本".into()))?;
     log::info!("下载新版本 {}", u.version);
+    let proxy = app.cfg().update_proxy.is_some();
+    let t0 = std::time::Instant::now();
     let (mut got, mut shown) = (0u64, u64::MAX);
-    let bytes = u
+    let r = u
         .download(
             |n, total| {
                 got += n as u64;
@@ -626,21 +707,64 @@ async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Er
             },
             || {},
         )
-        .await
-        .map_err(fail)?;
+        .await;
+    update_rec("download", proxy, t0, r.as_ref().err(), |m| {
+        m.insert("to".into(), json!(u.version));
+        m.insert("mb".into(), json!(got >> 20));
+    });
+    let bytes = r.map_err(fail)?;
     let h = handle.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
         h.state::<App>().shutdown(Duration::from_secs(3));
     })
     .await;
     log::info!("启动安装器，程序退出");
+    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先把诊断数据落盘、去掉运行标记（这不是异常退出）
+    update_rec("install", proxy, std::time::Instant::now(), None, |m| {
+        m.insert("to".into(), json!(u.version));
+    });
+    telemetry::flush_now(Duration::from_millis(500));
+    let root = app
+        .path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_owned();
+    running_clear(&root);
     // Windows 上启动安装器后直接退出进程，不会返回
     if let Err(e) = u.install(bytes) {
+        running_write(&root);
         // 安装器没起来，程序照常用：撤销退出标记，否则之后点播放都会被当成「正在退出」而放弃
         app.quit.send_replace(false);
         return Err(fail(e));
     }
     handle.restart()
+}
+
+/// 检查更新各步（check / download / install）记一条 `update`：成败、耗时、错误。
+fn update_rec(
+    step: &str,
+    proxy: bool,
+    t0: std::time::Instant,
+    err: Option<&tauri_plugin_updater::Error>,
+    extra: impl FnOnce(&mut Map<String, Value>),
+) {
+    if !telemetry::enabled() {
+        return;
+    }
+    let mut m = Map::from_iter([
+        ("step".to_owned(), json!(step)),
+        ("ok".to_owned(), json!(err.is_none())),
+        ("ms".to_owned(), json!(t0.elapsed().as_millis() as u64)),
+        ("proxy".to_owned(), json!(proxy)),
+    ]);
+    if let Some(e) = err {
+        m.insert(
+            "err".into(),
+            json!(e.to_string().chars().take(200).collect::<String>()),
+        );
+    }
+    extra(&mut m);
+    telemetry::rec("update", Value::Object(m));
 }
 
 /// 通用 Emby 请求（当前服务器）。401 时清掉该服务器的 token，界面据此引导重新登录。
@@ -739,6 +863,13 @@ async fn play(
 }
 
 fn main() {
+    START.get_or_init(|| (std::time::Instant::now(), now_ms()));
+    // panic 写进日志（error 级，开着诊断数据时也会上报），再交给默认处理
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("程序出错（panic）：{info}");
+        default_hook(info);
+    }));
     let ctx = tauri::generate_context!();
     let root = config::data_root(&ctx.config().identifier);
     let exit_root = root.clone();
@@ -818,6 +949,7 @@ fn main() {
             record_env();
             record_servers(&cfg);
             exit_report(&root);
+            running_check(&root);
             let mpv_dir = app
                 .path()
                 .resource_dir()
@@ -895,6 +1027,8 @@ fn main() {
                 exit_mark("exit");
                 handle.state::<App>().shutdown(Duration::from_secs(3));
                 exit_save(&exit_root);
+                telemetry::flush_now(Duration::from_millis(500));
+                running_clear(&exit_root);
             }
             _ => {}
         });

@@ -565,6 +565,7 @@ impl Session {
         let mut minute =
             tokio::time::interval_at(tokio::time::Instant::now() + TEL_EVERY, TEL_EVERY);
         let mut ctl_open = true;
+        let mut quit_sent = false;
         loop {
             tokio::select! {
                 line = lines.next_line() => match line {
@@ -575,8 +576,8 @@ impl Session {
                     _ => break, // mpv 退出，管道关闭
                 },
                 c = ctl.recv(), if ctl_open => match c {
-                    Some(Ctl::Quit) => { log::info!("关闭播放器"); st.send(json!(["quit"])).await; }
-                    None => { ctl_open = false; st.send(json!(["quit"])).await; }
+                    Some(Ctl::Quit) => { log::info!("关闭播放器"); quit_sent = true; st.send(json!(["quit"])).await; }
+                    None => { ctl_open = false; quit_sent = true; st.send(json!(["quit"])).await; }
                     #[cfg(test)]
                     Some(Ctl::Mpv(cmd)) => { st.send(cmd).await; }
                 },
@@ -589,9 +590,28 @@ impl Session {
             st.stop(i); // mpv 被直接关掉、没来得及发 end-file 时补发
         }
         let status = child.wait().await;
+        crate::exit_mark("mpv_exited");
+        let code = status.as_ref().ok().and_then(|s| s.code());
         if st.tel.on {
-            let code = status.ok().and_then(|s| s.code());
             telemetry::rec("mpv_exit", json!({ "srv": st.emby.tag, "code": code }));
+        }
+        // 一集都没播起来 mpv 就异常退出（显卡初始化失败、崩溃），又不是我们叫它退的：告诉界面，不能悄无声息
+        if !quit_sent
+            && !st.failed_sent
+            && !status.as_ref().is_ok_and(|s| s.success())
+            && !st.queue.iter().any(|e| e.started)
+        {
+            let e = &st.queue[at];
+            let message = format!(
+                "无法播放「{}」：播放器意外退出（退出码 {}），启动参数见日志",
+                title(&e.item),
+                code.map_or("无".into(), |c| c.to_string())
+            );
+            log::warn!("{message}（条目 {}）", e.item.id);
+            let _ = st.events.send(Event::Failed {
+                item_id: e.item.id.clone(),
+                message,
+            });
         }
         #[cfg(unix)]
         let _ = std::fs::remove_file(&ipc);
@@ -606,6 +626,7 @@ impl Session {
         } = st;
         drop(reports);
         let _ = reporter.await;
+        crate::exit_mark("reported");
         log::info!("播放结束");
         let _ = events.send(Event::Ended { volume });
     }
@@ -638,6 +659,10 @@ struct State {
     want: Option<usize>,
     /// 上次告诉 ModernZ 的「下一集已就绪」，见 [`State::sync_next_ready`]。
     next_ready: bool,
+    /// IPC 写失败过（mpv 已退出、管道断了）：只记一次日志，后面的命令照样丢弃。
+    pipe_broken: bool,
+    /// 已经给界面发过 Failed（起播没成、mpv 退出时就不再补发「意外退出」）。
+    failed_sent: bool,
     tel: Tel,
 }
 
@@ -737,6 +762,8 @@ impl State {
             prepared,
             want: None,
             next_ready: false,
+            pipe_broken: false,
+            failed_sent: false,
             tel: Tel::default(),
         }
     }
@@ -800,7 +827,9 @@ impl State {
     async fn send(&mut self, cmd: Value) -> u64 {
         self.rid += 1;
         let line = format!("{}\n", json!({ "command": cmd, "request_id": self.rid }));
-        if let Err(e) = self.wr.write_all(line.as_bytes()).await {
+        if let Err(e) = self.wr.write_all(line.as_bytes()).await
+            && !std::mem::replace(&mut self.pipe_broken, true)
+        {
             log::warn!("写 mpv IPC 失败：{e}");
         }
         self.rid
@@ -1181,6 +1210,7 @@ impl State {
         if self.cur == Some(i) {
             self.cur = None;
         }
+        self.failed_sent = true;
         let _ = self.events.send(Event::Failed { item_id, message });
     }
 

@@ -18,13 +18,27 @@ pub fn data_root(identifier: &str) -> PathBuf {
     let beside_exe = std::env::current_exe()
         .ok()
         .and_then(|e| e.parent().map(|d| dunce::simplified(d).join("data")));
-    beside_exe
-        .filter(|d| fs::create_dir_all(d).is_ok() && fs::write(d.join(MARKER), b"").is_ok())
-        .unwrap_or_else(|| {
-            std::env::var_os("LOCALAPPDATA")
-                .map_or_else(std::env::temp_dir, PathBuf::from)
-                .join(identifier)
-        })
+    beside_exe.filter(|d| claim(d)).unwrap_or_else(|| {
+        std::env::var_os("LOCALAPPDATA")
+            .map_or_else(std::env::temp_dir, PathBuf::from)
+            .join(identifier)
+    })
+}
+
+/// 能否把 `d` 当数据目录（可写），顺带决定要不要打标记：只有新建的、空的或已经是我们的目录才打，
+/// 本来就有别人东西的 `data` 照用但不打标记，卸载时不删。
+fn claim(d: &Path) -> bool {
+    let ours = d.join(MARKER).exists() || fs::read_dir(d).map_or(true, |mut r| r.next().is_none());
+    if fs::create_dir_all(d).is_err() {
+        return false;
+    }
+    if ours {
+        return fs::write(d.join(MARKER), b"").is_ok();
+    }
+    let probe = d.join(".embymini-probe");
+    let ok = fs::write(&probe, b"").is_ok();
+    let _ = fs::remove_file(probe);
+    ok
 }
 
 /// 旧版本的配置（config.json、mpv.conf）在 `%APPDATA%\<id>`，日志、界面缓存、mpv 缓存在 `%LOCALAPPDATA%\<id>`。
@@ -310,6 +324,21 @@ mod tests {
         assert_eq!(load(&path).preload_percent, 80);
         assert!(path.with_extension("json.bad").exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 只给新建 / 空的 / 本来就是我们的目录打卸载标记；别人的 data 照用但不打。
+    #[test]
+    fn claim_marks_only_our_dirs() {
+        let t = std::env::temp_dir().join(format!("embymini-claim-{}", std::process::id()));
+        let (fresh, foreign) = (t.join("fresh"), t.join("foreign"));
+        assert!(claim(&fresh) && fresh.join(MARKER).exists());
+        assert!(claim(&fresh), "第二次启动照常可用");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("别人的文件"), b"x").unwrap();
+        assert!(claim(&foreign));
+        assert!(!foreign.join(MARKER).exists());
+        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1, "探测文件要删掉");
+        fs::remove_dir_all(t).unwrap();
     }
 
     #[test]

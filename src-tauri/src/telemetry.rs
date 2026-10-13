@@ -74,6 +74,16 @@ pub fn rec(k: &str, v: Value) {
     }
 }
 
+/// 写入任务收到它就清空暂存（见 [`purge`]）；不是真的记录类别。
+const PURGE: &str = "__purge";
+
+/// 用户关掉诊断数据：没送出去的也不送了，删掉暂存（交给写入任务做，不和它正在写的文件冲突）。
+pub fn purge() {
+    if let Some(tx) = TX.get() {
+        let _ = tx.try_send(json!({ "k": PURGE }));
+    }
+}
+
 /// 起播时调用：接下来一小段时间不上传，把带宽让给起播。
 pub fn hold_uploads() {
     *HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + HOLD_FOR_PLAY);
@@ -186,6 +196,15 @@ impl Spool {
         self.buf.push(b'\n');
     }
 
+    /// 丢掉内存里的行和目录里所有暂存、批次。
+    fn purge(&mut self) {
+        self.buf.clear();
+        self.raw = None;
+        for e in fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+
     /// 把内存里的行追加到文件；够大或够久就封批。
     fn flush(&mut self) -> io::Result<()> {
         if !self.buf.is_empty() {
@@ -292,6 +311,7 @@ async fn write_loop(dir: PathBuf, meta: Value, mut rx: mpsc::Receiver<Value>) {
     loop {
         tokio::select! {
             v = rx.recv() => match v {
+                Some(v) if v["k"] == PURGE => spool.purge(),
                 Some(v) => for line in caps.admit(v) { spool.push(&line) },
                 None => break,
             },
@@ -490,6 +510,15 @@ mod tests {
             batches(&dir),
             vec![(newest.clone(), fs::metadata(&newest).unwrap().len())]
         );
+        // 关掉诊断：批次、未封批的文件、内存里的行都清掉，之后还能照常写
+        s.push(&json!({ "k": "op" }));
+        s.flush().unwrap();
+        s.push(&json!({ "k": "op" }));
+        s.purge();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        s.push(&json!({ "k": "op" }));
+        s.flush().unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 

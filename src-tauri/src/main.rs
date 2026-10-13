@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_log::{Target, TargetKind};
+use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::{mpsc, watch};
 
@@ -38,6 +38,55 @@ struct App {
     quit: watch::Sender<bool>,
     /// 还没返回的 `play` 个数（[`Starting`]），退出时等它们收尾。
     starting: AtomicUsize,
+    /// 已叫停、还在收尾（回传 Stopped）的播放任务，退出时等它们（见 [`App::begin_shutdown`]）。
+    closing: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+// ---------- 关闭耗时埋点 ----------
+// 从点关闭（或开始退出）算起，各阶段的毫秒数写日志；退出前存到 data\last-exit.json，
+// 下次启动作为诊断数据 `exit` 上报，用来查「关闭时卡一下」卡在哪一段。
+
+static CLOSE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static CLOSE_MARKS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+/// 开始计时（重复调用以第一次为准）。
+fn exit_start() {
+    CLOSE_T0.get_or_init(std::time::Instant::now);
+}
+
+/// 记一个关闭阶段；还没开始关闭时（例如平时关掉 mpv）什么都不做。
+pub fn exit_mark(phase: &'static str) {
+    let Some(t0) = CLOSE_T0.get() else { return };
+    let ms = t0.elapsed().as_millis() as u64;
+    log::info!("关闭耗时 {phase}：{ms} ms");
+    lock(&CLOSE_MARKS).push((phase, ms));
+}
+
+fn exit_file(root: &std::path::Path) -> PathBuf {
+    root.join("last-exit.json")
+}
+
+/// 退出前把各阶段耗时存盘（进程马上结束，诊断数据的写入任务来不及落盘）。
+fn exit_save(root: &std::path::Path) {
+    let marks: Map<String, Value> = lock(&CLOSE_MARKS)
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).into()))
+        .collect();
+    if !marks.is_empty() {
+        let _ = std::fs::write(exit_file(root), Value::Object(marks).to_string());
+    }
+}
+
+/// 启动时把上次退出的耗时补记成诊断数据（没开诊断就只删文件）。
+fn exit_report(root: &std::path::Path) {
+    let f = exit_file(root);
+    if let Some(v) = std::fs::read(&f)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+    {
+        telemetry::rec("exit", v);
+    }
+    let _ = std::fs::remove_file(f);
 }
 
 /// 进入 `play` 时加一、离开时减一。
@@ -95,24 +144,37 @@ impl App {
         }
     }
 
+    /// 退出的第一步，点关闭时就做（不等窗口销毁、`RunEvent::Exit`）：叫停起播中的 `play`，
+    /// 让正在播的 mpv 立刻退出；它的回传任务留给 [`App::shutdown`] 去等。可重复调用。
+    fn begin_shutdown(&self) {
+        self.quit.send_replace(true);
+        if let Some(task) = self.stop_player() {
+            log::info!("程序退出，先关闭播放器并回传进度");
+            lock(&self.closing).push(task);
+        }
+    }
+
     /// 程序退出前调用：mpv 是独立进程，不会跟着 EmbyMini 退出，而回传进度的任务会随进程消失，
     /// 续播点就丢了。所以先叫停起播中的 `play` 并等它们返回（否则可能刚起播完又登记一个播放器），
-    /// 再让正在播的 mpv 退出、回传 Stopped。总共最多等 `wait`。
+    /// 再让正在播的 mpv 退出、等回传 Stopped。总共最多等 `wait`。
     fn shutdown(&self, wait: Duration) {
-        self.quit.send_replace(true);
+        exit_start();
+        self.begin_shutdown();
         tauri::async_runtime::block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
             while self.starting.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            if let Some(task) = self.stop_player() {
-                log::info!("程序退出，先关闭播放器并回传进度");
+            self.begin_shutdown(); // 等的这段时间里刚起播完登记的播放器
+            let tasks = std::mem::take(&mut *lock(&self.closing));
+            for task in tasks {
                 if tokio::time::timeout_at(deadline, task).await.is_err() {
                     log::warn!("关闭播放器超时（{wait:?}），进度可能没回传");
                 }
             }
         });
+        exit_mark("shutdown_done");
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, Error> {
@@ -349,6 +411,9 @@ fn telemetry_set(app: State<'_, App>, on: bool, name: String) -> Result<(), Erro
         c.telemetry_name = Some(name.trim().to_owned()).filter(|n| !n.is_empty());
     })?;
     telemetry::set_enabled(on);
+    if was && !on {
+        telemetry::purge();
+    }
     if on && !was {
         record_env();
         record_servers(&app.cfg());
@@ -408,13 +473,15 @@ fn system_proxy() -> Option<String> {
     if !cfg!(windows) {
         return std::env::var("https_proxy").ok();
     }
-    let out = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        ])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("reg");
+    cmd.args([
+        "query",
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+    ]);
+    // reg 是控制台程序：不加 CREATE_NO_WINDOW 会闪一下黑框
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
+    let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let val = |name: &str| {
         text.lines()
@@ -545,12 +612,17 @@ async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Er
         .map_err(fail)?
         .ok_or_else(|| Error::Other("已是最新版本".into()))?;
     log::info!("下载新版本 {}", u.version);
-    let mut got = 0u64;
+    let (mut got, mut shown) = (0u64, u64::MAX);
     let bytes = u
         .download(
             |n, total| {
                 got += n as u64;
-                let _ = handle.emit("update-progress", (got, total));
+                // 每个分块都发的话 40 MB 要发几千次：百分比（不知道总大小时按 MB）变了才发
+                let step = total.map_or(got >> 20, |t| got * 100 / t.max(1));
+                if step != shown {
+                    shown = step;
+                    let _ = handle.emit("update-progress", (got, total));
+                }
             },
             || {},
         )
@@ -562,7 +634,12 @@ async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Er
     })
     .await;
     log::info!("启动安装器，程序退出");
-    u.install(bytes).map_err(fail)?; // Windows 上启动安装器后直接退出进程，不会返回
+    // Windows 上启动安装器后直接退出进程，不会返回
+    if let Err(e) = u.install(bytes) {
+        // 安装器没起来，程序照常用：撤销退出标记，否则之后点播放都会被当成「正在退出」而放弃
+        app.quit.send_replace(false);
+        return Err(fail(e));
+    }
     handle.restart()
 }
 
@@ -664,6 +741,7 @@ async fn play(
 fn main() {
     let ctx = tauri::generate_context!();
     let root = config::data_root(&ctx.config().identifier);
+    let exit_root = root.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(w) = app.get_webview_window("main") {
@@ -672,8 +750,12 @@ fn main() {
             }
         }))
         .plugin(
+            // 默认 40 KB 就整个删掉重来，排查要的记录留不住：放到 2 MB，轮换时留最近 3 份；时间用本地时间
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
+                .max_file_size(2_000_000)
+                .rotation_strategy(RotationStrategy::KeepSome(3))
+                .timezone_strategy(TimezoneStrategy::UseLocal)
                 .clear_targets()
                 .targets([
                     Target::new(TargetKind::Stdout),
@@ -735,6 +817,7 @@ fn main() {
             );
             record_env();
             record_servers(&cfg);
+            exit_report(&root);
             let mpv_dir = app
                 .path()
                 .resource_dir()
@@ -765,6 +848,7 @@ fn main() {
                 play_seq: AtomicU64::new(0),
                 quit: watch::Sender::new(false),
                 starting: AtomicUsize::new(0),
+                closing: Mutex::new(Vec::new()),
             });
             Ok(())
         })
@@ -785,10 +869,34 @@ fn main() {
         ])
         .build(ctx)
         .unwrap_or_else(|e| panic!("EmbyMini 启动失败：{e}"))
-        .run(|handle, ev| {
-            if let tauri::RunEvent::Exit = ev {
-                handle.state::<App>().shutdown(Duration::from_secs(3));
+        .run(move |handle, ev| match ev {
+            // 点关闭：先藏窗口、让 mpv 退出，再走销毁窗口、等回传这些慢的步骤，用户看到的是立刻关掉
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { .. },
+                ..
+            } if label == "main" => {
+                exit_start();
+                exit_mark("close_requested");
+                if let Some(w) = handle.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+                exit_mark("hidden");
+                handle.state::<App>().begin_shutdown();
+                exit_mark("mpv_quit_sent");
             }
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } => exit_mark("window_destroyed"),
+            tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
+            tauri::RunEvent::Exit => {
+                exit_start();
+                exit_mark("exit");
+                handle.state::<App>().shutdown(Duration::from_secs(3));
+                exit_save(&exit_root);
+            }
+            _ => {}
         });
 }
 
@@ -842,6 +950,7 @@ mod tests {
             play_seq: AtomicU64::new(0),
             quit: watch::Sender::new(false),
             starting: AtomicUsize::new(0),
+            closing: Mutex::new(Vec::new()),
         }
     }
 

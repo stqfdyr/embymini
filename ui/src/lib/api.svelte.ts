@@ -231,8 +231,10 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
       } else s.items.push(...p.Items)
       s.total = p.TotalRecordCount
       s.loaded = true
+      s.error = ''
     } catch (e) {
-      if (mine === gen) s.error = errText(e)
+      // 正显示快照时取数失败：同 loader，继续显示快照、不报错（滚动时会再取）
+      if (mine === gen && !fromSnap) s.error = errText(e)
     } finally {
       if (mine === gen) s.busy = false
     }

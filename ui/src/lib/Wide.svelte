@@ -67,6 +67,7 @@
   .text { display: block; padding: 8px 2px 0; }
   .name { font-size: 13px; font-weight: 500; }
   .sub { font-size: 12px; color: var(--text-2); margin-top: 1px; }
-  .desc { display: block; width: 100%; padding: 0 2px; text-align: left; font-size: 12px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
+  /* 不写 display：要用 .clamp-3 的 -webkit-box 截成三行 */
+  .desc { width: 100%; padding: 0 2px; text-align: left; font-size: 12px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
   button.desc:hover { color: var(--text); }
 </style>

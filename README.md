@@ -50,11 +50,11 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 |---|---|
 | `data\config.json` | 服务器列表（含登录 token，不存密码）、播放设置 |
 | `data\mpv.conf` | 个人 mpv 配置：自己新建，在自带配置之后加载，同名选项以它为准，升级不覆盖 |
-| `data\logs\` | 日志 |
+| `data\logs\` | 日志（单个文件 2 MB 轮换，留最近 3 份；本地时间） |
 | `data\webview\` | 界面数据（含上次浏览的列表快照，启动时先显示） |
 | `data\cache\images\` | 海报、背景图缓存（上限 1 GB，按最近使用淘汰） |
 | `data\mpv-cache\` | mpv 着色器缓存 |
-| `data\telemetry\` | 诊断数据的待上传批次（打开「发送诊断数据」才有，上限 20 MB） |
+| `data\telemetry\` | 诊断数据的待上传批次（打开「发送诊断数据」才有，上限 20 MB；关掉开关时清空） |
 
 安装目录不可写时（例如手动拷到只读位置）退回 `%LOCALAPPDATA%\com.stqfdyr.embymini`。旧版本放在 `%APPDATA%` / `%LOCALAPPDATA%` 下的配置，新版首次启动时自动搬过来并删掉旧目录。
 
@@ -63,4 +63,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 ## 第三方
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
-- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`
+- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文

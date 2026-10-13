@@ -10,6 +10,7 @@ Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给
 ## 安装
 
 在 [Releases](https://github.com/stqfdyr/embymini/releases) 下载最新的 `EmbyMini_<版本>_x64-setup.exe` 运行即可，覆盖安装会保留服务器配置。
+0.2.0 起可以在「设置 → 关于」检查更新、一键安装（可单独给检查更新设代理，留空跟随系统代理）。
 安装包没有签名，Windows 可能提示「已保护你的电脑」，点「更多信息」→「仍要运行」。可用同一 Release 里的 `SHA256SUMS.txt` 校验文件。
 
 ## 目录
@@ -36,7 +37,7 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | 桌面版开发（Windows） | `ui\node_modules\.bin\tauri dev` |
 | 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_real_server -- --ignored --nocapture` |
 | 测试包 | 手动触发 `windows` workflow；安装包在该次运行的 Artifacts 里（`EmbyMini-setup`） |
-| 发版 | 把 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `version` 改成新版本并推送，再 `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`；构建、冒烟测试通过后自动发 Release（安装包 + `SHA256SUMS.txt`），版本号带 `-` 的标为预发布 |
+| 发版 | 把 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `version` 改成新版本并推送，再 `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`；构建、冒烟测试通过后自动发 Release（安装包、自动更新用的签名与 `latest.json`、`SHA256SUMS.txt`），版本号带 `-` 的标为预发布。打包需要仓库 Secrets 里的更新签名私钥 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 
 端到端测试会真实播放并回传进度，结束时把观看记录恢复成测试前的样子。
 

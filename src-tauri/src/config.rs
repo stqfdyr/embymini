@@ -60,6 +60,8 @@ pub struct Config {
     pub preload_percent: u8,
     /// 上次退出播放器时的音量，下次起播沿用。
     pub volume: Option<f64>,
+    /// 检查更新、下载安装包用的代理（如 `http://127.0.0.1:10808`）；为空时跟随系统代理。其它请求一律不走代理。
+    pub update_proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -71,6 +73,7 @@ impl Default for Config {
             mpv_path: None,
             preload_percent: 80,
             volume: None,
+            update_proxy: None,
         }
     }
 }

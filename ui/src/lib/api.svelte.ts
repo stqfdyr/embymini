@@ -6,7 +6,10 @@ import type { MenuItem } from './menu.svelte'
 import type { Item, Page } from './types'
 
 export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; loggedIn: boolean }
-export type ConfigView = { active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string }
+export type ConfigView = {
+  active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string
+  updateProxy: string | null; version: string
+}
 export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }
 
 /** 任意错误 → 给用户看的一句话（后端的 ApiError、JS 异常、字符串都能处理）。 */

@@ -16,6 +16,8 @@ jobs:
       contents: write # 发 Release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 发 Release 时要找上一个标签，列出这一版的提交
 
       # 标签与程序版本不一致时尽早失败：安装包文件名、关于页、UA 里的版本号都取自这两个文件
       - name: 核对版本号（仅 v* 标签）
@@ -79,14 +81,18 @@ jobs:
           Select-String -Path "$env:SHOT_DIR\mpv-render.log" -Pattern '\]\[e\]\[|d3d11|Using hardware|VO:' | ForEach-Object Line
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      # 同时生成自动更新用的签名（<安装包>.sig）；私钥只在 Secrets 里，丢了就发不了能自动更新的版本
       - name: 打包
         shell: cmd
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: ui\node_modules\.bin\tauri.cmd build
 
       - uses: actions/upload-artifact@v4
         with:
           name: EmbyMini-setup
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe*
 
       # 冒烟：像用户一样静默安装、启动，确认程序起得来、资源路径正确（资源目录带 \\?\ 前缀导致 mpv 读不到自带配置时，这一步会直接失败）
       - name: 冒烟测试：静默安装 → 启动 → 查日志、截图
@@ -128,7 +134,8 @@ jobs:
           name: smoke
           path: smoke/
 
-      # 冒烟通过才发；版本号带 - 的（如 v0.2.0-beta.1）标为预发布。说明 = 下面这段 + 自动生成的变更列表
+      # 冒烟通过才发；版本号带 - 的（如 v0.2.0-beta.1）标为预发布（客户端检查更新只看正式版）。
+      # 说明 = 安装提示 + 上一个标签以来的提交标题；latest.json 是客户端检查更新读的文件（版本、说明、安装包地址和签名）
       - name: 发布 Release（仅 v* 标签）
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -137,14 +144,25 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           set -eu
+          tag="$GITHUB_REF_NAME"
+          prev=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)
+          changes=$(git log --no-merges --format='- %s' ${prev:+"$prev.."}"$tag")
           cd src-tauri/target/release/bundle/nsis
           exe=$(ls *-setup.exe)
           sha256sum "$exe" > SHA256SUMS.txt
           cat SHA256SUMS.txt
+          jq -n --arg v "${tag#v}" --arg n "$changes" --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg s "$(cat "$exe.sig")" --arg u "https://github.com/$GH_REPO/releases/download/$tag/$exe" \
+            '{version: $v, notes: $n, pub_date: $d, platforms: {"windows-x86_64": {signature: $s, url: $u}}}' > latest.json
+          cat latest.json
           pre=()
-          case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
-          notes="**安装**：下载 \`$exe\` 运行即可；覆盖安装会保留服务器配置。安装包没有签名，Windows 可能提示「已保护你的电脑」，点「更多信息」→「仍要运行」。
+          case "$tag" in *-*) pre=(--prerelease) ;; esac
+          notes="**安装**：下载 \`$exe\` 运行即可；覆盖安装会保留服务器配置，0.2.0 起程序里「设置 → 关于」可以检查更新。安装包没有签名，Windows 可能提示「已保护你的电脑」，点「更多信息」→「仍要运行」。
 
-          **校验**：\`SHA256SUMS.txt\` 里是安装包的 SHA-256。"
-          gh release create "$GITHUB_REF_NAME" "$exe" SHA256SUMS.txt --verify-tag \
-            --title "EmbyMini $GITHUB_REF_NAME" --notes "$notes" --generate-notes ${pre[@]+"${pre[@]}"}
+          **校验**：\`SHA256SUMS.txt\` 里是安装包的 SHA-256。
+
+          ## 更新内容
+
+          $changes"
+          gh release create "$tag" "$exe" "$exe.sig" SHA256SUMS.txt latest.json --verify-tag \
+            --title "EmbyMini $tag" --notes "$notes" ${pre[@]+"${pre[@]}"}

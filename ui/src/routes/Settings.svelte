@@ -1,7 +1,9 @@
-<!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、个人 mpv 配置的位置）+ 关于（界面用哪块 GPU）。分组列表样式。 -->
+<!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、个人 mpv 配置的位置）
+     + 关于（版本与检查更新、更新代理、界面用哪块 GPU）。分组列表样式。 -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
-  import { Check, LogIn, Pencil, Plus, Trash2 } from '@lucide/svelte'
+  import { listen } from '@tauri-apps/api/event'
+  import { Check, Download, LogIn, Pencil, Plus, RefreshCw, Trash2 } from '@lucide/svelte'
   import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
   import { ask } from '../lib/Dialog.svelte'
@@ -15,6 +17,7 @@
   let msg = $state<{ text: string; ok: boolean } | null>(null)
   let mpvPath = $state(session.cfg?.mpvPath ?? '')
   let preload = $state(session.cfg?.preloadPercent ?? 80)
+  let updateProxy = $state(session.cfg?.updateProxy ?? '')
   let adding = $state(!session.cfg?.servers.length)
 
   async function run(f: () => Promise<unknown>, ok?: string) {
@@ -87,10 +90,38 @@
   const gpuName = gpu()
   const savePlayer = () =>
     run(async () => {
-      await invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload })
+      await invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload, updateProxy: updateProxy || null })
       await loadConfig()
       mpvPath = session.cfg?.mpvPath ?? '' // 显示后端规范化后的值（去掉了引号、空白）
+      updateProxy = session.cfg?.updateProxy ?? ''
     }, '已保存')
+
+  /** 检查更新：idle → checking → latest / found（显示版本和说明）→ installing（进度）；出错回到 idle 并显示原因。 */
+  let upd = $state<{ step: 'idle' | 'checking' | 'latest' | 'found' | 'installing'; version?: string; notes?: string; pct?: number; error?: string }>({ step: 'idle' })
+  async function checkUpdate() {
+    upd = { step: 'checking' }
+    try {
+      const r = await invoke<{ version: string; notes: string } | null>('update_check')
+      upd = r ? { step: 'found', ...r } : { step: 'latest' }
+    } catch (e) {
+      upd = { step: 'idle', error: errText(e) }
+    }
+  }
+  async function install() {
+    const { version, notes } = upd
+    upd = { step: 'installing', version, notes, pct: 0 }
+    const off = await listen<[number, number | null]>('update-progress', (e) => {
+      const [got, total] = e.payload
+      if (total) upd.pct = Math.min(100, Math.round((got / total) * 100))
+    })
+    try {
+      await invoke('update_install') // 成功时程序会退出并由安装器重新打开
+    } catch (e) {
+      upd = { step: 'found', version, notes, error: errText(e) }
+    } finally {
+      off()
+    }
+  }
 </script>
 
 <div class="page">
@@ -161,6 +192,30 @@
   </div>
   <h3>关于</h3>
   <div class="group">
+    <div class="row">
+      <span class="label">版本</span>
+      <div class="grow">
+        <div>EmbyMini {session.cfg?.version}</div>
+        {#if upd.step === 'latest'}<div class="sub">已是最新版本</div>
+        {:else if upd.step === 'found' || upd.step === 'installing'}
+          <div class="sub">新版本 {upd.version}{#if upd.step === 'installing'}：正在下载 {upd.pct}%，下完会自动安装并重新打开{/if}</div>
+          {#if upd.notes}<div class="sub notes selectable">{upd.notes}</div>{/if}
+        {/if}
+        {#if upd.error}<div class="sub err">{upd.error}</div>{/if}
+      </div>
+      {#if upd.step === 'found'}
+        <button class="btn primary" onclick={install}><Download size={14} /> 立即更新</button>
+      {:else}
+        <button class="btn" disabled={upd.step === 'checking' || upd.step === 'installing'} onclick={checkUpdate}><RefreshCw size={14} /> {upd.step === 'checking' ? '检查中…' : '检查更新'}</button>
+      {/if}
+    </div>
+    <label class="row">
+      <span class="label">更新代理</span>
+      <div class="grow">
+        <input class="wide" placeholder="留空跟随系统代理，如 http://127.0.0.1:10808" bind:value={updateProxy} spellcheck="false" onchange={savePlayer} />
+        <div class="sub">只用于检查更新和下载安装包，其它请求都直连</div>
+      </div>
+    </label>
     <div class="row"><span class="label">界面渲染</span><span class="grow sub selectable">{gpuName}</span></div>
     <div class="row"><span class="label">播放器渲染</span><span class="grow sub">mpv 优先使用 NVIDIA 独显（D3D11 + 硬解）；播放时按 i 可查看实际使用的解码方式</span></div>
   </div>
@@ -196,4 +251,7 @@
   .note { margin: 10px var(--gutter); font-size: 12px; color: var(--text-3); line-height: 1.8; }
   .msg { margin: 14px var(--gutter); color: var(--text-2); }
   .msg.err { color: var(--danger); }
+  .sub.err { color: var(--danger); }
+  .notes { white-space: pre-wrap; max-height: 160px; overflow: auto; margin-top: 6px; }
+  input.wide { width: 100%; }
 </style>

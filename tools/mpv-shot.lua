@@ -1,4 +1,4 @@
--- 不连服务器，单独检查自带 mpv 配置的实际渲染：ModernZ 控制条、选集菜单（中文字体、图标字体）。
+-- 不连服务器，单独检查自带 mpv 配置的实际渲染：ModernZ 控制条、下一集就绪（绿色闪电）、选集菜单（中文字体、图标字体）。
 -- 用法：mpv --config-dir=src-tauri/mpv --script=tools/mpv-shot.lua --force-window=yes "av://lavfi:testsrc2=duration=60:size=1920x1080"
 -- 截图写到环境变量 SHOT_DIR（默认当前目录），拍完自动退出。Windows CI 诊断与本机 Xvfb 都用它。
 local dir = os.getenv("SHOT_DIR") or "."
@@ -14,6 +14,8 @@ mp.register_event("file-loaded", function()
     mp.add_timeout(2, function()
         mp.add_timeout(1.5, function()
             shot("1-modernz")
+            mp.commandv("script-message", "embymini-next-ready", "yes")
+            mp.add_timeout(0.5, function() shot("1b-next-ready") end)
             mp.commandv("script-message-to", "embymini", "episodes",
                 '["S01E01 第一集：中文与 English 混排","S01E02 第二集","S01E03 第三集"]', "0")
             mp.commandv("script-message-to", "embymini", "menu")

@@ -10,7 +10,8 @@
 -- Full license: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
 --
 -- Modified for EmbyMini (changes marked "EmbyMini:"): the top bar shows the
--- window title centered and the network speed next to the window controls.
+-- window title centered and the network speed next to the window controls;
+-- the next button turns green with a bolt once the next episode is queued.
 
 local assdraw = require "mp.assdraw"
 local msg = require "mp.msg"
@@ -3226,7 +3227,11 @@ local function osc_init()
 
     --next
     ne = new_element("playlist_next", "button")
-    ne.content = icons.next
+    -- EmbyMini: green + bolt while the next episode is already queued in mpv (switching is instant)
+    ne.content = function()
+        if not state.embymini_next_ready then return icons.next end
+        return "{\\1c&H59C734&}" .. icons.next .. "{\\fscx60\\fscy60\\p1}m 7 0 l 0 12 l 5 12 l 3 21 l 12 8 l 7 8 l 9 0{\\p0}"
+    end
     ne.enabled = (have_pl and (pl_pos < pl_count)) or (loop ~= "no") or contains(user_opts.buttons_always_active, "playlist_next")
     bind_buttons("playlist_next")
 
@@ -4403,6 +4408,11 @@ mp.observe_property("pause", "bool", function(_, enabled)
 end)
 
 mp.register_script_message("osc-visibility", visibility_mode)
+-- EmbyMini: "yes" / "no" from the client, see the playlist_next button
+mp.register_script_message("embymini-next-ready", function(v)
+    state.embymini_next_ready = (v == "yes")
+    request_tick()
+end)
 mp.register_script_message("osc-show", show_osc)
 mp.register_script_message("osc-hide", function()
     if user_opts.visibility == "auto" then

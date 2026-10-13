@@ -25,6 +25,8 @@ const NEXT_MSG: &str = "embymini-next";
 const PREV_MSG: &str = "embymini-prev";
 /// 选集菜单（mpv/scripts/embymini.lua）选中某一集，参数是队列下标。
 const JUMP_MSG: &str = "embymini-jump";
+/// 发给 ModernZ：下一集是否已在 mpv 列表里（`yes` / `no`），是的话下一集按钮变绿带闪电（mpv/scripts/modernz.lua）。
+const NEXT_READY_MSG: &str = "embymini-next-ready";
 
 /// 资源目录里自带的 mpv 配置目录（`<资源>/mpv`），不存在返回 None。
 ///
@@ -602,6 +604,8 @@ struct State {
     prepared: mpsc::UnboundedSender<Prepared>,
     /// 用户最近一次要切去的集（还在后台准备）；更早的切集结果到了就丢掉。
     want: Option<usize>,
+    /// 上次告诉 ModernZ 的「下一集已就绪」，见 [`State::sync_next_ready`]。
+    next_ready: bool,
 }
 
 impl State {
@@ -633,6 +637,7 @@ impl State {
             reports,
             prepared,
             want: None,
+            next_ready: false,
         }
     }
 
@@ -643,6 +648,20 @@ impl State {
             log::warn!("写 mpv IPC 失败：{e}");
         }
         self.rid
+    }
+
+    /// 下一集已追加进 mpv 列表（PlaybackInfo、直链、轨道都已就绪，点下一集立即切换）时让 ModernZ 的
+    /// 下一集按钮变绿带闪电；换集、追加失败时恢复。状态变了才发。
+    async fn sync_next_ready(&mut self) {
+        let ready = self
+            .cur
+            .is_some_and(|i| self.queue.get(i + 1).is_some_and(|e| e.loaded));
+        if ready != self.next_ready {
+            self.next_ready = ready;
+            let v = if ready { "yes" } else { "no" };
+            self.send(json!(["script-message", NEXT_READY_MSG, v]))
+                .await;
+        }
     }
 
     async fn osd(&mut self, text: &str) {
@@ -696,6 +715,7 @@ impl State {
                 }
                 self.queue[i].ready = Some(r);
                 self.load(i, "append-play").await;
+                self.sync_next_ready().await;
                 log::info!("预加载下一集：{id}");
                 let _ = self.events.send(Event::Preloaded { item_id: id });
             }
@@ -728,7 +748,12 @@ impl State {
             {
                 match v["data"]["playlist_entry_id"].as_i64() {
                     Some(id) => self.queue[i].entry_id = Some(id),
-                    None => log::warn!("loadfile 失败：{}", v["error"]),
+                    None => {
+                        log::warn!("loadfile 失败：{}", v["error"]);
+                        // 没进列表：手动下一集要走 jump，不能 playlist-next
+                        self.queue[i].loaded = false;
+                        self.sync_next_ready().await;
+                    }
                 }
             }
             return;
@@ -764,6 +789,7 @@ impl State {
                     .await;
                     self.pos = self.queue[i].start;
                     self.dur = 0.0;
+                    self.sync_next_ready().await;
                 }
             }
             "file-loaded" => {
@@ -1196,8 +1222,8 @@ mod tests {
         }
     }
 
-    /// 读出 State 写给 mpv 的全部 loadfile 命令：(url, 模式)。
-    async fn loadfiles(st: State, mut mpv: tokio::io::DuplexStream) -> Vec<(String, String)> {
+    /// 读出 State 写给 mpv 的全部命令。
+    async fn commands(st: State, mut mpv: tokio::io::DuplexStream) -> Vec<Value> {
         drop(st);
         let mut out = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut mpv, &mut out)
@@ -1205,6 +1231,14 @@ mod tests {
             .unwrap();
         out.lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap()["command"].clone())
+            .collect()
+    }
+
+    /// 读出 State 写给 mpv 的全部 loadfile 命令：(url, 模式)。
+    async fn loadfiles(st: State, mpv: tokio::io::DuplexStream) -> Vec<(String, String)> {
+        commands(st, mpv)
+            .await
+            .into_iter()
             .filter(|c| c[0] == "loadfile")
             .map(|c| {
                 (
@@ -1255,6 +1289,33 @@ mod tests {
             loadfiles(st, mpv).await,
             [("https://h.example/e2".into(), "replace".into())]
         );
+    }
+
+    /// 下一集追加进列表后按钮变绿（yes），换到下一集或追加失败后恢复（no），状态没变不重复发。
+    #[tokio::test]
+    async fn next_ready_follows_the_queue() {
+        let (mut st, mpv, _ev) = offline_state(3);
+        st.cur = Some(0);
+        st.on_prepared(1, After::Append, Ok(ready_for("e1"))).await;
+        let rid = st.rid - 1; // loadfile 之后紧跟 script-message
+        st.on_message(json!({ "request_id": rid, "data": { "playlist_entry_id": 7 } }))
+            .await;
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
+            .await;
+        assert_eq!(st.cur, Some(1));
+        // 第 2 集的追加被 mpv 拒绝：仍是 no，且不再当作在列表里
+        st.on_prepared(2, After::Append, Ok(ready_for("e2"))).await;
+        let rid = st.rid - 1;
+        st.on_message(json!({ "request_id": rid, "error": "x" }))
+            .await;
+        assert!(!st.queue[2].loaded);
+        let ready: Vec<String> = commands(st, mpv)
+            .await
+            .into_iter()
+            .filter(|c| c[0] == "script-message" && c[1] == NEXT_READY_MSG)
+            .map(|c| c[2].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ready, ["yes", "no", "yes", "no"]);
     }
 
     /// 上游卡死（连上了但不回数据）时，后台预加载不能卡住 mpv 事件处理：关闭播放器要立刻送到 mpv。

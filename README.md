@@ -59,4 +59,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 ## 第三方
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
-- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速），改动处标 `EmbyMini:`
+- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`

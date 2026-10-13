@@ -1,6 +1,7 @@
 <!-- 右键菜单：位置贴着鼠标，靠近窗口边缘时向内翻；点外面、滚动、Esc、窗口失焦都会关闭。 -->
 <script lang="ts">
   import { closeMenu, menu } from './menu.svelte'
+  import { op } from './tel'
 
   let el: HTMLDivElement | undefined = $state()
   let pos = $state({ x: 0, y: 0 })
@@ -30,7 +31,7 @@
       {#if it === 'sep'}
         <div class="sep"></div>
       {:else}
-        <button role="menuitem" class:danger={it.danger} onclick={() => (closeMenu(), it.action())}>
+        <button role="menuitem" class:danger={it.danger} onclick={() => (closeMenu(), op(`menu:${it.label}`), it.action())}>
           <span class="ic">{#if it.icon}<it.icon size={15} />{/if}</span>{it.label}
         </button>
       {/if}

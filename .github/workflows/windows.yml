@@ -87,6 +87,9 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # 诊断数据上报地址和 token（编进程序）；没设时设置里不显示「发送诊断数据」
+          EMBYMINI_TEL_URL: ${{ secrets.EMBYMINI_TEL_URL }}
+          EMBYMINI_TEL_TOKEN: ${{ secrets.EMBYMINI_TEL_TOKEN }}
         run: ui\node_modules\.bin\tauri.cmd build
 
       - uses: actions/upload-artifact@v4

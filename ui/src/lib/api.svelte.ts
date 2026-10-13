@@ -3,12 +3,14 @@ import { untrack } from 'svelte'
 import { invoke } from '@tauri-apps/api/core'
 import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
 import type { MenuItem } from './menu.svelte'
+import { op, setTel } from './tel'
 import type { Item, Page } from './types'
 
-export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; loggedIn: boolean }
+export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; tag: string; loggedIn: boolean }
 export type ConfigView = {
   active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string
   updateProxy: string | null; version: string
+  telemetryAvailable: boolean; telemetry: boolean; telemetryName: string
 }
 export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }
 
@@ -56,6 +58,7 @@ export async function loadConfig() {
   const c = await invoke<ConfigView>('config_get')
   session.cfg = c
   session.server = c.servers.find((s) => s.id === c.active) ?? null
+  setTel(c.telemetry)
   cache.clear()
   seen.clear()
 }
@@ -135,12 +138,15 @@ export function send(method: 'POST' | 'DELETE', path: string, query?: Record<str
 }
 
 /** 收藏 / 已看：成功后后台刷新；失败（上游 502 之类）弹提示，不能点了没反应。 */
-const mark = (kind: 'FavoriteItems' | 'PlayedItems', what: string) => (id: string, on: boolean) =>
-  send(on ? 'POST' : 'DELETE', `/Users/${uid()}/${kind}/${id}`).then(refreshQuiet, (e) => notify(`${what}失败：${errText(e)}`))
+const mark = (kind: 'FavoriteItems' | 'PlayedItems', what: string) => (id: string, on: boolean) => {
+  op(`${kind}:${on}`)
+  return send(on ? 'POST' : 'DELETE', `/Users/${uid()}/${kind}/${id}`).then(refreshQuiet, (e) => notify(`${what}失败：${errText(e)}`))
+}
 export const setFavorite = mark('FavoriteItems', '收藏')
 export const setPlayed = mark('PlayedItems', '标记已看')
 /** 从「继续观看」移除（服务端 HideFromResume，进度保留），提示条里可撤销。 */
 function hideResume(it: Item, hide = true): Promise<unknown> {
+  op(hide ? 'hide_resume' : 'hide_resume_undo')
   return send('POST', `/Users/${uid()}/Items/${it.Id}/HideFromResume`, { Hide: hide }).then(
     () => {
       refreshQuiet()
@@ -152,11 +158,13 @@ function hideResume(it: Item, hide = true): Promise<unknown> {
 export const resumeMenu = (it: Item): MenuItem[] => [...itemMenu(it), 'sep', { label: '从继续观看中移除', icon: EyeOff, action: () => hideResume(it) }]
 
 /** 起播。出错（服务器拒绝、找不到 mpv 等）直接弹提示；加载失败由播放事件 failed 另行提示。 */
-export const play = (itemId: string, fromStart = false) =>
-  invoke('play', { itemId, fromStart }).catch((e: ApiError) => {
+export function play(itemId: string, fromStart = false) {
+  op(fromStart ? 'play_from_start' : 'play')
+  return invoke('play', { itemId, fromStart }).catch((e: ApiError) => {
     if (e?.kind === 'unauthorized') onUnauthorized()
     notify(`播放失败：${errText(e)}`)
   })
+}
 
 /** 卡片右键菜单：能直接播的（电影、单集）给播放；都能标记已看、收藏。 */
 export function itemMenu(it: Item, open?: () => void): MenuItem[] {

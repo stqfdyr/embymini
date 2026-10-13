@@ -23,6 +23,8 @@ dunce = "1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tauri-plugin-updater = "2"
+flate2 = "1"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 
 [profile.release]
 lto = true

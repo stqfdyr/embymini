@@ -7,6 +7,7 @@
   import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
   import { ask } from '../lib/Dialog.svelte'
+  import { gpuName } from '../lib/tel'
 
   const blank = { url: '', port: '', user: '', password: '' }
   let form = $state({ ...blank })
@@ -18,6 +19,9 @@
   let mpvPath = $state(session.cfg?.mpvPath ?? '')
   let preload = $state(session.cfg?.preloadPercent ?? 80)
   let updateProxy = $state(session.cfg?.updateProxy ?? '')
+  let telOn = $state(session.cfg?.telemetry ?? false)
+  let telName = $state(session.cfg?.telemetryName ?? '')
+  const saveTel = () => run(() => invoke('telemetry_set', { on: telOn, name: telName }), telOn ? '已打开诊断数据' : '已关闭诊断数据')
   let adding = $state(!session.cfg?.servers.length)
 
   async function run(f: () => Promise<unknown>, ok?: string) {
@@ -75,19 +79,7 @@
   const use = (id: string) => run(() => invoke('server_use', { id }).then(() => go('/')))
   const remove = async (id: string, name: string) =>
     (await ask('删除服务器', `删除「${name}」？登录信息会一起删掉。`, '删除', true)) && run(() => invoke('server_remove', { id }))
-  /** 界面实际用的 GPU（WebView2 底下是 Chromium，ANGLE 渲染器名里带显卡型号），方便确认是不是在用显卡加速。 */
-  function gpu() {
-    try {
-      const gl = document.createElement('canvas').getContext('webgl')
-      const ext = gl?.getExtension('WEBGL_debug_renderer_info')
-      const name = ext ? String(gl!.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : ''
-      if (!name) return '未知（没有 WebGL，可能在用软件渲染）'
-      return /swiftshader|llvmpipe|software|basic render/i.test(name) ? `软件渲染（${name}）` : name.replace(/^ANGLE \((.*)\)$/, '$1')
-    } catch {
-      return '未知'
-    }
-  }
-  const gpuName = gpu()
+  const gpu = gpuName()
   const savePlayer = () =>
     run(async () => {
       await invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload, updateProxy: updateProxy || null })
@@ -216,7 +208,23 @@
         <div class="sub">只用于检查更新和下载安装包，其它请求都直连</div>
       </div>
     </label>
-    <div class="row"><span class="label">界面渲染</span><span class="grow sub selectable">{gpuName}</span></div>
+    {#if session.cfg?.telemetryAvailable}
+      <label class="row">
+        <span class="label">诊断数据</span>
+        <div class="grow">
+          <div>发送诊断数据</div>
+          <div class="sub">接口、图片、页面、播放的耗时与卡顿，用来改进加载速度和流畅度；不含账号、密码、服务器地址、搜索词和片名</div>
+        </div>
+        <input type="checkbox" bind:checked={telOn} onchange={saveTel} />
+      </label>
+      {#if telOn}
+        <label class="row">
+          <span class="label">上报名称</span>
+          <input class="grow" placeholder="默认用计算机名" bind:value={telName} spellcheck="false" onchange={saveTel} />
+        </label>
+      {/if}
+    {/if}
+    <div class="row"><span class="label">界面渲染</span><span class="grow sub selectable">{gpu}</span></div>
     <div class="row"><span class="label">播放器渲染</span><span class="grow sub">mpv 优先使用 NVIDIA 独显（D3D11 + 硬解）；播放时按 i 可查看实际使用的解码方式</span></div>
   </div>
   <p class="note">播放器快捷键：空格 暂停　←→ 快退 / 快进 5 秒　↑↓ 音量　F 全屏　&lt; &gt; 上一集 / 下一集　F8 选集　Q 退出</p>
@@ -243,7 +251,8 @@
     box-shadow: inset 0 -1px 0 var(--stroke-strong); transition: box-shadow 0.12s, background 0.12s;
   }
   input:not([type='range']):focus { background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
-  input[type='range'] { accent-color: var(--accent); }
+  input[type='range'], input[type='checkbox'] { accent-color: var(--accent); }
+  input[type='checkbox'] { width: 18px; height: 18px; }
   .form { display: grid; grid-template-columns: 170px 1fr 1fr; gap: 10px; }
   .form .url, .form .btns { grid-column: 1 / -1; }
   .btns { display: flex; gap: 8px; }

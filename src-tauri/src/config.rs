@@ -62,6 +62,10 @@ pub struct Config {
     pub volume: Option<f64>,
     /// 检查更新、下载安装包用的代理（如 `http://127.0.0.1:10808`）；为空时跟随系统代理。其它请求一律不走代理。
     pub update_proxy: Option<String>,
+    /// 发送诊断数据（默认关）。
+    pub telemetry: bool,
+    /// 诊断数据里的「上报名称」，方便区分是谁；为空时用计算机名。
+    pub telemetry_name: Option<String>,
 }
 
 impl Default for Config {
@@ -74,6 +78,8 @@ impl Default for Config {
             preload_percent: 80,
             volume: None,
             update_proxy: None,
+            telemetry: false,
+            telemetry_name: None,
         }
     }
 }
@@ -106,6 +112,8 @@ pub struct ServerView {
     pub user_id: String,
     /// API 根，前端用它拼图片地址（图片接口不需要 token）。
     pub base: String,
+    /// 上游标识（[`server_tag`]），诊断数据按它区分上游。
+    pub tag: String,
     pub logged_in: bool,
 }
 
@@ -130,9 +138,19 @@ impl Server {
             user: self.user.clone(),
             user_id: self.user_id.clone(),
             base: self.api_base(),
+            tag: server_tag(&self.api_base()),
             logged_in: !self.token.is_empty(),
         }
     }
+}
+
+/// 上游标识：API 根地址的 FNV-1a 哈希取 8 位十六进制。诊断数据靠它把不同上游、同一上游的不同线路
+/// （不同中继地址）分开统计，又不把地址本身发出去；知道地址的人算一遍就能对上。算法不能改，否则新旧数据对不上。
+pub fn server_tag(api_base: &str) -> String {
+    let h = api_base.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{:08x}", h >> 32)
 }
 
 /// 把用户输入的地址和端口规范化成 `(scheme://host[/子路径], 端口)`。
@@ -237,6 +255,20 @@ mod tests {
         );
         assert!(normalize("ftp://h.example", None).is_err());
         assert!(normalize("", None).is_err());
+    }
+
+    #[test]
+    fn server_tag_is_stable() {
+        // 固定值：改了算法，历史诊断数据就和新数据对不上
+        assert_eq!(server_tag(""), "cbf29ce4");
+        assert_eq!(
+            server_tag("https://h.example/emby"),
+            server_tag("https://h.example/emby")
+        );
+        assert_ne!(
+            server_tag("https://a.example/emby"),
+            server_tag("https://b.example/emby")
+        );
     }
 
     #[test]

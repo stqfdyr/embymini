@@ -1,6 +1,8 @@
 // hash 路由：#/、#/item/<id>、#/library/<id>、#/person/<id>、#/season/<剧集 id>/<季 id>、#/search、#/favorites、#/settings。
 // 离开页面时记下滚动位置，返回时恢复。
 
+import { pageReady, pageStart } from './tel'
+
 export const route = $state({ name: 'home', id: '', sub: '', hash: '#/' })
 const scroll = new Map<string, number>()
 
@@ -9,6 +11,7 @@ function parse() {
   const [, name = 'home', id = '', sub = ''] = hash.slice(1).split('/')
   scroll.set(route.hash, window.scrollY)
   Object.assign(route, { name: name || 'home', id: decodeURIComponent(id), sub: decodeURIComponent(sub), hash })
+  pageStart(route.name)
   // 新页面立刻回到顶部（详情页会先画出顶部，不能停在上一页的位置）；返回的页面等数据到了再恢复
   if (!scroll.has(hash)) window.scrollTo(0, 0)
 }
@@ -21,6 +24,7 @@ export const back = () => (history.length > 1 ? history.back() : go('/'))
 
 /** 页面数据就绪后调用：回到上次离开时的位置（新页面回到顶部）。 */
 export function restoreScroll() {
+  pageReady()
   const y = scroll.get(route.hash) ?? 0
   requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo(0, y)))
 }

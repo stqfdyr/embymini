@@ -55,41 +55,94 @@ fn status_msg(code: u16, body: &str) -> String {
 /// 网络层错误按连不上 / 超时 / 证书分类，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
 /// 只取 source 链，不取顶层：顶层带完整 URL（含查询参数，如搜索词）。
 fn net(e: reqwest::Error) -> Error {
+    net_classified(&e).1
+}
+
+/// 网络错误的类别（诊断数据用：connect / timeout / tls / net）和给人看的错误。
+fn net_classified(e: &reqwest::Error) -> (&'static str, Error) {
     let mut chain = Vec::new();
-    let mut src = std::error::Error::source(&e);
+    let mut src = std::error::Error::source(e);
     while let Some(s) = src {
         chain.push(s.to_string());
         src = s.source();
     }
     let detail = chain.join("：");
     let lower = detail.to_ascii_lowercase();
-    let what = if e.is_timeout() {
-        "服务器响应超时"
+    let (class, what) = if e.is_timeout() {
+        ("timeout", "服务器响应超时")
     } else if ["certificate", "tls", "ssl"]
         .iter()
         .any(|k| lower.contains(k))
     {
-        "证书或 TLS 握手失败"
+        ("tls", "证书或 TLS 握手失败")
     } else if e.is_connect() {
-        "连不上服务器"
+        ("connect", "连不上服务器")
     } else {
-        "网络错误"
+        ("net", "网络错误")
     };
-    Error::Network(if detail.is_empty() {
+    let err = Error::Network(if detail.is_empty() {
         what.into()
     } else {
         format!("{what}（{detail}）")
-    })
+    });
+    (class, err)
 }
 
-/// 失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）。
-fn log_result<T>(method: &str, path: &str, t0: Instant, r: &Result<T, Error>) {
+/// 路径模板：id 段（纯数字，或 16 位以上的十六进制）换成 `{id}`，诊断数据按接口聚合。
+fn template(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            let id = (!seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
+                || (seg.len() >= 16 && seg.bytes().all(|b| b.is_ascii_hexdigit()));
+            if id { "{id}" } else { seg }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// 请求收尾：解析回包；失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）；
+/// 记一条诊断数据（方法、路径模板、状态码、耗时、字节数、错误类别）。
+async fn finish(
+    srv: &str,
+    method: &str,
+    path: &str,
+    t0: Instant,
+    sent: reqwest::Result<reqwest::Response>,
+) -> Result<Value, Error> {
+    let (r, status, bytes, class) = match sent {
+        Err(e) => {
+            let (class, err) = net_classified(&e);
+            (Err(err), 0, 0, class)
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let (r, bytes) = json_or_error(resp).await;
+            let class = match &r {
+                Ok(_) => "",
+                Err(Error::Unauthorized) => "auth",
+                Err(Error::Status(..)) => "status",
+                Err(Error::Network(_)) => "net",
+                Err(Error::Other(_)) => "decode",
+            };
+            (r, status, bytes, class)
+        }
+    };
     let took = t0.elapsed();
-    match r {
+    match &r {
         Err(e) => log::warn!("{method} {path} 失败（{took:.1?}）：{e}"),
         Ok(_) if took >= SLOW => log::info!("{method} {path} 慢请求：{took:.1?}"),
         Ok(_) => {}
     }
+    if crate::telemetry::enabled() {
+        crate::telemetry::rec(
+            "api",
+            serde_json::json!({
+                "srv": srv, "m": method, "p": template(path), "st": status,
+                "ms": took.as_millis() as u64, "b": bytes, "e": class,
+            }),
+        );
+    }
+    r
 }
 
 /// Emby 请求一律直连，不读系统代理：reqwest 只在建 Client 时读一次系统代理，
@@ -103,7 +156,7 @@ pub fn http_client() -> reqwest::Result<Client> {
         .build()
 }
 
-fn device_name() -> String {
+pub fn device_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "PC".into())
@@ -120,20 +173,25 @@ fn auth_header(device_id: &str, user_id: &str, token: &str) -> String {
     h
 }
 
-async fn json_or_error(resp: reqwest::Response) -> Result<Value, Error> {
+/// 回包 → JSON（同时返回正文字节数）。
+async fn json_or_error(resp: reqwest::Response) -> (Result<Value, Error>, usize) {
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
-        return Err(Error::Unauthorized);
+        return (Err(Error::Unauthorized), 0);
     }
-    let bytes = resp.bytes().await.map_err(net)?;
-    if !status.is_success() {
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return (Err(net(e)), 0),
+    };
+    let r = if !status.is_success() {
         let text = String::from_utf8_lossy(&bytes).chars().take(200).collect();
-        return Err(Error::Status(status.as_u16(), text));
-    }
-    if bytes.is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_slice(&bytes).map_err(|e| Error::Other(format!("回包不是 JSON：{e}")))
+        Err(Error::Status(status.as_u16(), text))
+    } else if bytes.is_empty() {
+        Ok(Value::Null)
+    } else {
+        serde_json::from_slice(&bytes).map_err(|e| Error::Other(format!("回包不是 JSON：{e}")))
+    };
+    (r, bytes.len())
 }
 
 /// 把通用 JSON 回包转成播放要用的强类型；`what` 写进错误信息，方便定位是哪个接口变了形状。
@@ -145,11 +203,14 @@ fn decode<T: DeserializeOwned>(what: &str, v: Value) -> Result<T, Error> {
 pub async fn server_name(http: &Client, base: &str) -> Result<String, Error> {
     const PATH: &str = "/System/Info/Public";
     let t0 = Instant::now();
-    let r = match http.get(format!("{base}{PATH}")).send().await {
-        Ok(resp) => json_or_error(resp).await,
-        Err(e) => Err(net(e)),
-    };
-    log_result("GET", PATH, t0, &r);
+    let r = finish(
+        &crate::config::server_tag(base),
+        "GET",
+        PATH,
+        t0,
+        http.get(format!("{base}{PATH}")).send().await,
+    )
+    .await;
     Ok(r?["ServerName"].as_str().unwrap_or("Emby").to_owned())
 }
 
@@ -163,22 +224,16 @@ pub async fn login(
 ) -> Result<(String, String), Error> {
     const PATH: &str = "/Users/AuthenticateByName";
     let t0 = Instant::now();
-    let r = match http
+    let sent = http
         .post(format!("{base}{PATH}"))
         .header("X-Emby-Authorization", auth_header(device_id, "", ""))
         .json(&serde_json::json!({ "Username": user, "Pw": password }))
         .send()
-        .await
-    {
-        Ok(resp) => json_or_error(resp).await,
-        Err(e) => Err(net(e)),
+        .await;
+    let v = match finish(&crate::config::server_tag(base), "POST", PATH, t0, sent).await {
+        Err(Error::Unauthorized) => return Err(Error::Other("用户名或密码错误".into())),
+        r => r?,
     };
-    let r = match r {
-        Err(Error::Unauthorized) => Err(Error::Other("用户名或密码错误".into())),
-        r => r,
-    };
-    log_result("POST", PATH, t0, &r);
-    let v = r?;
     match (v["User"]["Id"].as_str(), v["AccessToken"].as_str()) {
         (Some(uid), Some(token)) if !uid.is_empty() && !token.is_empty() => {
             Ok((uid.to_owned(), token.to_owned()))
@@ -195,6 +250,8 @@ pub struct Emby {
     auth: String,
     token: String,
     pub user_id: String,
+    /// 上游标识，诊断数据用（见 [`crate::config::server_tag`]）。
+    pub tag: String,
 }
 
 impl Emby {
@@ -205,11 +262,12 @@ impl Emby {
             auth: auth_header(device_id, &server.user_id, &server.token),
             token: server.token.clone(),
             user_id: server.user_id.clone(),
+            tag: crate::config::server_tag(&server.api_base()),
         }
     }
 
     /// 通用请求。`path` 是 `/emby` 之后的部分，必须以 `/` 开头；查询参数单独传（键值对列表）。
-    /// 失败和慢请求写日志（[`log_result`]）。
+    /// 失败和慢请求写日志、记诊断数据（[`finish`]）。
     pub async fn call<Q: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -228,12 +286,7 @@ impl Emby {
         if let Some(b) = body {
             rb = rb.json(b);
         }
-        let r = match rb.send().await {
-            Ok(resp) => json_or_error(resp).await,
-            Err(e) => Err(net(e)),
-        };
-        log_result(method.as_str(), path, t0, &r);
-        r
+        finish(&self.tag, method.as_str(), path, t0, rb.send().await).await
     }
 
     async fn get<T: DeserializeOwned>(
@@ -531,6 +584,19 @@ pub(crate) mod tests {
         assert_eq!(c.token_header(), "X-Emby-Token: tok");
         assert_eq!(subtitle_ext(Some("subrip")), "srt");
         assert_eq!(subtitle_ext(Some("PGSSUB")), "sup");
+    }
+
+    #[test]
+    fn path_template_hides_ids() {
+        assert_eq!(
+            template("/Users/0123456789abcdef0123456789abcdef/Items/1354593"),
+            "/Users/{id}/Items/{id}"
+        );
+        assert_eq!(template("/Shows/NextUp"), "/Shows/NextUp");
+        assert_eq!(
+            template("/Items/12/PlaybackInfo"),
+            "/Items/{id}/PlaybackInfo"
+        );
     }
 
     #[test]

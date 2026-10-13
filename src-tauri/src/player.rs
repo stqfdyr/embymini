@@ -7,13 +7,14 @@
 //! （见 [`State::jump`]）。换集时沿用上一集选的音轨、字幕。
 
 use crate::emby::{self, Emby, Error, Item, MediaStream, NO_QUERY};
+use crate::telemetry;
 use reqwest::Method;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -385,6 +386,8 @@ pub struct Session {
     io: Box<dyn Io>,
     ipc: PathBuf,
     preload: f64,
+    /// 点播放的时刻和起播各阶段耗时（诊断数据，首帧出来时记一条 `play`）。
+    timeline: (Instant, Map<String, Value>),
 }
 
 /// 启动 mpv（窗口立刻出来），同时建队列（剧集 = 本集所在整季）、准备首集，再连上 IPC。出错直接返回给界面。
@@ -394,6 +397,8 @@ pub async fn start(
     from_start: bool,
     opts: Options,
 ) -> Result<Session, Error> {
+    let t0 = Instant::now();
+    let ms = move || t0.elapsed().as_millis() as u64;
     let ipc = ipc_path();
     let args = mpv_args(&opts, &ipc);
     // 参数里只有路径和开关，没有 token（token 经 IPC 设置），可以整串记日志
@@ -419,11 +424,13 @@ pub async fn start(
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::Other(format!("无法启动 mpv（{}）：{e}", opts.mpv.display())))?;
+    let spawn_ms = ms();
 
     let queue = async {
         // 条目和 PlaybackInfo 只依赖 id，并行取；单集列表要等条目里的剧 / 季 id
         let (item, info) = tokio::try_join!(emby.item(item_id), emby.playback_info(item_id))?;
         let first = ready(&emby, &item, info)?;
+        let info_ms = ms();
         let mut items = Vec::new();
         if let (true, Some(series), Some(season)) =
             (item.kind == "Episode", &item.series_id, &item.season_id)
@@ -455,10 +462,14 @@ pub async fn start(
         if !from_start {
             queue[at].start = item.user_data.playback_position_ticks as f64 / TICKS_PER_SEC;
         }
-        Ok::<_, Error>((queue, at))
+        Ok::<_, Error>((queue, at, info_ms))
     };
-    let (queue, io) = tokio::join!(queue, connect(&ipc, &mut child));
-    let ((queue, at), io) = match (queue, io) {
+    let ipc_done = async {
+        let r = connect(&ipc, &mut child).await;
+        (r, ms())
+    };
+    let (queue, (io, ipc_ms)) = tokio::join!(queue, ipc_done);
+    let ((queue, at, info_ms), io) = match (queue, io) {
         (Ok(q), Ok(io)) => (q, io),
         (Err(e), _) | (_, Err(e)) => {
             let _ = child.kill().await;
@@ -479,6 +490,15 @@ pub async fn start(
         io,
         ipc,
         preload: opts.preload_percent,
+        timeline: (
+            t0,
+            Map::from_iter([
+                ("spawn_ms".to_owned(), spawn_ms.into()),
+                ("info_ms".to_owned(), info_ms.into()),
+                ("ipc_ms".to_owned(), ipc_ms.into()),
+                ("from_start".to_owned(), from_start.into()),
+            ]),
+        ),
     })
 }
 
@@ -503,12 +523,16 @@ impl Session {
             io,
             ipc,
             preload,
+            timeline,
         } = self;
         let (rd, wr) = tokio::io::split(io);
         let mut lines = BufReader::new(rd).lines();
         let (reports, reporter) = spawn_reporter(emby.clone());
         let (prepared, mut prepared_rx) = mpsc::unbounded_channel();
         let mut st = State::new(emby, queue, wr, events, preload, reports, prepared);
+        st.tel.on = telemetry::enabled();
+        st.tel.first = Some(timeline);
+        let tel_on = st.tel.on;
 
         // token 走请求头，不进 URL（见 emby::strip_key）；要在第一次 loadfile 之前设好
         let header = st.emby.token_header();
@@ -529,6 +553,7 @@ impl Session {
             "sid",
         ]
         .into_iter()
+        .chain(TEL_PROPS.iter().copied().filter(|_| tel_on))
         .enumerate()
         {
             st.send(json!(["observe_property", id + 1, name])).await;
@@ -537,6 +562,8 @@ impl Session {
 
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut minute =
+            tokio::time::interval_at(tokio::time::Instant::now() + TEL_EVERY, TEL_EVERY);
         let mut ctl_open = true;
         loop {
             tokio::select! {
@@ -555,12 +582,17 @@ impl Session {
                 },
                 Some((i, after, r)) = prepared_rx.recv() => st.on_prepared(i, after, r).await,
                 _ = tick.tick() => st.progress("TimeUpdate"),
+                _ = minute.tick(), if st.tel.on => st.probe_minute().await,
             }
         }
         if let Some(i) = st.cur {
             st.stop(i); // mpv 被直接关掉、没来得及发 end-file 时补发
         }
-        let _ = child.wait().await;
+        let status = child.wait().await;
+        if st.tel.on {
+            let code = status.ok().and_then(|s| s.code());
+            telemetry::rec("mpv_exit", json!({ "srv": st.emby.tag, "code": code }));
+        }
         #[cfg(unix)]
         let _ = std::fs::remove_file(&ipc);
         #[cfg(not(unix))]
@@ -606,6 +638,73 @@ struct State {
     want: Option<usize>,
     /// 上次告诉 ModernZ 的「下一集已就绪」，见 [`State::sync_next_ready`]。
     next_ready: bool,
+    tel: Tel,
+}
+
+/// 诊断数据（开了才有）要多订阅的属性：缓冲卡顿、缓存秒数、下载速度。
+const TEL_PROPS: &[&str] = &["paused-for-cache", "demuxer-cache-duration", "cache-speed"];
+/// 每隔这么久记一条丢帧与下载速度的汇总。
+const TEL_EVERY: Duration = Duration::from_secs(60);
+/// 开播后取一次的解码 / 渲染信息。
+const RENDER_PROPS: &[&str] = &[
+    "mpv-version",
+    "hwdec-current",
+    "current-gpu-context",
+    "current-vo",
+    "video-codec",
+    "video-params",
+    "container-fps",
+    "display-fps",
+];
+/// 每分钟取一次、记增量的计数器（排查拖动窗口发卡、掉帧）；`vsync-jitter` 记当时的值。
+const FRAME_PROPS: &[&str] = &[
+    "frame-drop-count",
+    "decoder-frame-drop-count",
+    "mistimed-frame-count",
+    "vo-delayed-frame-count",
+    "vsync-jitter",
+];
+
+/// 每分钟汇总：计数器记和上一分钟的差（`vsync-jitter` 记当时的值），下载速度记本分钟的最小 / 平均 / 最大（KB/s）。
+fn minute_summary(tel: &mut Tel, data: Map<String, Value>) -> Value {
+    let mut out = Map::new();
+    for (k, v) in &data {
+        let prev = tel.last_frames.get(k).and_then(Value::as_f64);
+        let d = match (v.as_f64(), prev) {
+            (Some(now), Some(p)) if k != "vsync-jitter" => json!(now - p),
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), d);
+    }
+    tel.last_frames = data;
+    let sp = std::mem::take(&mut tel.speeds);
+    if !sp.is_empty() {
+        let kb = |x: f64| (x / 1024.0).round();
+        let min = sp.iter().copied().fold(f64::MAX, f64::min);
+        let max = sp.iter().copied().fold(0.0, f64::max);
+        let avg = sp.iter().sum::<f64>() / sp.len() as f64;
+        out.insert("kbps".into(), json!([kb(min), kb(avg), kb(max)]));
+    }
+    out.insert("cache_s".into(), json!(tel.cache_s.round()));
+    Value::Object(out)
+}
+
+/// 播放相关的诊断数据状态。每条记录都带上游标识 `srv`：不同上游、不同线路的表现分开统计。
+#[derive(Default)]
+struct Tel {
+    on: bool,
+    /// 首次起播：点播放的时刻 + 已有阶段；首帧（第一次 playback-restart）时记 `play`。
+    first: Option<(Instant, Map<String, Value>)>,
+    /// 换集：发起时刻、是否不用等接口（已预加载 / 已准备好）、原因（next / prev / menu / auto）；首帧时记 `switch`。
+    switch: Option<(Instant, bool, &'static str)>,
+    stall: Option<Instant>,
+    cache_s: f64,
+    /// 本分钟的下载速度采样（字节 / 秒）。
+    speeds: Vec<f64>,
+    /// get_property 的 request_id → (哪一组, 属性名)；一组凑齐后一起记。
+    probes: HashMap<u64, (&'static str, &'static str)>,
+    probe_data: HashMap<&'static str, (usize, Map<String, Value>)>,
+    last_frames: Map<String, Value>,
 }
 
 impl State {
@@ -638,6 +737,63 @@ impl State {
             prepared,
             want: None,
             next_ready: false,
+            tel: Tel::default(),
+        }
+    }
+
+    /// 记一条播放诊断数据，补上上游标识和当前条目。
+    fn tel_rec(&self, k: &str, mut v: Value) {
+        if let Some(m) = v.as_object_mut() {
+            m.insert("srv".into(), self.emby.tag.clone().into());
+            if let Some(i) = self.cur {
+                m.insert("item".into(), self.queue[i].item.id.clone().into());
+            }
+        }
+        telemetry::rec(k, v);
+    }
+
+    /// 发一组 get_property，回包凑齐后由 [`Self::on_probe`] 记一条。
+    async fn probe(&mut self, tag: &'static str, props: &'static [&'static str]) {
+        self.tel.probe_data.insert(tag, (props.len(), Map::new()));
+        for p in props {
+            let rid = self.send(json!(["get_property", p])).await;
+            self.tel.probes.insert(rid, (tag, p));
+        }
+    }
+
+    async fn probe_minute(&mut self) {
+        if self.cur.is_some() && !self.paused {
+            self.probe("minute", FRAME_PROPS).await;
+        }
+    }
+
+    fn on_probe(&mut self, tag: &'static str, prop: &'static str, v: Value) {
+        let Some((left, data)) = self.tel.probe_data.get_mut(tag) else {
+            return;
+        };
+        data.insert(prop.into(), v);
+        *left -= 1;
+        if *left > 0 {
+            return;
+        }
+        let Some((_, data)) = self.tel.probe_data.remove(tag) else {
+            return;
+        };
+        match tag {
+            "render" => self.tel_rec("render", Value::Object(data)),
+            _ => {
+                let out = minute_summary(&mut self.tel, data);
+                self.tel_rec("pmin", out);
+            }
+        }
+    }
+
+    /// 用户换集（next / prev / menu）：记下发起时刻，首帧出来时记耗时；`hit` = 不用等接口。
+    fn tel_switch(&mut self, to: usize, cause: &'static str) {
+        if self.tel.on {
+            let e = &self.queue[to];
+            let hit = e.loaded || (e.ready.is_some() && !e.stopped);
+            self.tel.switch = Some((Instant::now(), hit, cause));
         }
     }
 
@@ -742,6 +898,13 @@ impl State {
 
     async fn on_message(&mut self, v: Value) {
         let Some(ev) = v["event"].as_str() else {
+            if let Some((tag, prop)) = v["request_id"]
+                .as_u64()
+                .and_then(|rid| self.tel.probes.remove(&rid))
+            {
+                self.on_probe(tag, prop, v["data"].clone());
+                return;
+            }
             if let Some(i) = v["request_id"]
                 .as_u64()
                 .and_then(|rid| self.pending.remove(&rid))
@@ -790,6 +953,10 @@ impl State {
                     self.pos = self.queue[i].start;
                     self.dur = 0.0;
                     self.sync_next_ready().await;
+                    // 播完自动进下一集（不是用户点的）也算一次换集
+                    if self.tel.on && self.tel.first.is_none() && self.tel.switch.is_none() {
+                        self.tel.switch = Some((Instant::now(), self.queue[i].loaded, "auto"));
+                    }
                 }
             }
             "file-loaded" => {
@@ -797,13 +964,35 @@ impl State {
                     // 真正加载出来才算开播；没加载出来的不回传 Playing / Stopped
                     self.queue[i].started = true;
                     self.apply_tracks(i).await;
+                    if self.tel.on {
+                        if let Some((t0, m)) = &mut self.tel.first {
+                            m.insert("loaded_ms".into(), (t0.elapsed().as_millis() as u64).into());
+                        }
+                        self.probe("render", RENDER_PROPS).await;
+                    }
                     self.report(i, "", json!({}));
                     let _ = self.events.send(Event::Started {
                         item_id: self.queue[i].item.id.clone(),
                     });
                 }
             }
+            // 首帧（也会在 seek 后触发，只在等首帧时处理）
+            "playback-restart" if self.tel.on => {
+                if let Some((t0, mut m)) = self.tel.first.take() {
+                    m.insert("frame_ms".into(), (t0.elapsed().as_millis() as u64).into());
+                    self.tel_rec("play", Value::Object(m));
+                } else if let Some((t0, hit, cause)) = self.tel.switch.take() {
+                    let ms = t0.elapsed().as_millis() as u64;
+                    self.tel_rec("switch", json!({ "cause": cause, "hit": hit, "ms": ms }));
+                }
+            }
             "end-file" => {
+                if self.tel.on {
+                    self.tel_rec(
+                        "end",
+                        json!({ "reason": v["reason"], "err": v["file_error"], "pos": self.pos.round() }),
+                    );
+                }
                 if let Some(i) = entry {
                     if v["reason"] == "error" {
                         self.fail(i, v["file_error"].as_str().unwrap_or("未知错误"))
@@ -819,6 +1008,7 @@ impl State {
             "client-message" if v["args"][0] == JUMP_MSG => {
                 let to = v["args"][1].as_str().and_then(|s| s.parse::<usize>().ok());
                 if let Some(i) = to.filter(|&i| i < self.queue.len() && Some(i) != self.cur) {
+                    self.tel_switch(i, "menu");
                     self.jump(i).await;
                 }
             }
@@ -846,6 +1036,22 @@ impl State {
                 }
             }
             (Some("duration"), d) => self.dur = d.as_f64().unwrap_or(0.0),
+            (Some("paused-for-cache"), d) => match (d.as_bool(), self.tel.stall) {
+                (Some(true), None) => self.tel.stall = Some(Instant::now()),
+                (Some(false), Some(t0)) => {
+                    self.tel.stall = None;
+                    let ms = t0.elapsed().as_millis() as u64;
+                    let kbps = self.tel.speeds.last().map_or(0.0, |s| (s / 1024.0).round());
+                    self.tel_rec("stall", json!({ "ms": ms, "cache_s": self.tel.cache_s, "kbps": kbps, "pos": self.pos.round() }));
+                }
+                _ => {}
+            },
+            (Some("demuxer-cache-duration"), d) => self.tel.cache_s = d.as_f64().unwrap_or(0.0),
+            (Some("cache-speed"), d) => {
+                if let Some(x) = d.as_f64() {
+                    self.tel.speeds.push(x);
+                }
+            }
             (Some("volume"), d) => self.volume = d.as_f64().or(self.volume),
             // 只记「选好轨之后」的变化；换集卸载时的 null 不算（关字幕看 sid=no）
             (Some("current-tracks/audio"), d) if self.tracking() && d.is_object() => {
@@ -876,7 +1082,10 @@ impl State {
         let Some(i) = self.cur else { return };
         if i + 1 >= self.queue.len() {
             self.osd("没有下一集了").await;
-        } else if self.queue[i + 1].loaded {
+            return;
+        }
+        self.tel_switch(i + 1, "next");
+        if self.queue[i + 1].loaded {
             self.send(json!(["playlist-next"])).await;
         } else {
             self.jump(i + 1).await;
@@ -886,7 +1095,10 @@ impl State {
     async fn prev(&mut self) {
         match self.cur {
             Some(0) => self.osd("已经是第一集").await,
-            Some(i) => self.jump(i - 1).await,
+            Some(i) => {
+                self.tel_switch(i - 1, "prev");
+                self.jump(i - 1).await;
+            }
             None => {}
         }
     }
@@ -1291,6 +1503,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn minute_summary_reports_deltas_and_speed() {
+        let mut tel = Tel::default();
+        let m = |drop: f64, jitter: f64| {
+            Map::from_iter([
+                ("frame-drop-count".to_owned(), json!(drop)),
+                ("vsync-jitter".to_owned(), json!(jitter)),
+            ])
+        };
+        tel.speeds = vec![1024.0, 3072.0];
+        let first = minute_summary(&mut tel, m(5.0, 0.1));
+        assert_eq!(first["frame-drop-count"], json!(5.0));
+        assert_eq!(first["kbps"], json!([1.0, 2.0, 3.0]));
+        let second = minute_summary(&mut tel, m(12.0, 0.2));
+        assert_eq!(second["frame-drop-count"], json!(7.0));
+        assert_eq!(second["vsync-jitter"], json!(0.2));
+        assert!(second.get("kbps").is_none());
+    }
+
     /// 下一集追加进列表后按钮变绿（yes），换到下一集或追加失败后恢复（no），状态没变不重复发。
     #[tokio::test]
     async fn next_ready_follows_the_queue() {
@@ -1354,6 +1585,7 @@ mod tests {
             io: Box::new(ours),
             ipc: std::env::temp_dir().join("embymini-slow-test.sock"),
             preload: 80.0,
+            timeline: (Instant::now(), Map::new()),
         };
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
@@ -1807,6 +2039,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "需要真服账号（EMBY_SERVER / PORT / EMBY_USER / EMBY_PASS）和 PATH 里的 mpv"]
     async fn e2e_real_server() {
+        // 设了 TEL_DIR（且编译时注入了上报地址）就把诊断数据也打开，播完到这个目录看记了什么
+        let tel_dir = std::env::var("TEL_DIR").ok();
+        if let Some(d) = &tel_dir {
+            // 编译期常量：没注入上报地址时 rec 什么都不记，测了也白测
+            if !telemetry::AVAILABLE {
+                panic!("TEL_DIR 要配合编译时的 EMBYMINI_TEL_URL / EMBYMINI_TEL_TOKEN");
+            }
+            telemetry::set_enabled(true);
+            telemetry::start(
+                d.into(),
+                telemetry::Meta {
+                    device: "e2e".into(),
+                    name: "e2e".into(),
+                    version: emby::VERSION,
+                },
+            );
+        }
         let c = login_from_env().await;
 
         let (ep1, ep2) = pick_pair(&c).await;
@@ -1907,6 +2156,9 @@ mod tests {
         assert!(bad.is_empty(), "{bad:?}");
         assert!(ep1_after.played, "ep1 播完后服务端没有标记已看");
         eprintln!("事件序列：{seen:?}");
+        if tel_dir.is_some() {
+            tokio::time::sleep(Duration::from_secs(6)).await; // 等写入任务落盘（每 5 秒）
+        }
         eprintln!(
             "mpv 预取下一集：{}",
             if mpv_log.contains("Prefetching") {

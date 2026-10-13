@@ -30,8 +30,11 @@ jobs:
 
       - name: 下载 mpv.exe 到 src-tauri/mpv/
         shell: pwsh
+        # 带本次运行的 token 查询：runner 出口 IP 共用，不带 token 时每小时 60 次的匿名额度常被耗尽（实测撞上过）
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $rel = Invoke-RestMethod https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $rel = Invoke-RestMethod https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
           # x86_64-v3：AVX2 优化的构建（2013 年以后的 CPU 都支持），软解和缩放更快
           $asset = $rel.assets | Where-Object name -match '^mpv-x86_64-v3-\d{8}-git-.*\.7z$' | Select-Object -First 1
           if (-not $asset) { throw '没找到 mpv 构建' }

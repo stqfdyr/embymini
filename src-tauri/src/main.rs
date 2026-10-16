@@ -958,11 +958,8 @@ mod tests {
             mpv_dir: None,
             mpv_cache: None,
             player: Mutex::new(player),
-            images: images::Images::new(
-                std::env::temp_dir().join("embymini-test-images"),
-                images::CAP,
-                reqwest::Client::new(),
-            ),
+            // 这些测试不取图：空路径不建目录，不在临时目录留东西
+            images: images::Images::new(PathBuf::new(), images::CAP, reqwest::Client::new()),
             stream: None,
             play_seq: AtomicU64::new(0),
             quit: watch::Sender::new(false),

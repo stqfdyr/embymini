@@ -43,6 +43,7 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | 浏览器里开发界面 | 导出 `EMBY_SERVER` / `PORT` / `EMBY_USER` / `EMBY_PASS` 后 `cd ui && npx vite`，打开 http://127.0.0.1:5173 |
 | 桌面版开发（Windows） | `ui\node_modules\.bin\tauri dev` |
 | 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_real_server -- --ignored --nocapture` |
+| 本地缓存验收（同上；整片缓存模式，会下载几百 MB） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_cache_proxy -- --ignored --nocapture` |
 | 测试包 | 手动触发 `windows` workflow；安装包在该次运行的 Artifacts 里（`EmbyMini-setup`） |
 | 发版 | 把 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `version` 改成新版本并推送，再 `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`；构建、冒烟测试通过后自动发 Release（安装包、自动更新用的签名与 `latest.json`、`SHA256SUMS.txt`），版本号带 `-` 的标为预发布。打包需要仓库 Secrets 里的更新签名私钥 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
 

@@ -90,8 +90,10 @@ struct Src {
 
 #[derive(Debug)]
 enum Fail {
-    /// 上游回的 HTTP 状态码，原样回给 mpv（403、404 时界面能给出原因）。
+    /// 上游回的 HTTP 状态码（4xx 等），是定论：原样回给 mpv（403、404 时界面能给出原因）。
     Status(u16),
+    /// 上游暂时出错（5xx、429，中继和上游不稳时常见）：和网络错误一样重试，一直不好才把这个码回给 mpv。
+    Busy(u16),
     Net(String),
     Timeout,
 }
@@ -99,11 +101,24 @@ enum Fail {
 impl Fail {
     fn code(&self) -> u16 {
         match self {
-            Self::Status(s) => *s,
+            Self::Status(s) | Self::Busy(s) => *s,
             Self::Net(_) => 502,
             Self::Timeout => 504,
         }
     }
+
+    /// 重试有没有意义（网络错误、超时、5xx）。
+    fn transient(&self) -> bool {
+        !matches!(self, Self::Status(_))
+    }
+}
+
+/// [`Stream::pump`] 为什么停下。
+enum Stop {
+    /// 写到了要的末尾，或碰到已有 / 有人在写的块。
+    Hit,
+    /// 只缓存前方：写到读的位置前方 [`AHEAD`] 块了，第 b 块先不写（连接已放掉）。
+    Ahead(usize),
 }
 
 struct Part {
@@ -131,8 +146,8 @@ struct St {
     touched: Vec<u64>,
     writing: HashMap<usize, Part>,
     main: Option<Main>,
-    /// 预览任务和它要的块区间（闭区间）。
-    previews: Vec<(Task, usize, usize)>,
+    /// 预览任务、它要的块区间（闭区间）和角色（主播放器的短任务也在这里）。
+    previews: Vec<(Task, usize, usize, Role)>,
     last_read: u64,
     /// 最近一次失败和它的时刻；在这之后的某个时刻前不再重试。
     fail: Option<(Fail, Instant)>,
@@ -178,6 +193,8 @@ struct Stats {
 
 struct File {
     name: String,
+    /// 已被 retain 掉（目录在删）：还连着的读不再安排下载、直接断开。
+    gone: AtomicBool,
     dir: PathBuf,
     key: String,
     src: Mutex<Src>,
@@ -216,6 +233,7 @@ impl File {
         }
         Self {
             name: name.to_owned(),
+            gone: AtomicBool::new(false),
             dir,
             key: uuid::Uuid::new_v4().simple().to_string(),
             src: Mutex::new(src),
@@ -242,7 +260,7 @@ impl File {
         self.dir.join(b.to_string())
     }
 
-    /// 停掉这个文件的全部下载任务。
+    /// 停掉这个文件的全部下载任务（缓存留着）。
     fn stop(&self) {
         let mut st = self.st();
         let tasks: Vec<_> = st
@@ -569,7 +587,7 @@ impl Stream {
     pub fn fail_status(&self, name: &str) -> Option<u16> {
         let f = lock(&self.files).get(name)?.clone();
         match &f.st().fail {
-            Some((Fail::Status(s), _)) => Some(*s),
+            Some((Fail::Status(s) | Fail::Busy(s), _)) => Some(*s),
             _ => None,
         }
     }
@@ -605,7 +623,9 @@ impl Stream {
             }
         }
         for f in &gone {
+            f.gone.store(true, Ordering::Relaxed);
             f.stop();
+            f.bump();
             self.report(f);
         }
         let me = self.clone();
@@ -632,10 +652,11 @@ impl Stream {
             });
             out
         };
+        // 改了名就不算进总量（recount 跳过回收目录）：先重算，新片不用等旧目录删完才有空间
+        self.recount();
         for t in trash {
             let _ = std::fs::remove_dir_all(t);
         }
-        self.recount();
         if !lock(&self.doomed).is_empty() {
             let me = self.clone();
             tauri::async_runtime::spawn(async move {
@@ -645,9 +666,9 @@ impl Stream {
         }
     }
 
-    /// 重新统计视频缓存总量，顺带按磁盘可用空间定容量上限。
+    /// 重新统计视频缓存总量（不算回收目录），顺带按磁盘可用空间定容量上限。
     fn recount(&self) {
-        let total = dir_size(&self.video);
+        let total = self.video_size();
         self.total.store(total, Ordering::Relaxed);
         if let Some(free) = free_space(&self.video) {
             let cap = (free + total)
@@ -657,9 +678,20 @@ impl Stream {
         }
     }
 
+    /// 视频缓存的字节（不算正在删的回收目录）。
+    fn video_size(&self) -> u64 {
+        std::fs::read_dir(&self.video)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".trash-"))
+            .map(|e| dir_size(&e.path()))
+            .sum()
+    }
+
     /// 视频缓存、字幕缓存各占多少字节。
     pub fn usage(&self) -> (u64, u64) {
-        (dir_size(&self.video), dir_size(&self.subs))
+        (self.video_size(), dir_size(&self.subs))
     }
 
     /// 清理视频缓存；`playing`（在播或正在起播）时保留已登记的文件——换集时 retain 过，登记着的就是这次播放的当前集和下一集。
@@ -707,6 +739,19 @@ impl Stream {
                 let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
             }
         });
+    }
+
+    /// 一次播放结束（mpv 退出）：停掉这些文件的下载，缓存留着（下次打开同一部片直接用）；每个文件记一条诊断数据。
+    /// 不停的话整片模式会在关掉播放器之后把整部片下完。只停给出的这几个：换片时新的一次播放可能已经开始了。
+    pub fn idle(&self, names: &[String]) {
+        let files: Vec<_> = {
+            let all = lock(&self.files);
+            names.iter().filter_map(|n| all.get(n).cloned()).collect()
+        };
+        for f in files {
+            f.stop();
+            self.report(&f);
+        }
     }
 
     /// 程序退出前：每个文件记一条诊断数据。
@@ -856,6 +901,9 @@ impl Stream {
         loop {
             let abort = {
                 let mut st = f.st();
+                if f.gone.load(Ordering::Relaxed) {
+                    return Err(410); // 换片时被删了
+                }
                 if let Some(s) = st.size {
                     return Ok(s);
                 }
@@ -899,7 +947,9 @@ impl Stream {
                 if role == Role::Main {
                     st.last_read = pos;
                 }
-                if st.done.get(b).copied().unwrap_or(false) {
+                if f.gone.load(Ordering::Relaxed) {
+                    Next::Gone // 换片时被删了：断开，mpv 那边这时已经在播别的
+                } else if st.done.get(b).copied().unwrap_or(false) {
                     st.touched[b] = self.tick.fetch_add(1, Ordering::Relaxed);
                     let len = block_len(st.size.unwrap_or(0), b);
                     Next::Read(f.block_path(b), len, true)
@@ -981,6 +1031,7 @@ impl Stream {
     /// 读的一方要第 b 块（预览要 [b, hi]）：已有或有人在写就等；否则按角色安排下载。返回要取消的旧任务（锁外取消）。
     fn ensure(&self, f: &Arc<File>, st: &mut St, b: usize, hi: usize, role: Role) -> Vec<Task> {
         if st.has(b)
+            || f.gone.load(Ordering::Relaxed)
             || st.retry_at.is_some_and(|t| Instant::now() < t)
             || st.size.is_some_and(|s| b >= blocks(s))
         {
@@ -990,7 +1041,7 @@ impl Stream {
             .main
             .as_ref()
             .is_some_and(|m| m.at <= b && b <= m.at + MAIN_NEAR as usize);
-        if near || st.previews.iter().any(|(_, lo, h)| *lo <= b && b <= *h) {
+        if near || st.previews.iter().any(|(_, lo, h, _)| *lo <= b && b <= *h) {
             return Vec::new();
         }
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -1013,17 +1064,26 @@ impl Stream {
             r => (r, hi),
         };
         let mut old = Vec::new();
-        if st.previews.len() >= PREVIEWS {
-            old.push(st.previews.remove(0).0); // 预览只关心最新的位置
+        // 预览只关心最新的位置：名额满了取消最早的预览 / 预取（主播放器的短任务不算名额、不取消）
+        let side = |r: &Role| *r != Role::Main;
+        if st.previews.iter().filter(|p| side(&p.3)).count() >= PREVIEWS
+            && let Some(k) = st.previews.iter().position(|p| side(&p.3))
+        {
+            old.push(st.previews.remove(k).0);
         }
         let task =
             tauri::async_runtime::spawn(self.clone().preview_task(f.clone(), b, hi, id, role));
-        st.previews.push((Task { id, task }, b, hi));
+        st.previews.push((Task { id, task }, b, hi, role));
         old
     }
 
     async fn main_task(self, f: Arc<File>, mut b: usize, id: u64) {
         let _g = TaskGuard { f: f.clone(), id };
+        let mine = || {
+            f.st().main.as_ref().is_some_and(|m| m.t.id == id) && !f.gone.load(Ordering::Relaxed)
+        };
+        let mut rx = f.changed.subscribe();
+        let mut back = 1;
         loop {
             let r = async {
                 let o = self.open(&f, b as u64 * BLOCK, None, Role::Main).await?;
@@ -1031,10 +1091,33 @@ impl Stream {
                 self.pump(&f, o, b, n, Some(id), Role::Main).await
             }
             .await;
-            if let Err(e) = r {
-                return f.failed(e);
+            match r {
+                Ok(Stop::Ahead(at)) => {
+                    // 读的位置往前走到只差半段再接着要：一次请求写 8 块左右，不至于每走一块就开一个请求
+                    loop {
+                        if !mine() {
+                            return;
+                        }
+                        let rb = (f.st().last_read / BLOCK) as usize;
+                        if !self.limited() || at <= rb + AHEAD as usize / 2 {
+                            break;
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
+                    }
+                }
+                Ok(Stop::Hit) => back = 1,
+                Err(e) if e.transient() => {
+                    // 网络错误、5xx：自己退避重试（1、2、4…30 秒），整片模式不能断在这里；读的一方要别处会换掉这个任务
+                    f.failed(e);
+                    tokio::time::sleep(Duration::from_secs(back)).await;
+                    back = (back * 2).min(30);
+                    if !mine() {
+                        return;
+                    }
+                }
+                Err(e) => return f.failed(e),
             }
-            // 碰到已有的块断开了，或写到了文件尾：从读的位置往后找下一个缺块
+            // 碰到已有的块断开了、写到了文件尾、或重试：从读的位置往后找下一个缺块
             match self.next_missing(&f) {
                 Some(nb) => {
                     b = nb;
@@ -1057,6 +1140,7 @@ impl Stream {
             self.pump(&f, o, lo, (hi + 1).min(n), None, role).await
         }
         .await;
+        let r = r.map(|_| ());
         if let Err(e) = r {
             f.failed(e);
         }
@@ -1068,7 +1152,7 @@ impl Stream {
         let n = st.done.len();
         let rb = ((st.last_read / BLOCK) as usize).min(n.saturating_sub(1));
         let free =
-            |b: &usize| !st.has(*b) && !st.previews.iter().any(|(_, lo, hi)| lo <= b && b <= hi);
+            |b: &usize| !st.has(*b) && !st.previews.iter().any(|(_, lo, hi, _)| lo <= b && b <= hi);
         if self.limited() {
             return (rb..(rb + AHEAD as usize + 1).min(n)).find(free);
         }
@@ -1097,11 +1181,11 @@ impl Stream {
         let r = loop {
             tokio::select! {
                 r = &mut a => match r {
-                    Err(Fail::Net(_)) if b.is_some() => a = b.take().unwrap(),
+                    Err(e) if e.transient() && b.is_some() => a = b.take().unwrap(),
                     r => break r,
                 },
                 r = maybe(&mut b) => match r {
-                    Err(Fail::Net(_)) => b = None,
+                    Err(e) if e.transient() => b = None,
                     r => break r,
                 },
                 _ = tokio::time::sleep_until(next) => {
@@ -1155,6 +1239,7 @@ impl Stream {
                 log::warn!("上游没按 Range 回数据（{st}）");
                 return Err(Fail::Status(502));
             }
+            (429 | 500..=599, _) => return Err(Fail::Busy(st)),
             _ => return Err(Fail::Status(st)),
         };
         let first = resp
@@ -1208,7 +1293,7 @@ impl Stream {
                     return Ok(resp);
                 }
                 Ok(resp) if !fallback => return Ok(resp),
-                Ok(resp) => last = Fail::Status(resp.status().as_u16()),
+                Ok(resp) => last = Fail::Busy(resp.status().as_u16()),
                 Err(e) => last = e,
             }
             lock(src).resolved = None;
@@ -1225,7 +1310,7 @@ impl Stream {
         to: usize,
         main: Option<u64>,
         role: Role,
-    ) -> Result<(), Fail> {
+    ) -> Result<Stop, Fail> {
         let Opened {
             mut resp,
             first: mut pending,
@@ -1233,23 +1318,16 @@ impl Stream {
         } = o;
         let size = f.st().size.unwrap_or(0);
         let io = |e: std::io::Error| Fail::Net(format!("写缓存失败：{e}"));
-        let mut rx = f.changed.subscribe();
         for b in from..to {
-            if let Some(id) = main {
-                // 只缓存前方：写到读的位置前方 AHEAD 块就等（不读回包，上游按播放速度慢慢给）
-                loop {
-                    let rb = (f.st().last_read / BLOCK) as usize;
-                    if !self.limited() || b <= rb + AHEAD as usize {
-                        break;
-                    }
-                    if f.st().main.as_ref().is_none_or(|m| m.t.id != id) {
-                        return Ok(());
-                    }
-                    let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
-                }
+            // 只缓存前方：写到读的位置前方 AHEAD 块就放掉连接。挂着不读的话，读超时（10 秒）和中继的发送超时都会把它断掉
+            if main.is_some()
+                && self.limited()
+                && b > (f.st().last_read / BLOCK) as usize + AHEAD as usize
+            {
+                return Ok(Stop::Ahead(b));
             }
             let Some(mut w) = self.claim(f, b, main, size) else {
-                return Ok(());
+                return Ok(Stop::Hit);
             };
             let len = block_len(size, b);
             let mut file = std::fs::File::create(&w.path).map_err(io)?;
@@ -1286,10 +1364,11 @@ impl Stream {
             self.total.fetch_add(len, Ordering::Relaxed);
             f.bump();
         }
-        Ok(())
+        Ok(Stop::Hit)
     }
 
-    /// 登记要写第 b 块。块已有、有人在写、主任务已被换掉时返回 None；超容量先删当前文件里最久没用的块，删不出来也返回 None。
+    /// 登记要写第 b 块。块已有、有人在写、主任务已被换掉时返回 None。超容量时先删当前文件里最久没用的块；删不出来也照写
+    /// （读的一方正等着它；拒绝的话任务会立即重开请求、空转）——超出的只是读的位置附近几块，主任务到了上限只写前方一段。
     fn claim(&self, f: &Arc<File>, b: usize, main: Option<u64>, size: u64) -> Option<Writing> {
         let mut st = f.st();
         if let Some(id) = main {
@@ -1307,9 +1386,12 @@ impl Stream {
             // 读的位置附近的不删
             let rb = (st.last_read / BLOCK) as usize;
             let keep = rb.saturating_sub(2)..=rb + AHEAD as usize;
-            let victim = (0..st.done.len())
+            let Some(victim) = (0..st.done.len())
                 .filter(|&k| st.done[k] && !keep.contains(&k))
-                .min_by_key(|&k| st.touched[k])?;
+                .min_by_key(|&k| st.touched[k])
+            else {
+                break;
+            };
             st.done[victim] = false;
             let _ = std::fs::remove_file(f.block_path(victim));
             sub_total(&self.total, block_len(size, victim));
@@ -1354,10 +1436,11 @@ impl File {
         st.size = Some(total);
         st.done = vec![false; n];
         st.touched = vec![0; n];
-        let _ = std::fs::write(
-            self.dir.join("meta.json"),
-            json!({ "size": total }).to_string(),
-        );
+        // 先写临时文件再改名：写到一半断电，meta 坏了会把整个目录的块都当成来历不明删掉
+        let tmp = self.dir.join("meta.json.tmp");
+        if std::fs::write(&tmp, json!({ "size": total }).to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, self.dir.join("meta.json"));
+        }
         drop(st);
         self.bump();
         n
@@ -1365,17 +1448,20 @@ impl File {
 
     fn failed(&self, e: Fail) {
         let why = match &e {
-            Fail::Status(s) => format!("HTTP {s}"),
+            Fail::Status(s) | Fail::Busy(s) => format!("HTTP {s}"),
             Fail::Net(m) => m.clone(),
             Fail::Timeout => format!("{} 秒没有数据", OPEN_LIMIT.as_secs()),
         };
-        log::warn!("缓存代理向上游取数据失败：{why}");
         lock(&self.stats).fails += 1;
         let back = match e {
             Fail::Status(_) => 3,
             _ => 1,
         };
         let mut st = self.st();
+        // 只记一连串失败里的第一次（成功取到数据时清零）：上游长时间不通时每秒重试，不刷屏
+        if st.fail.is_none() {
+            log::warn!("缓存代理向上游取数据失败：{why}");
+        }
         let now = Instant::now();
         st.retry_at = Some(now + Duration::from_secs(back));
         st.fail = Some((e, now));
@@ -1522,10 +1608,19 @@ mod tests {
         other: String,
         log: Arc<Mutex<Vec<(String, String, bool)>>>,
         data: Arc<Vec<u8>>,
+        /// 正在发正文的连接数。
+        active: Arc<AtomicU64>,
     }
 
     fn data(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 31 + i / 4099) as u8).collect()
+    }
+
+    struct Active(Arc<AtomicU64>);
+    impl Drop for Active {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     async fn serve(
@@ -1533,12 +1628,15 @@ mod tests {
         log: Arc<Mutex<Vec<(String, String, bool)>>>,
         data: Arc<Vec<u8>>,
         redirect: Option<String>,
+        active: Arc<AtomicU64>,
     ) {
         let stalls = Arc::new(AtomicU64::new(0));
         let cuts = Arc::new(AtomicU64::new(0));
+        let flaky = Arc::new(AtomicU64::new(0));
         while let Ok((mut s, _)) = l.accept().await {
             let (log, data, redirect) = (log.clone(), data.clone(), redirect.clone());
-            let (stalls, cuts) = (stalls.clone(), cuts.clone());
+            let (stalls, cuts, flaky, active) =
+                (stalls.clone(), cuts.clone(), flaky.clone(), active.clone());
             tokio::spawn(async move {
                 let mut buf = vec![0; 8192];
                 let mut head = String::new();
@@ -1571,6 +1669,11 @@ mod tests {
                     let _ = s.write_all(r.as_bytes()).await;
                     return;
                 }
+                // 前两次 502（中继不稳）
+                if path.starts_with("/flaky") && flaky.fetch_add(1, Ordering::SeqCst) < 2 {
+                    let _ = s.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    return;
+                }
                 if path.starts_with("/sub") {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello").await;
                     return;
@@ -1592,8 +1695,14 @@ mod tests {
                     tokio::time::sleep(Duration::from_secs(20)).await;
                     return;
                 }
+                active.fetch_add(1, Ordering::SeqCst);
+                let _active = Active(active);
                 let mut sent = 0u64;
                 for chunk in data[a as usize..=b as usize].chunks(64 << 10) {
+                    // 慢速上游：约 1.3 MB/s
+                    if path.starts_with("/slow") {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                     // 第一次请求：发了 6 MiB 就断开（中途断线）
                     if path.starts_with("/cut")
                         && sent > 6 << 20
@@ -1613,17 +1722,25 @@ mod tests {
     async fn upstream(size: usize) -> Upstream {
         let log = Arc::new(Mutex::new(Vec::new()));
         let data = Arc::new(data(size));
+        let active = Arc::new(AtomicU64::new(0));
         let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let other = format!("http://{}", l2.local_addr().unwrap());
-        tokio::spawn(serve(l2, log.clone(), data.clone(), None));
+        tokio::spawn(serve(l2, log.clone(), data.clone(), None, active.clone()));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", l.local_addr().unwrap());
-        tokio::spawn(serve(l, log.clone(), data.clone(), Some(other.clone())));
+        tokio::spawn(serve(
+            l,
+            log.clone(),
+            data.clone(),
+            Some(other.clone()),
+            active.clone(),
+        ));
         Upstream {
             base,
             other,
             log,
             data,
+            active,
         }
     }
 
@@ -1876,6 +1993,133 @@ mod tests {
         let n = f.st().done.iter().filter(|d| **d).count() as u64;
         assert!(n <= AHEAD + 2, "到了容量上限还在往后写：{n} 块");
         drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 只缓存前方：写满前方 AHEAD 块就放掉上游连接（挂着不读会被读超时断开），读的位置往前走半段再续上。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn limited_mode_releases_connection_and_resumes() {
+        let u = upstream((60 * BLOCK) as usize).await;
+        let dir = tmp("limited");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_11_a", &format!("{}/f", u.base), &auth(&u));
+        let _ = get(&url, Some("bytes=0-99"), false).await;
+        let f = lock(&s.files).get("srv_11_a").unwrap().clone();
+        let done = |f: &File| -> Vec<usize> {
+            let st = f.st();
+            (0..st.done.len()).filter(|&b| st.done[b]).collect()
+        };
+        assert!(
+            until(|| done(&f).len() == AHEAD as usize + 1, 5).await,
+            "{:?}",
+            done(&f)
+        );
+        assert!(
+            until(|| u.active.load(Ordering::SeqCst) == 0, 3).await,
+            "写满前方后还挂着上游连接"
+        );
+        assert!(f.st().main.is_some(), "主任务应该还在等读的位置往前走");
+        // 读到第 5 块：离写到的位置还差 12 块，不续；读到第 10 块：差 7 块（不到半段 8 块），续上写到 26
+        let _ = get(
+            &url,
+            Some(&format!("bytes={}-{}", 5 * BLOCK, 5 * BLOCK + 9)),
+            false,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(done(&f).len(), AHEAD as usize + 1);
+        let _ = get(
+            &url,
+            Some(&format!("bytes={}-{}", 10 * BLOCK, 10 * BLOCK + 9)),
+            false,
+        )
+        .await;
+        assert!(
+            until(|| done(&f) == (0..=26).collect::<Vec<_>>(), 5).await,
+            "{:?}",
+            done(&f)
+        );
+        assert_eq!(reqs(&u, "/f").len(), 2, "续写应只开一个新请求");
+        drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 5xx 当成暂时的：主任务退避重试，读的一方等到数据，不把 502 回给 mpv。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_5xx_is_retried() {
+        let u = upstream(BLOCK as usize + 100).await;
+        let dir = tmp("flaky");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_12_a", &format!("{}/flaky", u.base), &auth(&u));
+        let t0 = Instant::now();
+        let (st, body) = get(&url, Some("bytes=0-99"), false).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[..100]);
+        assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+        assert_eq!(reqs(&u, "/flaky").len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// retain 掉还在读的文件：读的连接断开，不再安排下载；播放结束（idle）停掉整片下载。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retain_and_idle_stop_downloads() {
+        let u = upstream((20 * BLOCK) as usize).await;
+        let dir = tmp("stop");
+        let s = Stream::start(&dir, true).unwrap();
+        let url = s.video("srv_13_a", &format!("{}/slow", u.base), &auth(&u));
+        let reading = tokio::spawn(async move { get(&url, None, false).await });
+        // 等读的一方真在收数据（总大小已知、第一块写了一部分）：测的是读数据中途被删，不是等总大小时
+        let f = lock(&s.files).get("srv_13_a").unwrap().clone();
+        assert!(
+            until(
+                || f.st().writing.get(&0).is_some_and(|p| p.written > 1 << 20),
+                5
+            )
+            .await
+        );
+        drop(f);
+        s.retain(&[]);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("retain 后读的连接没断")
+            .unwrap();
+        assert!(body.len() < u.data.len());
+        assert!(until(|| u.active.load(Ordering::SeqCst) == 0, 3).await);
+        let n = reqs(&u, "/slow").len();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(reqs(&u, "/slow").len(), n, "删掉的文件还在向上游要数据");
+
+        let url = s.video("srv_14_a", &format!("{}/slow", u.base), &auth(&u));
+        let _ = get(&url, Some("bytes=0-99"), false).await;
+        assert!(
+            u.active.load(Ordering::SeqCst) > 0,
+            "整片模式应在后台接着下"
+        );
+        let first = dir.join("video/srv_14_a/0");
+        assert!(until(|| first.exists(), 10).await);
+        s.idle(&["srv_14_a".into()]);
+        assert!(
+            until(|| u.active.load(Ordering::SeqCst) == 0, 3).await,
+            "播放结束后还在下"
+        );
+        assert!(first.exists(), "缓存要留着");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 容量小到连读的位置附近都放不下时照样写（只是超一点），不能拒绝写而让任务空转重开请求。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tiny_capacity_still_serves() {
+        let u = upstream((8 * BLOCK) as usize).await;
+        let dir = tmp("tiny");
+        let s = Stream::start(&dir, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        s.cap.store(BLOCK, Ordering::Relaxed);
+        let url = s.video("srv_15_a", &format!("{}/f", u.base), &auth(&u));
+        let (st, body) = get(&url, Some(&format!("bytes=0-{}", 3 * BLOCK)), false).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[..=3 * BLOCK as usize]);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(reqs(&u, "/f").len() <= 2, "{:?}", reqs(&u, "/f"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

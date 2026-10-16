@@ -699,6 +699,14 @@ impl Session {
         }
         let status = child.wait().await;
         crate::lifecycle::exit_mark("mpv_exited");
+        if let Some(s) = &st.stream {
+            let names: Vec<String> = st
+                .queue
+                .iter()
+                .filter_map(|e| e.ready.as_ref().map(|r| r.name.clone()))
+                .collect();
+            s.idle(&names);
+        }
         let code = status.as_ref().ok().and_then(|s| s.code());
         if st.tel.on {
             telemetry::rec("mpv_exit", json!({ "srv": st.emby.tag, "code": code }));
@@ -2693,6 +2701,8 @@ mod tests {
         );
         pause(1500).await;
         shot("01-start").await;
+        // 第 1 集的外挂字幕地址（换集后轨道列表就是第 2 集的了）
+        let ep1_tracks = get_property(&ipc, "track-list").await;
         pause(3000).await;
         key("RIGHT").await; // 加载后的第一次 seek：也要出进度条
         pause(500).await;
@@ -2728,14 +2738,15 @@ mod tests {
                 .iter()
                 .map(|e| e["filename"].clone()),
         );
-        shown.extend(
-            get_property(&ipc, "track-list")
-                .await
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["external-filename"].clone()),
-        );
+        for tracks in [ep1_tracks, get_property(&ipc, "track-list").await] {
+            shown.extend(
+                tracks
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t["external-filename"].clone()),
+            );
+        }
         ctl.send(Ctl::Quit).unwrap();
         while !matches!(next().await, Event::Ended { .. }) {}
         run.await.unwrap();
@@ -2754,14 +2765,118 @@ mod tests {
             .filter(|v| v.contains(token) || v.contains("api_key"))
             .count();
         assert_eq!(leaked, 0, "mpv 能显示出来的地址里有 {leaked} 处带 token");
+        // 视频和外挂字幕都经缓存代理（path 在第一个；内嵌轨的 external-filename 是 null）
+        let direct = shown
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|u| !u.starts_with("http://127.0.0.1:"))
+            .count();
         assert!(
-            shown[0]
-                .as_str()
-                .is_some_and(|p| p.starts_with("http://127.0.0.1:")),
-            "没有经缓存代理播放：{}",
-            shown[0]
+            shown[0].is_string() && direct == 0,
+            "有 {direct} 个地址没经缓存代理"
         );
+        let subs = shown
+            .iter()
+            .filter(|v| v.as_str().is_some_and(|u| u.contains("/s/")))
+            .count();
+        eprintln!("外挂字幕 {subs} 条经缓存代理");
         let _ = std::fs::remove_dir_all(cache);
         eprintln!("截图在 {}；检查过的地址 {} 个", dir.display(), shown.len());
+    }
+
+    /// 缓存代理验收（整片模式，真服 + 无头 mpv）：后台整片下载、拖到没缓存 / 已缓存的位置各要多久、
+    /// 关掉播放器后不再下载、重开同一集从缓存起播。会经中继下几百 MB。
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "需要真服账号和 PATH 里的 mpv；整片模式会下几百 MB"]
+    async fn e2e_cache_proxy() {
+        let c = login_from_env().await;
+        let (ep1, ep2) = pick_pair(&c).await;
+        let before = [
+            c.item(&ep1.id).await.unwrap(),
+            c.item(&ep2.id).await.unwrap(),
+        ];
+        let dir =
+            std::env::temp_dir().join(format!("embymini-e2e-cache-whole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stream = Stream::start(&dir, true).unwrap();
+        let blocks = || {
+            std::fs::read_dir(dir.join("video"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+                .filter(|e| e.file_name().to_string_lossy().parse::<u64>().is_ok())
+                .count()
+        };
+        let play = async || {
+            let opts = Options {
+                stream: Some(stream.clone()),
+                ..headless(&[])
+            };
+            let t0 = Instant::now();
+            let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
+            let ipc = session.ipc.clone();
+            let (ctl, ctl_rx) = mpsc::unbounded_channel();
+            let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+            let run = tokio::spawn(session.run(ctl_rx, ev_tx));
+            assert!(matches!(ev_rx.recv().await, Some(Event::Started { .. })));
+            (t0.elapsed(), ipc, ctl, ev_rx, run)
+        };
+        // 拖到 at 秒，等 time-pos 走过 at 开始前进
+        let seek = async |ipc: &Path, at: f64| {
+            let t0 = Instant::now();
+            mpv_cmd(ipc, json!(["seek", at, "absolute"])).await;
+            loop {
+                let pos = get_property(ipc, "time-pos").await.as_f64().unwrap_or(0.0);
+                if pos >= at + 0.5 {
+                    return t0.elapsed();
+                }
+                assert!(
+                    t0.elapsed() < Duration::from_secs(60),
+                    "拖到 {at} 秒一分钟没出画面"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+
+        let (first, ipc, ctl, mut ev_rx, run) = play().await;
+        let dur = get_property(&ipc, "duration").await.as_f64().unwrap();
+        let up0 = stream.up_bytes();
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        let rate = (stream.up_bytes() - up0) as f64 / 8.0 / 1048576.0;
+        eprintln!(
+            "起播 {first:?}；后台下载 {rate:.1} MB/s，已缓存 {} 块",
+            blocks()
+        );
+        assert!(rate > 0.5, "整片模式没在后台下载");
+        let far = seek(&ipc, dur * 0.6).await;
+        let near = seek(&ipc, 10.0).await;
+        eprintln!("拖到没缓存的 60%：{far:?}；拖回已缓存的开头：{near:?}");
+        assert!(
+            near < Duration::from_secs(2),
+            "已缓存的位置拖动太慢：{near:?}"
+        );
+        ctl.send(Ctl::Quit).unwrap();
+        while !matches!(ev_rx.recv().await, Some(Event::Ended { .. }) | None) {}
+        run.await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let up1 = stream.up_bytes();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(stream.up_bytes(), up1, "关掉播放器后还在下载");
+        let cached = blocks();
+
+        let (again, _ipc, ctl, mut ev_rx, run) = play().await;
+        eprintln!("重开同一集起播 {again:?}（第一次 {first:?}）；缓存 {cached} 块");
+        ctl.send(Ctl::Quit).unwrap();
+        while !matches!(ev_rx.recv().await, Some(Event::Ended { .. }) | None) {}
+        run.await.unwrap();
+        let mut bad = Vec::new();
+        for b in &before {
+            bad.extend(restore(&c, b).await);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(cached > 0);
     }
 }

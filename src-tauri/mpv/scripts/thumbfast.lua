@@ -6,8 +6,9 @@
 --
 -- Modified for EmbyMini (changes marked "EmbyMini:"): the thumbnailer process
 -- gets the main player's HTTP headers and user agent (the stream needs the
--- same auth header) and a short network timeout; seeks while the mouse moves
--- along the seek bar are spaced out, since each one is a new HTTP request.
+-- same auth header) and a short network timeout; on network streams it seeks
+-- to keyframes only and keeps one seek in flight at a time, since each seek is
+-- a new HTTP request.
 
 --[[
 This Source Code Form is subject to the terms of the Mozilla Public
@@ -155,6 +156,9 @@ local x, y
 local last_x, last_y
 
 local last_seek_time
+local net_wait, net_settle = 3, 0.25 -- EmbyMini: see seek()
+local net_sent_time, net_sent_at -- EmbyMini: network seek in flight (position, when sent)
+local net_moved_at = 0 -- EmbyMini: when the hovered position last changed
 
 local effective_w, effective_h = options.max_width, options.max_height
 local real_w, real_h
@@ -523,6 +527,8 @@ local function spawn(time)
 
     spawned = true
     spawn_waiting = true
+    -- EmbyMini: --start already fetches this position; opening the stream takes several seconds longer than a seek
+    net_sent_time, net_sent_at = time, mp.get_time() + 5
 
     subprocess(args, true,
         function(success, result)
@@ -659,19 +665,31 @@ local function move_file(from, to)
     os.rename(from, to)
 end
 
+-- EmbyMini: on a network stream every seek is a new HTTP range request taking 1-3 s, and a new seek aborts
+-- the one in flight, so seeking while the mouse moves showed nothing until it stopped. There, while the mouse
+-- moves, a seek is sent only when the previous thumbnail has arrived (or after net_wait seconds); once it has
+-- rested net_settle seconds, the final position goes out at once. Always to the keyframe: an exact seek
+-- downloads and decodes everything from the keyframe on and took seconds longer.
 local function seek(fast)
     if last_seek_time then
+        if properties["demuxer-via-network"] then
+            local now = mp.get_time()
+            if net_sent_time == last_seek_time then return end
+            if net_sent_at and now - net_sent_at < net_wait and (spawn_waiting or now - net_moved_at < net_settle) then return end
+            net_sent_time, net_sent_at = last_seek_time, now
+            fast = true
+        end
         run("async seek " .. last_seek_time .. (fast and " absolute+keyframes" or " absolute+exact"))
     end
 end
 
--- EmbyMini: 0.25 s instead of 3/60 s. Over the network every seek is a new HTTP range request that takes
--- about a second, so seeking 20 times a second while the mouse moves only aborts requests and wastes traffic
-local seek_period = 0.25
+local seek_period = 3/60
 local seek_period_counter = 0
 local seek_timer
 seek_timer = mp.add_periodic_timer(seek_period, function()
-    if seek_period_counter == 0 then
+    if properties["demuxer-via-network"] then
+        seek(true) -- EmbyMini: keep trying until the latest position is sent (clear() stops the timer)
+    elseif seek_period_counter == 0 then
         seek(allow_fast_seek)
         seek_period_counter = 1
     else
@@ -707,6 +725,7 @@ local function check_new_thumb()
     spawn_waiting = false
     local w, h = real_res(effective_w, effective_h, finfo.size)
     if w then -- only accept valid thumbnails
+        net_sent_at = nil -- EmbyMini: thumbnail arrived, the next seek may go out
         move_file(tmp, options.thumbnail..".bgra")
 
         real_w, real_h = w, h
@@ -740,6 +759,7 @@ local function clear()
         activity_timer:resume()
     end
     last_seek_time = nil
+    net_sent_time, net_sent_at = nil, nil -- EmbyMini
     show_thumbnail = false
     last_x = nil
     last_y = nil
@@ -794,6 +814,7 @@ local function thumb(time, r_x, r_y, script)
 
     if time == last_seek_time then return end
     last_seek_time = time
+    net_moved_at = mp.get_time() -- EmbyMini
     if not spawned then spawn(time) end
     request_seek()
     if not file_timer:is_enabled() then file_timer:resume() end

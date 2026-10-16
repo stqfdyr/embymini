@@ -68,4 +68,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
 - [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文
-- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA 和读超时；鼠标在进度条上移动时拉开取图间隔），标 `EmbyMini:`
+- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA 和读超时；网络流只取关键帧、同时只有一个取图请求），标 `EmbyMini:`

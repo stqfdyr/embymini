@@ -82,6 +82,7 @@ static FLUSHED: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// 程序退出前调用：写入任务平时 5 秒才落一次盘，最后几秒（这一集的结束、mpv 退出码、Stopped 请求）
 /// 不落盘就丢了。让它立刻写，最多等 `wait`。没开过诊断数据时什么都不做。
+/// 内部用 `block_on`：只能在同步线程里调（主线程或 `spawn_blocking`），在 async 任务里调会 panic。
 pub fn flush_now(wait: Duration) {
     let Some(tx) = TX.get() else { return };
     tauri::async_runtime::block_on(async {

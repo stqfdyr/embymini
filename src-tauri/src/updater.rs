@@ -101,17 +101,18 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
         m.insert("mb".into(), json!(got >> 20));
     });
     let bytes = r.map_err(fail)?;
-    let h = handle.clone();
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        h.state::<App>().shutdown(Duration::from_secs(3));
-    })
-    .await;
     log::info!("启动安装器，程序退出");
-    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先把诊断数据落盘、去掉运行标记（这不是异常退出）
+    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先关播放器，再把诊断数据落盘、去掉运行标记（这不是异常退出）。
+    // shutdown 和 flush_now 内部用 block_on，在 async 命令里直接调会 panic，命令永远不返回、界面停在 100%
     update_rec("install", proxy, std::time::Instant::now(), None, |m| {
         m.insert("to".into(), json!(u.version));
     });
-    telemetry::flush_now(Duration::from_millis(500));
+    let h = handle.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        h.state::<App>().shutdown(Duration::from_secs(3));
+        telemetry::flush_now(Duration::from_millis(500));
+    })
+    .await;
     let root = app
         .path
         .parent()

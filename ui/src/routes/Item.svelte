@@ -1,5 +1,6 @@
 <!-- 详情页（剧集 / 电影）：背板 + Logo + 操作 + 简介 → 季与单集 → 演职人员 → 艺术图 → 类似作品 → 链接 → 媒体信息。
-     点进来时先用列表里已有的条目画出顶部（peek），详情、季、单集并行取，到了原地补全。 -->
+     点进来时先用列表里已有的条目画出顶部（peek），详情、季、单集并行取，到了原地补全。
+     同一部片有多个版本（1080p、4K 等）时，技术参数行换成版本下拉，播放和媒体信息都跟着选中的版本。 -->
 <script lang="ts">
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { Check, Heart, Link, Play, RotateCcw, User } from '@lucide/svelte'
@@ -106,7 +107,11 @@
 
   /** 播放按钮的目标：电影是自己；剧集是「下一集」，没有就是所选季的第一集。 */
   const t = $derived(loaded && (loaded.item.Type === 'Series' ? loaded.next ?? eps[0] : loaded.item))
-  const src = $derived(t?.MediaSources?.[0] ?? loaded?.item.MediaSources?.[0])
+  const sources = $derived(t?.MediaSources ?? loaded?.item.MediaSources ?? [])
+  /** 选的版本只对当时那个播放目标有效，换了目标（换集、刷新后下一集变了）就回到服务器排的第一个。 */
+  let picked = $state<{ target?: string; source: string }>()
+  const src = $derived(sources.find((s) => picked && picked.target === t?.Id && s.Id === picked.source) ?? sources[0])
+  const pickedSource = $derived(sources.length > 1 ? src?.Id : undefined)
   const bd = $derived(item ? img(item.Id, 'Backdrop', item.BackdropImageTags?.[0], 1600) : '')
 
   function playLabel(t?: Item) {
@@ -141,13 +146,13 @@
             <h1>{item.Name}</h1>
           {/if}
           <div class="actions">
-            <button class="round" title="从头播放" disabled={!t} onclick={() => t && play(t.Id, true)}><RotateCcw size={18} /></button>
+            <button class="round" title="从头播放" disabled={!t} onclick={() => t && play(t.Id, true, pickedSource)}><RotateCcw size={18} /></button>
             <button class="round" class:on={item.UserData?.Played} title={item.UserData?.Played ? '标记为未看' : '标记为已看'} onclick={() => toggle('played', item)}><Check size={18} /></button>
             <button class="round" class:on={item.UserData?.IsFavorite} title={item.UserData?.IsFavorite ? '取消收藏' : '收藏'} onclick={() => toggle('fav', item)}>
               <Heart size={18} fill={item.UserData?.IsFavorite ? 'currentColor' : 'none'} />
             </button>
           </div>
-          <button class="play" disabled={!t} onclick={() => t && play(t.Id)}><Play size={16} fill="currentColor" /> {loaded ? playLabel(t) : '播放'}</button>
+          <button class="play" disabled={!t} onclick={() => t && play(t.Id, false, pickedSource)}><Play size={16} fill="currentColor" /> {loaded ? playLabel(t) : '播放'}</button>
         </div>
         <div class="right">
           <div class="meta">
@@ -155,7 +160,12 @@
             {#if item.OfficialRating}<span class="rated">{item.OfficialRating}</span>{/if}
             <span>{(item.Genres ?? []).join(' · ')}</span>
           </div>
-          <div class="meta tech">{[minutes(t?.RunTimeTicks ?? item.RunTimeTicks), date(t?.PremiereDate ?? item.PremiereDate), techLine(src)].filter((x) => x && x !== '0分钟').join('   ')}</div>
+          <div class="meta tech">
+            {[minutes(t?.RunTimeTicks ?? item.RunTimeTicks), date(t?.PremiereDate ?? item.PremiereDate), sources.length > 1 ? '' : techLine(src)].filter((x) => x && x !== '0分钟').join('   ')}
+            {#if sources.length > 1 && src}
+              <Dropdown value={src.Id} items={sources.map((s) => ({ value: s.Id, label: techLine(s) || s.Name || s.Id, hint: s.Container?.toUpperCase() }))} onselect={(v) => (picked = { target: t?.Id, source: v })} />
+            {/if}
+          </div>
           {#if item.Overview}
             <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
             <p class="ov selectable" class:clamp-3={!expanded} onclick={() => (expanded = !expanded)} title={expanded ? '' : '点击展开'}>{item.Overview}</p>

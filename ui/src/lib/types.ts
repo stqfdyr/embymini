@@ -68,6 +68,8 @@ export interface Item {
   /** 人物：出生地。 */
   ProductionLocations?: string[]
   Status?: string
+  /** 剧集：总集数（不含季）。 */
+  RecursiveItemCount?: number
   CommunityRating?: number | null
   OfficialRating?: string | null
   Overview?: string

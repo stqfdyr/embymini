@@ -179,10 +179,11 @@ function hideResume(it: Item, hide = true): Promise<unknown> {
 }
 export const resumeMenu = (it: Item): MenuItem[] => [...itemMenu(it), 'sep', { label: '从继续观看中移除', icon: EyeOff, action: () => hideResume(it) }]
 
-/** 起播。出错（服务器拒绝、找不到 mpv 等）直接弹提示；加载失败由播放事件 failed 另行提示。 */
-export function play(itemId: string, fromStart = false) {
+/** 起播。出错（服务器拒绝、找不到 mpv 等）直接弹提示；加载失败由播放事件 failed 另行提示。
+ *  `sourceId`：多版本（1080p / 4K 等）时详情页选的那个，不给就用服务器排的第一个。 */
+export function play(itemId: string, fromStart = false, sourceId?: string) {
   op(fromStart ? 'play_from_start' : 'play')
-  return invoke('play', { itemId, fromStart }).catch((e: ApiError) => {
+  return invoke('play', { itemId, fromStart, sourceId: sourceId ?? null }).catch((e: ApiError) => {
     if (e?.kind === 'unauthorized') onUnauthorized()
     notify(`播放失败：${errText(e)}`)
   })

@@ -315,14 +315,22 @@ impl Emby {
         Ok(r.items)
     }
 
-    pub async fn playback_info(&self, id: &str) -> Result<PlaybackInfo, Error> {
-        let q = [
+    /// `source`：用户在详情页选的版本（同一部片有 1080p、4K 等多个文件时）；不给就用服务器排的第一个。
+    pub async fn playback_info(
+        &self,
+        id: &str,
+        source: Option<&str>,
+    ) -> Result<PlaybackInfo, Error> {
+        let mut q = vec![
             ("UserId", self.user_id.as_str()),
             ("StartTimeTicks", "0"),
             ("IsPlayback", "true"),
             ("AutoOpenLiveStream", "false"),
             ("MaxStreamingBitrate", "400000000"),
         ];
+        if let Some(s) = source {
+            q.push(("MediaSourceId", s));
+        }
         let v = self
             .call(
                 Method::POST,
@@ -331,7 +339,11 @@ impl Emby {
                 Some(&Value::Object(Default::default())),
             )
             .await?;
-        decode("PlaybackInfo", v)
+        let mut info: PlaybackInfo = decode("PlaybackInfo", v)?;
+        if let Some(s) = source {
+            info.prefer(s);
+        }
+        Ok(info)
     }
 
     /// 直链：优先用 PlaybackInfo 给的 `DirectStreamUrl`（反向代理可能改写它），没有再按标准格式拼。
@@ -469,6 +481,16 @@ pub struct PlaybackInfo {
     pub play_session_id: Option<String>,
     pub media_sources: Vec<MediaSource>,
     pub error_code: Option<String>,
+}
+
+impl PlaybackInfo {
+    /// 把选中的版本挪到第一个（播放只用第一个）。标准做法是服务器按 `MediaSourceId` 只回那一个，
+    /// 但有的服务器不理会这个参数、照样回全部版本。
+    fn prefer(&mut self, source: &str) {
+        if let Some(i) = self.media_sources.iter().position(|m| m.id == source) {
+            self.media_sources.swap(0, i);
+        }
+    }
 }
 
 #[derive(Deserialize, Default, Debug, Clone)]
@@ -615,6 +637,23 @@ pub(crate) mod tests {
             template("/Sessions/Playing/Progress"),
             "/Sessions/Playing/Progress"
         );
+    }
+
+    #[test]
+    fn chosen_version_goes_first() {
+        let src = |id: &str| MediaSource {
+            id: id.into(),
+            ..Default::default()
+        };
+        let mut pi = PlaybackInfo {
+            play_session_id: None,
+            media_sources: vec![src("1080"), src("2160")],
+            error_code: None,
+        };
+        pi.prefer("2160");
+        assert_eq!(pi.media_sources[0].id, "2160");
+        pi.prefer("gone"); // 不认识的 id：保持原样
+        assert_eq!(pi.media_sources[0].id, "2160");
     }
 
     #[test]

@@ -73,6 +73,12 @@ fn mpv_args(opts: &Options, ipc: &Path) -> Vec<String> {
             args.push(format!("--{opt}={}", dir.display()));
         }
     }
+    // 进度条预览（thumbfast）要另起一个 mpv，Windows 上它只会去 PATH 里找，找不到自带的这个。
+    // `-append` 只加一项、不按逗号拆，路径里有逗号也没事
+    args.push(format!(
+        "--script-opts-append=thumbfast-mpv_path={}",
+        opts.mpv.display()
+    ));
     args.push(format!("--input-ipc-server={}", ipc.display()));
     args.push(format!("--user-agent={}", emby::UA));
     args.extend(["--force-window=immediate", "--idle=once"].map(String::from));
@@ -285,7 +291,7 @@ struct Ready {
 }
 
 async fn prepare(emby: &Emby, item: &Item) -> Result<Ready, Error> {
-    ready(emby, item, emby.playback_info(&item.id).await?)
+    ready(emby, item, emby.playback_info(&item.id, None).await?)
 }
 
 fn ready(emby: &Emby, item: &Item, info: emby::PlaybackInfo) -> Result<Ready, Error> {
@@ -438,9 +444,11 @@ pub struct Session {
 }
 
 /// 启动 mpv（窗口立刻出来），同时建队列（剧集 = 本集所在整季）、准备首集，再连上 IPC。出错直接返回给界面。
+/// `source`：首集用哪个版本（详情页选的）；之后自动切的集用服务器默认的。
 pub async fn start(
     emby: Emby,
     item_id: &str,
+    source: Option<&str>,
     from_start: bool,
     opts: Options,
 ) -> Result<Session, Error> {
@@ -475,7 +483,8 @@ pub async fn start(
 
     let queue = async {
         // 条目和 PlaybackInfo 只依赖 id，并行取；单集列表要等条目里的剧 / 季 id
-        let (item, info) = tokio::try_join!(emby.item(item_id), emby.playback_info(item_id))?;
+        let (item, info) =
+            tokio::try_join!(emby.item(item_id), emby.playback_info(item_id, source))?;
         let first = ready(&emby, &item, info)?;
         let info_ms = ms();
         let mut items = Vec::new();
@@ -641,7 +650,7 @@ impl Session {
             st.stop(i); // mpv 被直接关掉、没来得及发 end-file 时补发
         }
         let status = child.wait().await;
-        crate::exit_mark("mpv_exited");
+        crate::lifecycle::exit_mark("mpv_exited");
         let code = status.as_ref().ok().and_then(|s| s.code());
         if st.tel.on {
             telemetry::rec("mpv_exit", json!({ "srv": st.emby.tag, "code": code }));
@@ -677,7 +686,7 @@ impl Session {
         } = st;
         drop(reports);
         let _ = reporter.await;
-        crate::exit_mark("reported");
+        crate::lifecycle::exit_mark("reported");
         log::info!("播放结束");
         let _ = events.send(Event::Ended { volume });
     }
@@ -1960,6 +1969,7 @@ mod tests {
     struct MpvRun {
         config: bool,
         modernz: bool,
+        thumbfast: bool,
         builtin_osc: bool,
         /// mpv 日志里的错误行（`[e]`），Windows 上应为空（配置写错、选项不存在都会出现在这里）。
         errors: Vec<String>,
@@ -1985,6 +1995,7 @@ mod tests {
         MpvRun {
             config: text.contains("Reading config file") && text.contains("mpv.conf"),
             modernz: text.contains("[modernz] Loading lua script"),
+            thumbfast: text.contains("[thumbfast] Loading lua script"),
             builtin_osc: text.contains("@osc.lua"),
             errors: text
                 .lines()
@@ -2090,7 +2101,7 @@ mod tests {
             let got = bundled_mpv_run(&dir);
             eprintln!("  修复后（{}）：{got:?}", dir.display());
             assert!(
-                got.config && got.modernz && !got.builtin_osc,
+                got.config && got.modernz && got.thumbfast && !got.builtin_osc,
                 "自带配置没生效：{got:?}"
             );
             if cfg!(windows) {
@@ -2299,7 +2310,7 @@ mod tests {
             token: "tok".into(),
         };
         let emby = Emby::new(emby::http_client().unwrap(), &server, "dev");
-        let starting = start(emby, "1", false, headless(&[]));
+        let starting = start(emby, "1", None, false, headless(&[]));
         // 1.5 秒后还在起播（上游不回话），这时 mpv 已经起来了；然后放弃
         let r = tokio::time::timeout(Duration::from_millis(1500), async {
             let mut starting = Box::pin(starting);
@@ -2347,7 +2358,7 @@ mod tests {
             !playable(&c, &c.item(&id).await.unwrap()).await,
             "{id} 已经能播放了（上游修好了），换一个直链 403 的条目"
         );
-        let session = start(c, &id, true, headless(&[])).await.unwrap();
+        let session = start(c, &id, None, true, headless(&[])).await.unwrap();
         let (_ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         tokio::spawn(session.run(ctl_rx, ev_tx));
@@ -2401,7 +2412,7 @@ mod tests {
         ];
         let log = std::env::temp_dir().join(format!("embymini-e2e-{}.log", std::process::id()));
         let opts = headless(&[format!("--log-file={}", log.display())]);
-        let session = start(c.clone(), &ep1.id, true, opts).await.unwrap();
+        let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
         let side = session.ipc.clone(); // 测试自己另开一个 IPC 连接读 mpv 属性
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
@@ -2523,7 +2534,7 @@ mod tests {
                 .map(|a| a.split_whitespace().map(String::from).collect())
                 .unwrap_or_default(),
         );
-        let session = start(c.clone(), &ep1.id, true, opts).await.unwrap();
+        let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
         let ipc = session.ipc.clone();
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();

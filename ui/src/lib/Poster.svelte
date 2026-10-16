@@ -1,17 +1,17 @@
-<!-- 竖版海报卡：评分（右下）、未看集数或已看对勾（右上）、标题 + 年份。
+<!-- 竖版海报卡：评分（右下）、剧集角标（未看集数或总集数）或已看对勾（右上）、标题 + 年份。
      右键出菜单；悬停预取详情，点进去不用等。 -->
 <script lang="ts">
   import { Check } from '@lucide/svelte'
   import { cancelPrefetch, img, itemMenu, prefetch } from './api.svelte'
   import { fade } from './fade'
-  import { rating, unplayed, years } from './fmt'
+  import { rating, seriesBadge, years } from './fmt'
   import { openMenu } from './menu.svelte'
   import { go } from './router.svelte'
   import type { Item } from './types'
 
   let { item, width = 160 }: { item: Item; width?: number } = $props()
   const src = $derived(img(item.Id, 'Primary', item.ImageTags?.Primary, width))
-  const left = $derived(unplayed(item))
+  const badge = $derived(seriesBadge(item))
   const href = $derived(`#/item/${item.Id}`)
 </script>
 
@@ -22,7 +22,7 @@
 >
   <div class="art ph">
     {#if src}<img {src} alt="" loading="lazy" use:fade />{/if}
-    {#if left}<span class="badge">{left}</span>
+    {#if badge}<span class="badge">{badge}</span>
     {:else if item.UserData?.Played}<span class="badge"><Check size={12} strokeWidth={3} /></span>{/if}
     {#if item.CommunityRating}<span class="score">{rating(item.CommunityRating)}</span>{/if}
   </div>

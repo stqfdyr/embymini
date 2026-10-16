@@ -4,7 +4,7 @@ Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给
 
 - 多服务器：地址、端口分开填，随时切换；可编辑（换地址、端口不用重新登录）或重新登录；支持反向代理挂在子路径下的服务器
 - 浏览：首页轮播、继续观看（可移除、可撤销）、各媒体库最新；媒体库分页、搜索、收藏；剧集详情（季、集、演职人员、类似作品、媒体信息）、整季单集页、演职人员作品页
-- 播放：mpv + ModernZ 界面（顶栏居中标题 + 网速）；续播、整季连播、按进度预加载下一集、选集菜单（F8）、换集沿用音轨与字幕、外挂字幕
+- 播放：mpv + ModernZ 界面（顶栏居中标题 + 网速，鼠标一动就出控制栏）；进度条悬停预览画面；直接播原始文件，同一部片有多个版本（1080p / 4K 等）时在详情页选；续播、整季连播、按进度预加载下一集、选集菜单（F8）、换集沿用音轨与字幕、外挂字幕
 - 诊断数据（可选，默认关闭）：接口、图片、页面、播放的耗时与卡顿，按服务器分开统计；不含账号、密码、服务器地址、搜索词和片名。只有正式安装包带这个功能
 - 进度用 Emby 标准的 Sessions 接口回传，其他客户端同步可见；token 不出现在 mpv 的播放列表与统计页里
 
@@ -19,12 +19,14 @@ Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给
 ```text
 src-tauri/            Rust 后端（Tauri 2）
   src/main.rs         命令注册、应用状态、退出时收尾
+  src/lifecycle.rs    关闭耗时与异常退出的诊断记录
+  src/updater.rs      检查更新、下载安装
   src/config.rs       本地配置：服务器列表、播放设置、地址规范化
   src/emby.rs         Emby HTTP：鉴权头、UA、通用请求、播放用的强类型
   src/images.rs       海报、背景图的本地磁盘缓存（emby-img 协议）
   src/telemetry.rs    诊断数据：记录、限流落盘、打包上传（默认关）
   src/player.rs       mpv 外部进程 + JSON IPC：队列、预加载、选轨、进度回传
-  mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、选集菜单脚本（安装包里另附 mpv.exe）
+  mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、thumbfast（进度条预览）、选集菜单脚本（安装包里另附 mpv.exe）
   testdata/           单测用的回包样本（只保留测试用到的字段）
 ui/                   前端（Svelte 5 + Vite）；ui/dev/bridge.ts 是浏览器里开发界面用的转发桥
 tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI 用它截图）
@@ -66,3 +68,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
 - [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文
+- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。改动一处（缩略图进程带上主播放器的请求头和 UA），标 `EmbyMini:`

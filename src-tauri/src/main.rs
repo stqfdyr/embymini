@@ -4,21 +4,25 @@
 mod config;
 mod emby;
 mod images;
+mod lifecycle;
 mod player;
 mod telemetry;
+mod updater;
 
 use config::{Config, Server, ServerView};
 use emby::{Emby, Error};
+use lifecycle::{
+    START, exit_mark, exit_report, exit_save, exit_start, now_ms, running_check, running_clear,
+};
 use reqwest::Method;
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
-use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::{mpsc, watch};
 
 struct App {
@@ -40,121 +44,6 @@ struct App {
     starting: AtomicUsize,
     /// 已叫停、还在收尾（回传 Stopped）的播放任务，退出时等它们（见 [`App::begin_shutdown`]）。
     closing: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
-}
-
-// ---------- 关闭耗时埋点 ----------
-// 从点关闭（或开始退出）算起，各阶段的毫秒数写日志；退出前存到 data\last-exit.json，
-// 下次启动作为诊断数据 `exit` 上报，用来查「关闭时卡一下」卡在哪一段。
-
-static CLOSE_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-/// 进程启动的时刻（单调时钟 + 墙上时间毫秒）：使用时长、启动耗时都从这里算。
-static START: std::sync::OnceLock<(std::time::Instant, u64)> = std::sync::OnceLock::new();
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-fn uptime_s() -> u64 {
-    START.get().map_or(0, |(t, _)| t.elapsed().as_secs())
-}
-static CLOSE_MARKS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
-
-/// 开始计时（重复调用以第一次为准）。
-fn exit_start() {
-    CLOSE_T0.get_or_init(std::time::Instant::now);
-}
-
-/// 记一个关闭阶段；还没开始关闭时（例如平时关掉 mpv）什么都不做。
-pub fn exit_mark(phase: &'static str) {
-    let Some(t0) = CLOSE_T0.get() else { return };
-    let ms = t0.elapsed().as_millis() as u64;
-    log::info!("关闭耗时 {phase}：{ms} ms");
-    lock(&CLOSE_MARKS).push((phase, ms));
-}
-
-fn exit_file(root: &std::path::Path) -> PathBuf {
-    root.join("last-exit.json")
-}
-
-/// 退出前把各阶段耗时存盘（进程马上结束，诊断数据的写入任务来不及落盘）。
-fn exit_save(root: &std::path::Path) {
-    let mut marks: Map<String, Value> = lock(&CLOSE_MARKS)
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).into()))
-        .collect();
-    if !marks.is_empty() {
-        // 下次启动才报，那时可能已经升级：带上这次的版本；运行时长是使用时长的分母
-        marks.insert("version".into(), emby::VERSION.into());
-        marks.insert("uptime_s".into(), uptime_s().into());
-        let _ = std::fs::write(exit_file(root), Value::Object(marks).to_string());
-    }
-}
-
-// ---------- 异常退出检测 ----------
-// 启动时写 data\running.json（版本、启动时刻、最后存活时刻），每分钟刷新存活时刻，正常退出（含自动更新）删掉。
-// 下次启动时它还在 = 上次没走正常退出：崩溃、被结束进程、关机时被杀，记一条 `crash`。
-
-fn running_file(root: &std::path::Path) -> PathBuf {
-    root.join("running.json")
-}
-
-fn running_write(root: &std::path::Path) {
-    let started = START.get().map_or(0, |(_, ms)| *ms);
-    let v = serde_json::json!({ "version": emby::VERSION, "started": started, "alive": now_ms() });
-    let _ = std::fs::write(running_file(root), v.to_string());
-}
-
-/// 启动时：上次的标记还在就补记 `crash`，然后写这次的标记，并每分钟刷新一次。
-fn running_check(root: &std::path::Path) {
-    let f = running_file(root);
-    if let Some(v) = std::fs::read(&f)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-    {
-        let (started, alive) = (
-            v["started"].as_u64().unwrap_or(0),
-            v["alive"].as_u64().unwrap_or(0),
-        );
-        log::warn!(
-            "上次没有正常退出（版本 {}）",
-            v["version"].as_str().unwrap_or("?")
-        );
-        telemetry::rec(
-            "crash",
-            serde_json::json!({
-                "version": v["version"], "uptime_s": alive.saturating_sub(started) / 1000,
-                "ago_s": now_ms().saturating_sub(alive) / 1000,
-            }),
-        );
-    }
-    running_write(root);
-    let root = root.to_owned();
-    tauri::async_runtime::spawn(async move {
-        let mut t = tokio::time::interval(Duration::from_secs(60));
-        t.tick().await;
-        loop {
-            t.tick().await;
-            running_write(&root);
-        }
-    });
-}
-
-fn running_clear(root: &std::path::Path) {
-    let _ = std::fs::remove_file(running_file(root));
-}
-
-/// 启动时把上次退出的耗时补记成诊断数据（没开诊断就只删文件）。
-fn exit_report(root: &std::path::Path) {
-    let f = exit_file(root);
-    if let Some(v) = std::fs::read(&f)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-    {
-        telemetry::rec("exit", v);
-    }
-    let _ = std::fs::remove_file(f);
 }
 
 /// 进入 `play` 时加一、离开时减一。
@@ -455,7 +344,7 @@ fn settings_set(
         .map(|p| p.trim().to_owned())
         .filter(|p| !p.is_empty());
     if let Some(p) = &update_proxy {
-        proxy_url(p)?;
+        updater::proxy_url(p)?;
     }
     app.update(|c| {
         c.mpv_path = mpv_path
@@ -624,149 +513,6 @@ async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Ve
     images::response(app.images.get(&req, &base, &srv).await)
 }
 
-/// 更新代理：`http://`、`https://`、`socks5://`、`socks5h://` 加主机和端口。
-fn proxy_url(p: &str) -> Result<reqwest::Url, Error> {
-    let bad = || {
-        Error::Other(format!(
-            "更新代理地址不对：{p}（例：http://127.0.0.1:10808 或 socks5://127.0.0.1:10808）"
-        ))
-    };
-    let u = reqwest::Url::parse(p).map_err(|_| bad())?;
-    let ok = matches!(u.scheme(), "http" | "https" | "socks5" | "socks5h")
-        && u.host_str().is_some_and(|h| !h.is_empty())
-        && u.port_or_known_default().is_some();
-    ok.then_some(u).ok_or_else(bad)
-}
-
-#[derive(Serialize)]
-struct UpdateInfo {
-    version: String,
-    notes: String,
-}
-
-/// 检查更新和下载安装包用的 updater：设了更新代理就走它，否则跟随系统代理
-/// （updater 每次都新建 HTTP 客户端，现读系统代理设置，不会像 Emby 的客户端那样读到过期的）。
-fn updater(handle: &AppHandle, app: &App) -> Result<tauri_plugin_updater::Updater, Error> {
-    // 40 MB 的安装包在慢代理上也要能下完；连不上时 reqwest 照常很快报错
-    let mut b = handle.updater_builder().timeout(Duration::from_secs(900));
-    if let Some(p) = app.cfg().update_proxy.clone() {
-        b = b.proxy(proxy_url(&p)?);
-    }
-    b.build()
-        .map_err(|e| Error::Other(format!("检查更新失败：{e}")))
-}
-
-/// 有新版本时返回版本号和更新说明（Release 里的 latest.json，签名用编进程序的公钥校验）。
-#[tauri::command]
-async fn update_check(handle: AppHandle, app: State<'_, App>) -> Result<Option<UpdateInfo>, Error> {
-    let t0 = std::time::Instant::now();
-    let proxy = app.cfg().update_proxy.is_some();
-    let r = updater(&handle, &app)?.check().await;
-    update_rec("check", proxy, t0, r.as_ref().err(), |m| {
-        if let Ok(u) = &r {
-            m.insert("found".into(), json!(u.as_ref().map(|u| u.version.clone())));
-        }
-    });
-    let u = r.map_err(|e| {
-        log::warn!("检查更新失败：{e}");
-        Error::Other(format!("检查更新失败：{e}"))
-    })?;
-    Ok(u.map(|u| UpdateInfo {
-        version: u.version,
-        notes: u.body.unwrap_or_default(),
-    }))
-}
-
-/// 下载并安装新版本：进度经 `update-progress` 事件发给界面（已下载字节, 总字节）。
-/// 下完先关播放器、回传进度，再启动安装器（只显示进度条，不用点），安装器装完自动重新打开程序。
-#[tauri::command]
-async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Error> {
-    let fail = |e: tauri_plugin_updater::Error| {
-        log::warn!("更新失败：{e}");
-        Error::Other(format!("更新失败：{e}"))
-    };
-    let u = updater(&handle, &app)?
-        .check()
-        .await
-        .map_err(fail)?
-        .ok_or_else(|| Error::Other("已是最新版本".into()))?;
-    log::info!("下载新版本 {}", u.version);
-    let proxy = app.cfg().update_proxy.is_some();
-    let t0 = std::time::Instant::now();
-    let (mut got, mut shown) = (0u64, u64::MAX);
-    let r = u
-        .download(
-            |n, total| {
-                got += n as u64;
-                // 每个分块都发的话 40 MB 要发几千次：百分比（不知道总大小时按 MB）变了才发
-                let step = total.map_or(got >> 20, |t| got * 100 / t.max(1));
-                if step != shown {
-                    shown = step;
-                    let _ = handle.emit("update-progress", (got, total));
-                }
-            },
-            || {},
-        )
-        .await;
-    update_rec("download", proxy, t0, r.as_ref().err(), |m| {
-        m.insert("to".into(), json!(u.version));
-        m.insert("mb".into(), json!(got >> 20));
-    });
-    let bytes = r.map_err(fail)?;
-    let h = handle.clone();
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        h.state::<App>().shutdown(Duration::from_secs(3));
-    })
-    .await;
-    log::info!("启动安装器，程序退出");
-    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先把诊断数据落盘、去掉运行标记（这不是异常退出）
-    update_rec("install", proxy, std::time::Instant::now(), None, |m| {
-        m.insert("to".into(), json!(u.version));
-    });
-    telemetry::flush_now(Duration::from_millis(500));
-    let root = app
-        .path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_owned();
-    running_clear(&root);
-    // Windows 上启动安装器后直接退出进程，不会返回
-    if let Err(e) = u.install(bytes) {
-        running_write(&root);
-        // 安装器没起来，程序照常用：撤销退出标记，否则之后点播放都会被当成「正在退出」而放弃
-        app.quit.send_replace(false);
-        return Err(fail(e));
-    }
-    handle.restart()
-}
-
-/// 检查更新各步（check / download / install）记一条 `update`：成败、耗时、错误。
-fn update_rec(
-    step: &str,
-    proxy: bool,
-    t0: std::time::Instant,
-    err: Option<&tauri_plugin_updater::Error>,
-    extra: impl FnOnce(&mut Map<String, Value>),
-) {
-    if !telemetry::enabled() {
-        return;
-    }
-    let mut m = Map::from_iter([
-        ("step".to_owned(), json!(step)),
-        ("ok".to_owned(), json!(err.is_none())),
-        ("ms".to_owned(), json!(t0.elapsed().as_millis() as u64)),
-        ("proxy".to_owned(), json!(proxy)),
-    ]);
-    if let Some(e) = err {
-        m.insert(
-            "err".into(),
-            json!(e.to_string().chars().take(200).collect::<String>()),
-        );
-    }
-    extra(&mut m);
-    telemetry::rec("update", Value::Object(m));
-}
-
 /// 通用 Emby 请求（当前服务器）。401 时清掉该服务器的 token，界面据此引导重新登录。
 #[tauri::command]
 async fn emby(
@@ -806,6 +552,7 @@ async fn play(
     handle: tauri::AppHandle,
     app: State<'_, App>,
     item_id: String,
+    source_id: Option<String>,
     from_start: bool,
 ) -> Result<(), Error> {
     let _starting = Starting::enter(&app.starting);
@@ -827,7 +574,13 @@ async fn play(
         extra_args: Vec::new(),
     };
     let Some(session) = app
-        .unless_quit(player::start(client, &item_id, from_start, opts))
+        .unless_quit(player::start(
+            client,
+            &item_id,
+            source_id.as_deref(),
+            from_start,
+            opts,
+        ))
         .await
     else {
         log::info!("程序退出，放弃起播：{item_id}");
@@ -994,8 +747,8 @@ fn main() {
             settings_set,
             emby,
             play,
-            update_check,
-            update_install,
+            updater::update_check,
+            updater::update_install,
             telemetry_set,
             tel
         ])
@@ -1037,20 +790,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn proxy_url_accepts_common_forms() {
-        for ok in [
-            "http://127.0.0.1:10808",
-            "socks5://127.0.0.1:10808",
-            "socks5h://localhost:1080",
-        ] {
-            assert!(proxy_url(ok).is_ok(), "{ok}");
-        }
-        for bad in ["127.0.0.1:10808", "ftp://h:1", "socks5://", ""] {
-            assert!(proxy_url(bad).is_err(), "{bad}");
-        }
-    }
 
     #[test]
     fn scrub_hides_titles() {

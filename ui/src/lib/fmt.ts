@@ -49,11 +49,18 @@ export function episodeLabel(it: Item) {
 export function techLine(src?: MediaSource) {
   const v = src?.MediaStreams?.find((s) => s.Type === 'Video')
   if (!src || !v) return ''
+  // 按宽度定档：宽银幕片源会裁掉上下黑边（1920×800 也是 1080P）
   const w = v.Width ?? 0
-  const res = w >= 3800 ? '4K' : w >= 2500 ? '2K' : v.Height ? `${v.Height}P` : ''
+  const res = w >= 3800 ? '4K' : w >= 2500 ? '2K' : w >= 1900 ? '1080P' : w >= 1260 ? '720P' : v.Height ? `${v.Height}P` : ''
   const fps = v.RealFrameRate ?? v.AverageFrameRate
   return [res, v.VideoRange, fps ? `${Math.round(fps)}FPS` : '', size(src.Size)].filter(Boolean).join(' ')
 }
 
-/** 剧集未看集数 / 已看对勾，供海报角标用。 */
-export const unplayed = (it: Item) => (it.Type === 'Series' ? it.UserData?.UnplayedItemCount ?? 0 : 0)
+/** 海报右上角的剧集角标：未看集数；服务器没给未看数时（有的服务器只在部分接口里给）显示总集数「N集」，
+ *  好和电影区分开。看完了不显示（海报另画已看对勾）。 */
+export function seriesBadge(it: Item) {
+  if (it.Type !== 'Series' || it.UserData?.Played) return ''
+  const left = it.UserData?.UnplayedItemCount
+  if (left != null) return left ? String(left) : ''
+  return it.RecursiveItemCount ? `${it.RecursiveItemCount}集` : ''
+}

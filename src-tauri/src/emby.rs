@@ -340,8 +340,8 @@ impl Emby {
             )
             .await?;
         let mut info: PlaybackInfo = decode("PlaybackInfo", v)?;
-        if let Some(s) = source {
-            info.prefer(s);
+        if let Some(s) = source.filter(|s| !info.prefer(s)) {
+            log::warn!("PlaybackInfo 里没有选中的版本 {s}，改播默认版本");
         }
         Ok(info)
     }
@@ -485,11 +485,13 @@ pub struct PlaybackInfo {
 
 impl PlaybackInfo {
     /// 把选中的版本挪到第一个（播放只用第一个）。标准做法是服务器按 `MediaSourceId` 只回那一个，
-    /// 但有的服务器不理会这个参数、照样回全部版本。
-    fn prefer(&mut self, source: &str) {
-        if let Some(i) = self.media_sources.iter().position(|m| m.id == source) {
+    /// 但有的服务器不理会这个参数、照样回全部版本。没找到返回 false。
+    fn prefer(&mut self, source: &str) -> bool {
+        let i = self.media_sources.iter().position(|m| m.id == source);
+        if let Some(i) = i {
             self.media_sources.swap(0, i);
         }
+        i.is_some()
     }
 }
 
@@ -650,9 +652,9 @@ pub(crate) mod tests {
             media_sources: vec![src("1080"), src("2160")],
             error_code: None,
         };
-        pi.prefer("2160");
+        assert!(pi.prefer("2160"));
         assert_eq!(pi.media_sources[0].id, "2160");
-        pi.prefer("gone"); // 不认识的 id：保持原样
+        assert!(!pi.prefer("gone")); // 不认识的 id：保持原样
         assert_eq!(pi.media_sources[0].id, "2160");
     }
 

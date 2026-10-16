@@ -19,7 +19,7 @@ export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; 
 export const errText = (e: unknown) => String((e as { message?: unknown } | null)?.message ?? e)
 
 /** 列表卡片要的字段；详情另加 People / MediaSources 等重字段。 */
-export const LIST_FIELDS = 'ProductionYear,EndDate,CommunityRating,UserData,PrimaryImageAspectRatio,RunTimeTicks,Overview,Genres,OfficialRating'
+export const LIST_FIELDS = 'ProductionYear,EndDate,CommunityRating,UserData,PrimaryImageAspectRatio,RunTimeTicks,Overview,Genres,OfficialRating,RecursiveItemCount'
 export const DETAIL_FIELDS = `${LIST_FIELDS},People,ExternalUrls,ProviderIds,MediaSources,Studios,PremiereDate,Status`
 /** 单集卡要的字段。 */
 export const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'

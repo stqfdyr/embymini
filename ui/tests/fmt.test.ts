@@ -15,10 +15,13 @@ test('剧集角标', () => {
   assert.equal(seriesBadge(it({ Type: 'Movie', RecursiveItemCount: 5 })), '')
 })
 
-test('技术参数行按宽度定档', () => {
+test('技术参数行的分辨率档位', () => {
   const line = (Width: number, Height: number) => techLine({ Id: 's', MediaStreams: [{ Index: 0, Type: 'Video', Width, Height }] })
   assert.equal(line(1920, 800), '1080P')
   assert.equal(line(1280, 536), '720P')
   assert.equal(line(3840, 1600), '4K')
   assert.equal(line(720, 480), '480P')
+  assert.equal(line(1440, 1080), '1080P') // HDV / 4:3：按宽只够 720P
+  assert.equal(line(960, 720), '720P')
+  assert.equal(line(2560, 1440), '2K')
 })

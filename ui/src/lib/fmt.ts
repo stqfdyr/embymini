@@ -49,9 +49,12 @@ export function episodeLabel(it: Item) {
 export function techLine(src?: MediaSource) {
   const v = src?.MediaStreams?.find((s) => s.Type === 'Video')
   if (!src || !v) return ''
-  // 按宽度定档：宽银幕片源会裁掉上下黑边（1920×800 也是 1080P）
-  const w = v.Width ?? 0
-  const res = w >= 3800 ? '4K' : w >= 2500 ? '2K' : w >= 1900 ? '1080P' : w >= 1260 ? '720P' : v.Height ? `${v.Height}P` : ''
+  // 宽银幕片源裁掉上下黑边（1920×800 也是 1080P），4:3 / HDV 片源左右窄（1440×1080 也是 1080P）：按宽、按高各定一档，取高的
+  const [w, h] = [v.Width ?? 0, v.Height ?? 0]
+  const byW = w >= 3800 ? 2160 : w >= 2500 ? 1440 : w >= 1900 ? 1080 : w >= 1260 ? 720 : 0
+  const byH = h >= 2000 ? 2160 : h >= 1400 ? 1440 : h >= 1000 ? 1080 : h >= 700 ? 720 : h
+  const tier = Math.max(byW, byH)
+  const res = tier >= 2160 ? '4K' : tier >= 1440 ? '2K' : tier ? `${tier}P` : ''
   const fps = v.RealFrameRate ?? v.AverageFrameRate
   return [res, v.VideoRange, fps ? `${Math.round(fps)}FPS` : '', size(src.Size)].filter(Boolean).join(' ')
 }

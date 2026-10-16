@@ -5,8 +5,9 @@
 -- Built for easy integration in third-party UIs.
 --
 -- Modified for EmbyMini (changes marked "EmbyMini:"): the thumbnailer process
--- gets the main player's HTTP headers and user agent, since the stream needs
--- the same auth header as the main player.
+-- gets the main player's HTTP headers and user agent (the stream needs the
+-- same auth header) and a short network timeout; seeks while the mouse moves
+-- along the seek bar are spaced out, since each one is a new HTTP request.
 
 --[[
 This Source Code Form is subject to the terms of the Mozilla Public
@@ -514,6 +515,8 @@ local function spawn(time)
         table.insert(args, "--http-header-fields-append="..h)
     end
     table.insert(args, "--user-agent="..mp.get_property("user-agent", ""))
+    -- EmbyMini: same read timeout as mpv.conf (the default is 60 s; a stalled read means no preview for a minute)
+    table.insert(args, "--network-timeout=10")
 
     table.insert(args, "--")
     table.insert(args, path)
@@ -662,7 +665,9 @@ local function seek(fast)
     end
 end
 
-local seek_period = 3/60
+-- EmbyMini: 0.25 s instead of 3/60 s. Over the network every seek is a new HTTP range request that takes
+-- about a second, so seeking 20 times a second while the mouse moves only aborts requests and wastes traffic
+local seek_period = 0.25
 local seek_period_counter = 0
 local seek_timer
 seek_timer = mp.add_periodic_timer(seek_period, function()

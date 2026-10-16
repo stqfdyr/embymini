@@ -26,7 +26,7 @@ src-tauri/            Rust 后端（Tauri 2）
   src/images.rs       海报、背景图的本地磁盘缓存（emby-img 协议）
   src/telemetry.rs    诊断数据：记录、限流落盘、打包上传（默认关）
   src/player.rs       mpv 外部进程 + JSON IPC：队列、预加载、选轨、进度回传
-  mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、thumbfast（进度条预览）、选集菜单脚本（安装包里另附 mpv.exe）
+  mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、thumbfast（进度条预览）、选集菜单与暂停时不藏光标的脚本（安装包里另附 mpv.exe）
   testdata/           单测用的回包样本（只保留测试用到的字段）
 ui/                   前端（Svelte 5 + Vite）；ui/dev/bridge.ts 是浏览器里开发界面用的转发桥
 tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI 用它截图）
@@ -68,4 +68,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
 - [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文
-- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。改动一处（缩略图进程带上主播放器的请求头和 UA），标 `EmbyMini:`
+- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA 和读超时；鼠标在进度条上移动时拉开取图间隔），标 `EmbyMini:`

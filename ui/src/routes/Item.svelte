@@ -1,6 +1,6 @@
 <!-- 详情页（剧集 / 电影）：背板 + Logo + 操作 + 简介 → 季与单集 → 演职人员 → 艺术图 → 类似作品 → 链接 → 媒体信息。
      点进来时先用列表里已有的条目画出顶部（peek），详情、季、单集并行取，到了原地补全。
-     同一部片有多个版本（1080p、4K 等）时，技术参数行换成版本下拉，播放和媒体信息都跟着选中的版本。 -->
+     同一部片有多个版本（1080p、4K 等）时，技术参数行换成版本下拉（标签 = 技术参数行，旁注视频编码和容器），播放和媒体信息都跟着选中的版本。 -->
 <script lang="ts">
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { Check, Heart, Link, Play, RotateCcw, User } from '@lucide/svelte'
@@ -163,7 +163,7 @@
           <div class="meta tech">
             {[minutes(t?.RunTimeTicks ?? item.RunTimeTicks), date(t?.PremiereDate ?? item.PremiereDate), sources.length > 1 ? '' : techLine(src)].filter((x) => x && x !== '0分钟').join('   ')}
             {#if sources.length > 1 && src}
-              <Dropdown value={src.Id} items={sources.map((s) => ({ value: s.Id, label: techLine(s) || s.Name || s.Id, hint: s.Container?.toUpperCase() }))} onselect={(v) => (picked = { target: t?.Id, source: v })} />
+              <Dropdown value={src.Id} items={sources.map((s) => ({ value: s.Id, label: techLine(s) || s.Name || s.Id, hint: [s.MediaStreams?.find((m) => m.Type === 'Video')?.Codec, s.Container].filter(Boolean).join(' · ').toUpperCase() }))} onselect={(v) => (picked = { target: t?.Id, source: v })} />
             {/if}
           </div>
           {#if item.Overview}

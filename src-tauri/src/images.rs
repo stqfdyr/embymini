@@ -323,22 +323,21 @@ impl Images {
         }
     }
 
-    /// 超过上限时按最近使用时间删最旧的，删到上限的 90%（留出余量，不至于每存一张就删一次）。
     fn trim(&self) {
-        let mut files = list(&self.dir);
-        let mut total: u64 = files.iter().map(|(_, n, _)| n).sum();
-        if total > self.cap {
-            files.sort_by_key(|(_, _, t)| *t);
-            for (p, n, _) in files {
-                if total <= self.cap / 10 * 9 {
-                    break;
-                }
-                if std::fs::remove_file(&p).is_ok() {
-                    total -= n;
-                }
-            }
+        self.total
+            .store(trim_dir(&self.dir, self.cap), Ordering::Relaxed);
+    }
+
+    /// 缓存管理：占用字节、清空。
+    pub fn usage(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    pub fn clear(&self) {
+        for (p, ..) in list(&self.dir) {
+            let _ = std::fs::remove_file(p);
         }
-        self.total.store(total, Ordering::Relaxed);
+        self.trim();
     }
 
     /// 记一张图（诊断数据关着时什么都不做）。
@@ -369,13 +368,32 @@ fn stats_json(srv: &str, kind: &str, s: &Stats) -> serde_json::Value {
     })
 }
 
-/// 缓存目录里的图片：(路径, 大小, 修改时间)。临时文件不算。
+/// 目录超过 `cap` 时按最近使用时间（修改时间，命中时刷新）删最旧的，删到上限的 90%（留出余量，不至于每存一个就删一次）。
+/// 返回剩下的总字节。字幕缓存也用它。
+pub fn trim_dir(dir: &Path, cap: u64) -> u64 {
+    let mut files = list(dir);
+    let mut total: u64 = files.iter().map(|(_, n, _)| n).sum();
+    if total > cap {
+        files.sort_by_key(|(_, _, t)| *t);
+        for (p, n, _) in files {
+            if total <= cap / 10 * 9 {
+                break;
+            }
+            if std::fs::remove_file(&p).is_ok() {
+                total -= n;
+            }
+        }
+    }
+    total
+}
+
+/// 缓存目录里的文件：(路径, 大小, 修改时间)。写到一半的临时文件（`.tmp`）不算。
 fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
     std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().extension().is_none())
+        .filter(|e| e.path().extension().is_none_or(|x| x != "tmp"))
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             Some((e.path(), m.len(), m.modified().ok()?))

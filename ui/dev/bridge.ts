@@ -60,7 +60,7 @@ export function devBridge(): Plugin {
           const cmd = (req.url ?? '').replace(/^\//, '')
           if (cmd === 'config_get') {
             return reply(200, {
-              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, version: 'dev', telemetryAvailable: true, telemetry: telOn, telemetryName: '',
+              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: true, version: 'dev', telemetryAvailable: true, telemetry: telOn, telemetryName: '',
               servers: [{ id: 'dev', name: s.name, url: s.url, port: s.port, user: process.env.EMBY_USER, userId: s.userId, base: s.base, tag: 'dev', loggedIn: true }],
             })
           }
@@ -77,6 +77,11 @@ export function devBridge(): Plugin {
             return reply(200, text ? JSON.parse(text) : null)
           }
           if (cmd === 'telemetry_set') telOn = Boolean(args.on)
+          // 缓存都在 Rust 里，浏览器里没有：给一组假数字，看弹窗样式用
+          if (cmd === 'cache_info' || cmd === 'cache_clear') {
+            const z = args.kind === 'all'
+            return reply(200, { video: z ? 0 : 3.2 * 2 ** 30, images: z ? 0 : 446.3 * 2 ** 20, subs: 0, temp: z ? 0 : 483 * 1024, playing: false })
+          }
           if (cmd === 'tel') {
             for (const e of args.events ?? []) console.log('[dev-bridge] tel', JSON.stringify(e))
             return reply(200, null)

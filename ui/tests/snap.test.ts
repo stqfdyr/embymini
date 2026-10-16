@@ -1,4 +1,4 @@
-// 列表快照（src/lib/snap.ts）：读写、容量淘汰（删最久没更新的）、单份过大不存、localStorage 不可用时不抛错。
+// 列表快照（src/lib/snap.ts）：读写、容量淘汰（删最久没更新的）、单份过大不存、localStorage 不可用时不抛错、占用与清空。
 // 跑法：npm test（Node 原生去掉类型后执行，不需要额外依赖）
 import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
@@ -16,7 +16,7 @@ class Store {
 }
 const store = new Store()
 ;(globalThis as { localStorage?: Store }).localStorage = store
-const { readSnap, writeSnap } = await import('../src/lib/snap.ts')
+const { readSnap, snapClear, snapSize, writeSnap } = await import('../src/lib/snap.ts')
 
 beforeEach(() => {
   store.m.clear()
@@ -55,4 +55,14 @@ test('存不下、读坏数据都不抛错', () => {
   store.quota = Infinity
   store.m.set('snap:bad', '{not json')
   assert.equal(readSnap('bad'), undefined)
+})
+
+test('占用按 UTF-16 算字节；清空后读不到', () => {
+  writeSnap('a', 'xx') // JSON 是 "xx"，4 个字符
+  writeSnap('b', { y: 2 })
+  assert.equal(snapSize(), (4 + JSON.stringify({ y: 2 }).length) * 2)
+  snapClear()
+  assert.equal(snapSize(), 0)
+  assert.equal(readSnap('a'), undefined)
+  assert.equal(store.m.size, 0)
 })

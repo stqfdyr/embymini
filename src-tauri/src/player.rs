@@ -5,8 +5,10 @@
 //! 下一集的 PlaybackInfo 在后台取（[`State::prepare_later`]），上游再慢，按键和退出也照常响应。
 //! 队列是整季，自然往后播靠「到预加载进度才追加下一集」，手动上一集 / 下一集 / 选集由 EmbyMini 处理
 //! （见 [`State::jump`]）。换集时沿用上一集选的音轨、字幕。
+//! 视频和字幕经本地缓存代理（[`crate::stream`]）读：交给 mpv 时才登记（[`State::load`]），换集时只留当前集和下一集的缓存。
 
 use crate::emby::{self, Emby, Error, Item, MediaStream, NO_QUERY};
+use crate::stream::Stream;
 use crate::telemetry;
 use reqwest::Method;
 use serde::Serialize;
@@ -28,6 +30,8 @@ const PREV_MSG: &str = "embymini-prev";
 const JUMP_MSG: &str = "embymini-jump";
 /// 发给 ModernZ：下一集是否已在 mpv 列表里（`yes` / `no`），是的话下一集按钮变绿带闪电（mpv/scripts/modernz.lua）。
 const NEXT_READY_MSG: &str = "embymini-next-ready";
+/// 发给 ModernZ：上游下载速度（字节 / 秒），顶栏网速显示它。经缓存代理时 mpv 自己的读取速度是本机磁盘的速度，不是网速。
+const SPEED_MSG: &str = "embymini-speed";
 
 /// 资源目录里自带的 mpv 配置目录（`<资源>/mpv`），不存在返回 None。
 ///
@@ -51,6 +55,8 @@ pub struct Options {
     pub cache_dir: Option<PathBuf>,
     /// 个人 mpv 配置（存在才加载）：在自带配置之后读，同名选项以它为准；放在数据目录，升级不覆盖。
     pub user_conf: Option<PathBuf>,
+    /// 本地缓存代理；没有（起不来）时 mpv 直连上游、token 经请求头带。
+    pub stream: Option<Stream>,
     pub extra_args: Vec<String>,
 }
 
@@ -273,13 +279,18 @@ fn loadfile_opts(title: &str, start: f64) -> String {
 
 struct Sub {
     url: String,
+    /// 字幕缓存里的文件名。
+    file: String,
     title: String,
     lang: String,
 }
 
 /// 一集的播放参数（来自 PlaybackInfo）。
 struct Ready {
+    /// 上游直链（不带 token）；交给 mpv 时换成缓存代理的本地地址。
     url: String,
+    /// 缓存目录名：上游 + 条目 + 版本，同一个文件每次都一样（下次打开直接用上次的缓存）。
+    name: String,
     source_id: String,
     session_id: Option<String>,
     subs: Vec<Sub>,
@@ -312,16 +323,24 @@ fn ready(emby: &Emby, item: &Item, info: emby::PlaybackInfo) -> Result<Ready, Er
         .filter(|s| s.kind == "Subtitle" && s.is_external)
         .collect();
     ext.sort_by_key(|s| s.index);
+    let name = cache_name(&[&emby.tag, &item.id, &src.id]);
     let subs = ext
         .into_iter()
         .map(|s| Sub {
             url: emby.subtitle_url(&item.id, &src, s),
+            // 以视频的缓存名开头：retain 掉视频时它的字幕登记一起清掉
+            file: format!(
+                "{name}_{}.{}",
+                s.index,
+                emby::subtitle_ext(s.codec.as_deref())
+            ),
             title: stream_title(s).unwrap_or_default().to_owned(),
             lang: s.language.clone().unwrap_or_default(),
         })
         .collect();
     Ok(Ready {
         url: emby.stream_url(&item.id, &src),
+        name,
         aid: mpv_track(&src.media_streams, "Audio", src.default_audio_stream_index),
         sid: mpv_track(
             &src.media_streams,
@@ -334,6 +353,25 @@ fn ready(emby: &Emby, item: &Item, info: emby::PlaybackInfo) -> Result<Ready, Er
         subs,
         streams: src.media_streams,
     })
+}
+
+/// 缓存里的文件名：各段只留字母、数字和 `-`（id 里别的字符换成 `-`），用 `_` 连起来。
+fn cache_name(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|p| {
+            p.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// mpv 警告日志去掉会泄露或打散去重的内容：URL（含条目 id、token 之外的路径）换成 `<url>`，数字换成 `#`
@@ -439,6 +477,7 @@ pub struct Session {
     io: Box<dyn Io>,
     ipc: PathBuf,
     preload: f64,
+    stream: Option<Stream>,
     /// 点播放的时刻和起播各阶段耗时（诊断数据，首帧出来时记一条 `play`）。
     timeline: (Instant, Map<String, Value>),
 }
@@ -456,7 +495,7 @@ pub async fn start(
     let ms = move || t0.elapsed().as_millis() as u64;
     let ipc = ipc_path();
     let args = mpv_args(&opts, &ipc);
-    // 参数里只有路径和开关，没有 token（token 经 IPC 设置），可以整串记日志
+    // 参数里只有路径和开关，没有 token（token 在缓存代理里，没有代理时经 IPC 设置），可以整串记日志
     log::info!("启动 mpv：{} {}", opts.mpv.display(), args.join(" "));
     let mut cmd = tokio::process::Command::new(&opts.mpv);
     // 播放直连，不走代理：mpv（ffmpeg）只认这类环境变量，用户的终端或代理软件可能设过
@@ -546,6 +585,7 @@ pub async fn start(
         io,
         ipc,
         preload: opts.preload_percent,
+        stream: opts.stream,
         timeline: (
             t0,
             Map::from_iter([
@@ -579,6 +619,7 @@ impl Session {
             io,
             ipc,
             preload,
+            stream,
             timeline,
         } = self;
         let (rd, wr) = tokio::io::split(io);
@@ -588,17 +629,22 @@ impl Session {
         let mut st = State::new(emby, queue, wr, events, preload, reports, prepared);
         st.tel.on = telemetry::enabled();
         st.tel.first = Some(timeline);
+        st.up_seen = stream.as_ref().map_or(0, Stream::up_bytes);
+        st.tel.up_minute = st.up_seen;
+        st.stream = stream;
         let tel_on = st.tel.on;
 
-        // token 走请求头，不进 URL（见 emby::strip_key）；要在第一次 loadfile 之前设好
-        let header = st.emby.token_header();
-        st.send(json!([
-            "change-list",
-            "http-header-fields",
-            "append",
-            header
-        ]))
-        .await;
+        // 没有缓存代理时 mpv 直连上游：token 走请求头，不进 URL（见 emby::strip_key）；要在第一次 loadfile 之前设好
+        if st.stream.is_none() {
+            let header = st.emby.token_header();
+            st.send(json!([
+                "change-list",
+                "http-header-fields",
+                "append",
+                header
+            ]))
+            .await;
+        }
         for (id, name) in [
             "time-pos",
             "duration",
@@ -624,6 +670,7 @@ impl Session {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut minute =
             tokio::time::interval_at(tokio::time::Instant::now() + TEL_EVERY, TEL_EVERY);
+        let mut second = tokio::time::interval(Duration::from_secs(1));
         let mut ctl_open = true;
         let mut quit_sent = false;
         loop {
@@ -644,6 +691,7 @@ impl Session {
                 Some((i, after, r)) = prepared_rx.recv() => st.on_prepared(i, after, r).await,
                 _ = tick.tick() => st.progress("TimeUpdate"),
                 _ = minute.tick(), if st.tel.on => st.probe_minute().await,
+                _ = second.tick(), if st.stream.is_some() => st.send_speed().await,
             }
         }
         if let Some(i) = st.cur {
@@ -723,6 +771,9 @@ struct State {
     pipe_broken: bool,
     /// 已经给界面发过 Failed（起播没成、mpv 退出时就不再补发「意外退出」）。
     failed_sent: bool,
+    stream: Option<Stream>,
+    /// 上次看到的缓存代理上游总字节（顶栏网速按它算差）。
+    up_seen: u64,
     tel: Tel,
 }
 
@@ -806,8 +857,10 @@ struct Tel {
     /// 这一集加载完了、还没取解码 / 渲染信息：等首帧再取（`file-loaded` 时解码器还没建，`hwdec-current` 是空的）。
     render_due: bool,
     cache_s: f64,
-    /// 本分钟的下载速度采样（字节 / 秒）。
+    /// 本分钟的下载速度采样（字节 / 秒）。经缓存代理时这是 mpv 从代理读的速度，上游速度另记 `up_kb`。
     speeds: Vec<f64>,
+    /// 上一分钟结束时缓存代理的上游总字节。
+    up_minute: u64,
     /// get_property 的 request_id → (哪一组, 属性名)；一组凑齐后一起记。
     probes: HashMap<u64, (&'static str, &'static str)>,
     probe_data: HashMap<&'static str, (usize, Map<String, Value>)>,
@@ -846,6 +899,8 @@ impl State {
             next_ready: false,
             pipe_broken: false,
             failed_sent: false,
+            stream: None,
+            up_seen: 0,
             tel: Tel::default(),
         }
     }
@@ -901,7 +956,12 @@ impl State {
                 self.tel_rec("render", Value::Object(data))
             }
             _ => {
-                let out = minute_summary(&mut self.tel, data);
+                let mut out = minute_summary(&mut self.tel, data);
+                if let Some(s) = &self.stream {
+                    let up = s.up_bytes();
+                    let d = up.saturating_sub(std::mem::replace(&mut self.tel.up_minute, up));
+                    out["up_kb"] = json!(d >> 10);
+                }
                 self.tel_rec("pmin", out);
             }
         }
@@ -956,6 +1016,30 @@ impl State {
         }
     }
 
+    /// 每秒把缓存代理的上游下载速度发给 ModernZ 的顶栏。
+    async fn send_speed(&mut self) {
+        let Some(up) = self.stream.as_ref().map(Stream::up_bytes) else {
+            return;
+        };
+        let d = up.saturating_sub(std::mem::replace(&mut self.up_seen, up));
+        self.send(json!(["script-message", SPEED_MSG, d.to_string()]))
+            .await;
+    }
+
+    /// 缓存只留当前集和已追加进 mpv 列表的下一集，其余的删掉（同主流播放器「保留最后一次播放的缓存」）。
+    fn keep_cache(&self) {
+        let (Some(s), Some(i)) = (&self.stream, self.cur) else {
+            return;
+        };
+        let next = Some(i + 1).filter(|&n| self.queue.get(n).is_some_and(|e| e.loaded));
+        let keep: Vec<String> = [Some(i), next]
+            .into_iter()
+            .flatten()
+            .filter_map(|k| self.queue[k].ready.as_ref().map(|r| r.name.clone()))
+            .collect();
+        s.retain(&keep);
+    }
+
     async fn osd(&mut self, text: &str) {
         self.send(json!(["show-text", text, 5000])).await;
     }
@@ -965,12 +1049,17 @@ impl State {
     }
 
     /// 把已准备好的一集交给 mpv：`append-play` 追加到列表（空闲时立即播放），`replace` 清空列表立即播放。
+    /// 有缓存代理时这时才登记、给 mpv 本地地址（登记得早了，换集时的 retain 可能把它当成别的片子删掉）。
     async fn load(&mut self, i: usize, mode: &str) {
         let e = &self.queue[i];
         let Some(r) = &e.ready else { return };
+        let url = match &self.stream {
+            Some(s) => s.video(&r.name, &r.url, &self.emby.stream_auth()),
+            None => r.url.clone(),
+        };
         let cmd = json!([
             "loadfile",
-            r.url,
+            url,
             mode,
             -1,
             loadfile_opts(&title(&e.item), e.start)
@@ -1008,6 +1097,10 @@ impl State {
                 self.queue[i].ready = Some(r);
                 self.load(i, "append-play").await;
                 self.sync_next_ready().await;
+                self.keep_cache();
+                if let (Some(s), Some(r)) = (&self.stream, &self.queue[i].ready) {
+                    s.prefetch(&r.name);
+                }
                 log::info!("预加载下一集：{id}");
                 let _ = self.events.send(Event::Preloaded { item_id: id });
             }
@@ -1089,6 +1182,7 @@ impl State {
                     self.pos = self.queue[i].start;
                     self.dur = 0.0;
                     self.sync_next_ready().await;
+                    self.keep_cache();
                     // 播完自动进下一集（不是用户点的）也算一次换集
                     if self.tel.on && self.tel.first.is_none() && self.tel.switch.is_none() {
                         self.tel_switch(i, "auto");
@@ -1314,10 +1408,17 @@ impl State {
         };
         let aid = pick(&self.pref_audio, "Audio", r.aid);
         let sid = pick(&self.pref_sub, "Subtitle", r.sid);
+        let auth = self.emby.stream_auth();
         let cmds: Vec<Value> = r
             .subs
             .iter()
-            .map(|s| json!(["sub-add", s.url, "auto", s.title, s.lang]))
+            .map(|s| {
+                let url = match &self.stream {
+                    Some(st) => st.sub(&s.file, &s.url, &auth),
+                    None => s.url.clone(),
+                };
+                json!(["sub-add", url, "auto", s.title, s.lang])
+            })
             .chain(
                 [("aid", aid), ("sid", sid)]
                     .into_iter()
@@ -1334,11 +1435,12 @@ impl State {
         self.applied = Some(i);
     }
 
-    /// 加载失败：探测一次直链拿到状态码，换成能看懂的原因发给界面。
+    /// 加载失败：拿到上游的状态码（缓存代理记着；没有代理时探测一次直链），换成能看懂的原因发给界面。
     async fn fail(&mut self, i: usize, mpv_error: &str) {
-        let status = match &self.queue[i].ready {
-            Some(r) => self.emby.probe(&r.url).await,
-            None => None,
+        let status = match (&self.queue[i].ready, &self.stream) {
+            (Some(r), Some(s)) => s.fail_status(&r.name),
+            (Some(r), None) => self.emby.probe(&r.url).await,
+            (None, _) => None,
         };
         let why = match status {
             Some(403) => {
@@ -1600,6 +1702,7 @@ mod tests {
     fn ready_for(id: &str) -> Ready {
         Ready {
             url: format!("https://h.example/{id}"),
+            name: id.into(),
             source_id: id.into(),
             session_id: None,
             subs: Vec::new(),
@@ -1877,6 +1980,7 @@ mod tests {
             io: Box::new(ours),
             ipc: std::env::temp_dir().join("embymini-slow-test.sock"),
             preload: 80.0,
+            stream: None,
             timeline: (Instant::now(), Map::new()),
         };
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
@@ -2265,6 +2369,7 @@ mod tests {
             volume: None,
             cache_dir: None,
             user_conf: None,
+            stream: None,
             extra_args,
         }
     }
@@ -2272,6 +2377,16 @@ mod tests {
     fn headless(extra: &[String]) -> Options {
         let base = ["--vo=null", "--ao=null", "--force-window=no"].map(String::from);
         test_opts(base.into_iter().chain(extra.iter().cloned()).collect())
+    }
+
+    /// 和正式程序一样经本地缓存代理播放（缓存放临时目录，测完删）。只缓存前方：整片模式会在测试的一两分钟里
+    /// 把整集从中继拉下来（每次几 GB 流量），整片的逻辑由 stream.rs 的单测覆盖。
+    fn proxied(opts: Options, tag: &str) -> (Options, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("embymini-e2e-cache-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let stream = Some(Stream::start(&dir, false).expect("缓存代理起不来"));
+        (Options { stream, ..opts }, dir)
     }
 
     /// 本进程起的、还活着的 mpv（按命令行里本进程专属的 IPC 名字找）。
@@ -2358,7 +2473,8 @@ mod tests {
             !playable(&c, &c.item(&id).await.unwrap()).await,
             "{id} 已经能播放了（上游修好了），换一个直链 403 的条目"
         );
-        let session = start(c, &id, None, true, headless(&[])).await.unwrap();
+        let (opts, cache) = proxied(headless(&[]), "broken");
+        let session = start(c, &id, None, true, opts).await.unwrap();
         let (_ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         tokio::spawn(session.run(ctl_rx, ev_tx));
@@ -2381,6 +2497,7 @@ mod tests {
                 .any(|e| matches!(e, Event::Started { .. } | Event::Stopped { .. })),
             "坏条目不应回传开播/停止"
         );
+        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2411,7 +2528,7 @@ mod tests {
             c.item(&ep2.id).await.unwrap(),
         ];
         let log = std::env::temp_dir().join(format!("embymini-e2e-{}.log", std::process::id()));
-        let opts = headless(&[format!("--log-file={}", log.display())]);
+        let (opts, cache) = proxied(headless(&[format!("--log-file={}", log.display())]), "real");
         let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
         let side = session.ipc.clone(); // 测试自己另开一个 IPC 连接读 mpv 属性
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
@@ -2458,6 +2575,9 @@ mod tests {
             }
             e => panic!("期望 ep1 自然播完，实际 {e:?}"),
         }
+        // 播完就查（回传在单独的任务里发，等它一下）：后面「上一集」会从头再播 ep1，有的服务器会因此清掉已看
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let ep1_played = c.item(&ep1.id).await.unwrap().user_data.played;
         assert_eq!(
             next().await,
             Event::Started {
@@ -2492,16 +2612,20 @@ mod tests {
         );
         run.await.unwrap();
 
-        // 服务端：ep1 播到 99% 以上，应已标记为已看
-        let ep1_after = c.item(&ep1.id).await.unwrap().user_data;
         let mpv_log = std::fs::read_to_string(&log).unwrap_or_default();
-        let _ = std::fs::remove_file(&log); // 日志里记着设置请求头的命令（含 token），用完即删
+        let _ = std::fs::remove_file(&log);
+        eprintln!("缓存：{} MB", crate::stream::dir_size(&cache) >> 20);
+        let _ = std::fs::remove_dir_all(&cache);
         let mut bad = Vec::new();
         for b in &before {
             bad.extend(restore(&c, b).await);
         }
         assert!(bad.is_empty(), "{bad:?}");
-        assert!(ep1_after.played, "ep1 播完后服务端没有标记已看");
+        assert!(ep1_played, "ep1 播完后服务端没有标记已看");
+        assert!(
+            !mpv_log.contains("X-Emby-Token"),
+            "经缓存代理时 mpv 不该拿到 token"
+        );
         eprintln!("事件序列：{seen:?}");
         if tel_dir.is_some() {
             tokio::time::sleep(Duration::from_secs(6)).await; // 等写入任务落盘（每 5 秒）
@@ -2529,10 +2653,13 @@ mod tests {
             c.item(&ep2.id).await.unwrap(),
         ];
         let dir = PathBuf::from(env("SHOT_DIR"));
-        let opts = test_opts(
-            std::env::var("MPV_EXTRA")
-                .map(|a| a.split_whitespace().map(String::from).collect())
-                .unwrap_or_default(),
+        let (opts, cache) = proxied(
+            test_opts(
+                std::env::var("MPV_EXTRA")
+                    .map(|a| a.split_whitespace().map(String::from).collect())
+                    .unwrap_or_default(),
+            ),
+            "shots",
         );
         let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
         let ipc = session.ipc.clone();
@@ -2627,6 +2754,14 @@ mod tests {
             .filter(|v| v.contains(token) || v.contains("api_key"))
             .count();
         assert_eq!(leaked, 0, "mpv 能显示出来的地址里有 {leaked} 处带 token");
+        assert!(
+            shown[0]
+                .as_str()
+                .is_some_and(|p| p.starts_with("http://127.0.0.1:")),
+            "没有经缓存代理播放：{}",
+            shown[0]
+        );
+        let _ = std::fs::remove_dir_all(cache);
         eprintln!("截图在 {}；检查过的地址 {} 个", dir.display(), shown.len());
     }
 }

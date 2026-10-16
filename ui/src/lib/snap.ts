@@ -26,6 +26,21 @@ export function readSnap<T>(key: string): T | undefined {
   }
 }
 
+/** 快照占的字节（localStorage 按 UTF-16 存，一个字符 2 字节），缓存管理里显示。 */
+export function snapSize() {
+  return Object.values(index()).reduce((n, [, size]) => n + size * 2, 0)
+}
+
+/** 清掉全部快照（缓存管理）。 */
+export function snapClear() {
+  try {
+    for (const k of Object.keys(index())) localStorage.removeItem(PREFIX + k)
+    localStorage.removeItem(INDEX)
+  } catch {
+    /* 清不掉就算了 */
+  }
+}
+
 /** 写一份快照；总量超上限时删最久没更新的。 */
 export function writeSnap(key: string, value: unknown) {
   try {

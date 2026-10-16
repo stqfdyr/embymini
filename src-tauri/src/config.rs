@@ -80,6 +80,8 @@ pub struct Config {
     pub telemetry: bool,
     /// 诊断数据里的「上报名称」，方便区分是谁；为空时用计算机名。
     pub telemetry_name: Option<String>,
+    /// 边播边缓存整个视频（默认开）；关掉时缓存代理只缓存播放位置前方一段。
+    pub cache_whole: bool,
 }
 
 impl Default for Config {
@@ -94,6 +96,7 @@ impl Default for Config {
             update_proxy: None,
             telemetry: false,
             telemetry_name: None,
+            cache_whole: true,
         }
     }
 }

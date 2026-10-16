@@ -5,10 +5,10 @@
 -- Built for easy integration in third-party UIs.
 --
 -- Modified for EmbyMini (changes marked "EmbyMini:"): the thumbnailer process
--- gets the main player's HTTP headers and user agent (the stream needs the
--- same auth header) and a short network timeout; on network streams it seeks
--- to keyframes only and keeps one seek in flight at a time, since each seek is
--- a new HTTP request.
+-- gets the main player's HTTP headers and user agent plus a header telling the
+-- client's local cache that these requests are for previews, and a short network
+-- timeout; on network streams it seeks to keyframes only and keeps one seek in
+-- flight at a time, since each seek is a new HTTP request.
 
 --[[
 This Source Code Form is subject to the terms of the Mozilla Public
@@ -513,8 +513,10 @@ local function spawn(time)
         table.insert(args, "--scripts="..client_script_path)
     end
 
-    -- EmbyMini: the stream URL carries no token; the main player sends it as a header (set over IPC),
-    -- so the thumbnailer needs the same headers and user agent or the server rejects it
+    -- EmbyMini: the stream comes from the client's local cache, which fetches only the 1-2 blocks around a
+    -- preview position and serves already-downloaded parts at once; this header marks the requests as previews.
+    -- Without the cache the main player sends the token as a header (set over IPC), so copy its headers too
+    table.insert(args, "--http-header-fields-append=X-EmbyMini-Role: thumb")
     for _, h in ipairs(mp.get_property_native("http-header-fields") or {}) do
         table.insert(args, "--http-header-fields-append="..h)
     end
@@ -665,7 +667,8 @@ local function move_file(from, to)
     os.rename(from, to)
 end
 
--- EmbyMini: on a network stream every seek is a new HTTP range request taking 1-3 s, and a new seek aborts
+-- EmbyMini: on a network stream every seek is a new HTTP range request taking 1-3 s (when the position is not
+-- in the local cache yet), and a new seek aborts
 -- the one in flight, so seeking while the mouse moves showed nothing until it stopped. There, while the mouse
 -- moves, a seek is sent only when the previous thumbnail has arrived (or after net_wait seconds); once it has
 -- rested net_settle seconds, the final position goes out at once. Always to the keyframe: an exact seek

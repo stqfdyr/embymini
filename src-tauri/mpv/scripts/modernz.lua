@@ -3186,11 +3186,12 @@ local function osc_init()
         return user_opts.truncate_title and truncate_title(t, state.windowtitle_max_w, osc_styles.window_title) or t
     end
 
-    -- EmbyMini: network speed (bytes actually read from the network per second)
+    -- EmbyMini: network speed (bytes downloaded per second). The client sends it (embymini-speed): with its
+    -- local cache in between, mpv's own input rate is the speed of reading the local disk
     ne = new_element("netspeed", "button")
     ne.content = function ()
         local dcs = state.demuxer_cache_state
-        local rate = dcs and dcs["raw-input-rate"]
+        local rate = state.embymini_speed or (dcs and dcs["raw-input-rate"])
         if not rate then return "" end
         if rate >= 1048576 then return string.format("%.1f MB/s", rate / 1048576) end
         return string.format("%d KB/s", math.floor(rate / 1024))
@@ -4412,6 +4413,10 @@ mp.register_script_message("osc-visibility", visibility_mode)
 mp.register_script_message("embymini-next-ready", function(v)
     state.embymini_next_ready = (v == "yes")
     request_tick()
+end)
+-- EmbyMini: download speed from the client, see the netspeed element
+mp.register_script_message("embymini-speed", function(v)
+    state.embymini_speed = tonumber(v)
 end)
 mp.register_script_message("osc-show", show_osc)
 mp.register_script_message("osc-hide", function()

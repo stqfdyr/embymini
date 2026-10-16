@@ -32,6 +32,13 @@ export function size(bytes?: number) {
   return bytes >= 1 << 30 ? `${(bytes / (1 << 30)).toFixed(2)}G` : `${Math.round(bytes / (1 << 20))}M`
 }
 
+/** 缓存占用：0 KB、512 KB、446.3 MB、12.40 GB。 */
+export function bytes(n: number) {
+  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`
+  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`
+  return `${Math.round(n / 1024)} KB`
+}
+
 export function bitrate(bps?: number) {
   if (!bps) return ''
   return bps >= 1e6 ? `${(bps / 1e6).toFixed(1)}mbps` : `${Math.round(bps / 1e3)}kbps`

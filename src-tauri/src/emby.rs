@@ -385,7 +385,7 @@ impl Emby {
         }
     }
 
-    /// 只在播放失败时调用：取直链第一个字节，拿到最终 HTTP 状态码（会跟随 302），用于给用户说清原因。
+    /// 没有缓存代理时播放失败才调用（有代理时状态码由代理记下）：取直链第一个字节，拿到最终 HTTP 状态码（会跟随 302），用于给用户说清原因。
     pub async fn probe(&self, url: &str) -> Option<u16> {
         let r = self
             .http
@@ -398,15 +398,23 @@ impl Emby {
         Some(r.status().as_u16())
     }
 
-    /// 给 mpv 的请求头：token 走请求头而不是 URL（见 [`strip_key`]）。
+    /// 缓存代理向上游要数据时用：token 只发给 API 根地址同源的主机。
+    pub fn stream_auth(&self) -> crate::stream::Auth {
+        crate::stream::Auth {
+            token: self.token.clone(),
+            origin: self.base.clone(),
+        }
+    }
+
+    /// 没有缓存代理时给 mpv 的请求头：token 走请求头而不是 URL（见 [`strip_key`]）。
     pub fn token_header(&self) -> String {
         format!("X-Emby-Token: {}", self.token)
     }
 }
 
-/// 去掉服务端直链里自带的 api_key。token 改由 mpv 的请求头带（[`Emby::token_header`]），
+/// 去掉服务端直链里自带的 api_key：token 由缓存代理加在请求头上（没有代理时由 mpv 的请求头带，[`Emby::token_header`]），
 /// 不进 URL，就不会出现在 mpv 的播放列表、统计页（`i`）和日志里，截图、录屏也不会泄露。
-/// 代价：直链 302 到别的主机时，mpv 也会把这个请求头带过去。
+/// 没有代理时的代价：直链 302 到别的主机时，mpv 也会把这个请求头带过去（代理只发给同源）。
 fn strip_key(url: String) -> String {
     let Ok(mut u) = reqwest::Url::parse(&url) else {
         return url;
@@ -424,7 +432,7 @@ fn strip_key(url: String) -> String {
     u.into()
 }
 
-fn subtitle_ext(codec: Option<&str>) -> String {
+pub fn subtitle_ext(codec: Option<&str>) -> String {
     match codec.map(str::to_ascii_lowercase).as_deref() {
         None | Some("subrip") => "srt".into(),
         Some("pgssub") => "sup".into(),

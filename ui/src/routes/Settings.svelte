@@ -1,12 +1,13 @@
-<!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、个人 mpv 配置的位置）
+<!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、边播边缓存、缓存管理、个人 mpv 配置的位置）
      + 关于（版本与检查更新、更新代理、界面用哪块 GPU）。分组列表样式。 -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
-  import { Check, Download, LogIn, Pencil, Plus, RefreshCw, Trash2 } from '@lucide/svelte'
+  import { Check, Download, HardDrive, LogIn, Pencil, Plus, RefreshCw, Trash2 } from '@lucide/svelte'
   import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
   import { ask } from '../lib/Dialog.svelte'
+  import CacheDialog from '../lib/CacheDialog.svelte'
   import { gpuName } from '../lib/tel'
 
   const blank = { url: '', port: '', user: '', password: '' }
@@ -19,6 +20,8 @@
   let mpvPath = $state(session.cfg?.mpvPath ?? '')
   let preload = $state(session.cfg?.preloadPercent ?? 80)
   let updateProxy = $state(session.cfg?.updateProxy ?? '')
+  let cacheWhole = $state(session.cfg?.cacheWhole ?? true)
+  let cacheOpen = $state(false)
   let telOn = $state(session.cfg?.telemetry ?? false)
   let telName = $state(session.cfg?.telemetryName ?? '')
   const saveTel = () => run(() => invoke('telemetry_set', { on: telOn, name: telName }), telOn ? '已打开诊断数据' : '已关闭诊断数据')
@@ -82,7 +85,7 @@
   const gpu = gpuName()
   const savePlayer = () =>
     run(async () => {
-      await invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload, updateProxy: updateProxy || null })
+      await invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload, updateProxy: updateProxy || null, cacheWhole })
       await loadConfig()
       mpvPath = session.cfg?.mpvPath ?? '' // 显示后端规范化后的值（去掉了引号、空白）
       updateProxy = session.cfg?.updateProxy ?? ''
@@ -174,6 +177,19 @@
       <input class="grow" type="range" min="50" max="99" bind:value={preload} onchange={savePlayer} />
       <span class="val">{preload}%</span>
     </label>
+    <label class="row">
+      <span class="label">边播边缓存</span>
+      <div class="grow">
+        <div>缓存整个视频</div>
+        <div class="sub">播放时在后台把整个文件存到本地：拖动进度、进度条预览、重看不用再等网络；只保留最近播放的那一集，最多 20 GB。关掉时只缓存播放位置前方一段</div>
+      </div>
+      <input type="checkbox" bind:checked={cacheWhole} onchange={savePlayer} />
+    </label>
+    <div class="row">
+      <span class="label">缓存管理</span>
+      <span class="grow sub">视频、图片、字幕、媒体库和临时缓存的占用，可以单独清理</span>
+      <button class="btn" onclick={() => (cacheOpen = true)}><HardDrive size={14} /> 管理</button>
+    </div>
     <div class="row">
       <span class="label">个人 mpv 配置</span>
       <div class="grow">
@@ -231,6 +247,7 @@
 
   {#if msg}<p class="msg" class:err={!msg.ok}>{msg.text}</p>{/if}
 </div>
+{#if cacheOpen}<CacheDialog onclose={() => (cacheOpen = false)} />{/if}
 
 <style>
   .page { max-width: 860px; margin: 0 auto; }

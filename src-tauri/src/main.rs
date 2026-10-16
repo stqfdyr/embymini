@@ -6,6 +6,7 @@ mod emby;
 mod images;
 mod lifecycle;
 mod player;
+mod stream;
 mod telemetry;
 mod updater;
 
@@ -36,6 +37,8 @@ struct App {
     player: Mutex<Option<Player>>,
     /// 海报、背景图的磁盘缓存（`emby-img` 协议）。
     images: std::sync::Arc<images::Images>,
+    /// 本地缓存代理（视频、字幕）；起不来时为 None，播放直连。
+    stream: Option<stream::Stream>,
     /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
     play_seq: AtomicU64,
     /// 程序要退出了：起播中的 `play` 收到后放弃起播（见 [`App::unless_quit`]）。
@@ -131,6 +134,9 @@ impl App {
                 }
             }
         });
+        if let Some(s) = &self.stream {
+            s.report_all();
+        }
         exit_mark("shutdown_done");
     }
 
@@ -189,6 +195,7 @@ struct ConfigView {
     /// 个人 mpv 配置文件的路径，设置页里显示给用户。
     user_mpv_conf: String,
     update_proxy: Option<String>,
+    cache_whole: bool,
     version: &'static str,
     /// 打包时注入了上报地址才有诊断数据开关。
     telemetry_available: bool,
@@ -208,6 +215,7 @@ fn config_get(app: State<'_, App>) -> ConfigView {
         preload_percent: c.preload_percent,
         user_mpv_conf: app.user_mpv_conf().display().to_string(),
         update_proxy: c.update_proxy.clone(),
+        cache_whole: c.cache_whole,
         version: emby::VERSION,
         telemetry_available: telemetry::AVAILABLE,
         telemetry: c.telemetry,
@@ -339,6 +347,7 @@ fn settings_set(
     mpv_path: Option<String>,
     preload_percent: u8,
     update_proxy: Option<String>,
+    cache_whole: bool,
 ) -> Result<(), Error> {
     let update_proxy = update_proxy
         .map(|p| p.trim().to_owned())
@@ -352,6 +361,128 @@ fn settings_set(
             .filter(|p| !p.is_empty());
         c.preload_percent = preload_percent.clamp(50, 99);
         c.update_proxy = update_proxy;
+        c.cache_whole = cache_whole;
+    })?;
+    if let Some(s) = &app.stream {
+        s.set_whole(cache_whole);
+    }
+    Ok(())
+}
+
+/// 缓存管理里各项的字节数；`playing` 时视频缓存里正在播的那部片清不掉。媒体库缓存（列表快照）在界面的 localStorage 里，界面自己算。
+#[derive(Serialize)]
+struct CacheInfo {
+    video: u64,
+    images: u64,
+    subs: u64,
+    temp: u64,
+    playing: bool,
+}
+
+/// 「临时缓存」：mpv 的着色器缓存、更新插件留在系统临时目录的安装包目录（每次更新约 40 MB，插件自己不删）、进度条预览留下的图片文件。
+fn temp_paths(app: &App) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = app.mpv_cache.iter().cloned().collect();
+    v.extend(updater_leftovers());
+    for e in std::fs::read_dir(std::env::temp_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if e.file_name().to_string_lossy().starts_with("thumbfast.out") {
+            v.push(e.path());
+        }
+    }
+    v
+}
+
+/// 更新插件的临时目录（`<产品名>-<版本>-updater-<随机>`）：装完新版本就没用了。
+fn updater_leftovers() -> Vec<PathBuf> {
+    std::fs::read_dir(std::env::temp_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with("EmbyMini-") && n.contains("-updater-")
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+fn remove_path(p: &std::path::Path) {
+    let _ = if p.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    };
+}
+
+fn cache_info_now(app: &App) -> CacheInfo {
+    let (video, subs) = app.stream.as_ref().map_or((0, 0), stream::Stream::usage);
+    let playing = lock(&app.player).is_some() || app.starting.load(Ordering::SeqCst) > 0;
+    let temp = temp_paths(app)
+        .iter()
+        .map(|p| {
+            if p.is_dir() {
+                stream::dir_size(p)
+            } else {
+                p.metadata().map_or(0, |m| m.len())
+            }
+        })
+        .sum();
+    CacheInfo {
+        video,
+        images: app.images.usage(),
+        subs,
+        temp,
+        playing,
+    }
+}
+
+#[tauri::command]
+async fn cache_info(handle: AppHandle) -> CacheInfo {
+    tauri::async_runtime::spawn_blocking(move || cache_info_now(&handle.state::<App>()))
+        .await
+        .unwrap_or(CacheInfo {
+            video: 0,
+            images: 0,
+            subs: 0,
+            temp: 0,
+            playing: false,
+        })
+}
+
+/// 清理一项（`video` / `images` / `subs` / `temp`，`all` = 全部），返回清理后的占用。
+#[tauri::command]
+async fn cache_clear(handle: AppHandle, kind: String) -> CacheInfo {
+    tauri::async_runtime::spawn_blocking(move || {
+        let app = handle.state::<App>();
+        let all = kind == "all";
+        let playing = lock(&app.player).is_some() || app.starting.load(Ordering::SeqCst) > 0;
+        if let Some(s) = app.stream.as_ref() {
+            if all || kind == "video" {
+                s.clear_video(playing);
+            }
+            if all || kind == "subs" {
+                s.clear_subs();
+            }
+        }
+        if all || kind == "images" {
+            app.images.clear();
+        }
+        if all || kind == "temp" {
+            temp_paths(&app).iter().for_each(|p| remove_path(p));
+        }
+        log::info!("清理缓存：{kind}");
+        cache_info_now(&app)
+    })
+    .await
+    .unwrap_or(CacheInfo {
+        video: 0,
+        images: 0,
+        subs: 0,
+        temp: 0,
+        playing: false,
     })
 }
 
@@ -571,6 +702,7 @@ async fn play(
         volume,
         cache_dir: app.mpv_cache.clone(),
         user_conf: Some(app.user_mpv_conf()),
+        stream: app.stream.clone(),
         extra_args: Vec::new(),
     };
     let Some(session) = app
@@ -722,11 +854,20 @@ fn main() {
             let images =
                 images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
             images.start();
+            let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
+            // 装完新版本，更新插件留下的安装包就没用了；等一会儿再删（安装器可能还没退出）
+            tauri::async_runtime::spawn(async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                for p in updater_leftovers() {
+                    remove_path(&p);
+                }
+            });
             app.manage(App {
                 path,
                 cfg: Mutex::new(cfg),
                 http,
                 images,
+                stream,
                 mpv_dir,
                 mpv_cache,
                 player: Mutex::new(None),
@@ -745,6 +886,8 @@ fn main() {
             server_remove,
             server_use,
             settings_set,
+            cache_info,
+            cache_clear,
             emby,
             play,
             updater::update_check,
@@ -820,6 +963,7 @@ mod tests {
                 images::CAP,
                 reqwest::Client::new(),
             ),
+            stream: None,
             play_seq: AtomicU64::new(0),
             quit: watch::Sender::new(false),
             starting: AtomicUsize::new(0),

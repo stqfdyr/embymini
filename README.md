@@ -5,8 +5,9 @@ Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给
 - 多服务器：地址、端口分开填，随时切换；可编辑（换地址、端口不用重新登录）或重新登录；支持反向代理挂在子路径下的服务器
 - 浏览：首页轮播、继续观看（可移除、可撤销）、各媒体库最新；媒体库分页、搜索、收藏；剧集详情（季、集、演职人员、类似作品、媒体信息）、整季单集页、演职人员作品页
 - 播放：mpv + ModernZ 界面（顶栏居中标题 + 网速，鼠标一动就出控制栏）；进度条悬停预览画面；直接播原始文件，同一部片有多个版本（1080p / 4K 等）时在详情页选；续播、整季连播、按进度预加载下一集、选集菜单（F8）、换集沿用音轨与字幕、外挂字幕
+- 本地缓存：边播边把整个视频存到本地，已下载的部分拖动、预览、重看都不等网络；上游卡住 3 秒自动另开连接；只保留最近播放的那一集（最多 20 GB）。设置里可以只缓存播放位置前方一段，「缓存管理」里查看占用、清理
 - 诊断数据（可选，默认关闭）：接口、图片、页面、播放的耗时与卡顿，按服务器分开统计；不含账号、密码、服务器地址、搜索词和片名。只有正式安装包带这个功能
-- 进度用 Emby 标准的 Sessions 接口回传，其他客户端同步可见；token 不出现在 mpv 的播放列表与统计页里
+- 进度用 Emby 标准的 Sessions 接口回传，其他客户端同步可见；token 只在 EmbyMini 进程里，mpv 和进度条预览进程都拿不到
 
 ## 安装
 
@@ -24,6 +25,7 @@ src-tauri/            Rust 后端（Tauri 2）
   src/config.rs       本地配置：服务器列表、播放设置、地址规范化
   src/emby.rs         Emby HTTP：鉴权头、UA、通用请求、播放用的强类型
   src/images.rs       海报、背景图的本地磁盘缓存（emby-img 协议）
+  src/stream.rs       本地缓存代理：mpv 从 127.0.0.1 读视频和字幕，边播边分块落盘，卡住时对冲重连
   src/telemetry.rs    诊断数据：记录、限流落盘、打包上传（默认关）
   src/player.rs       mpv 外部进程 + JSON IPC：队列、预加载、选轨、进度回传
   mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、thumbfast（进度条预览）、选集菜单与暂停时不藏光标的脚本（安装包里另附 mpv.exe）
@@ -57,10 +59,14 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | `data\logs\` | 日志（单个文件 2 MB 轮换，留最近 3 份；本地时间） |
 | `data\webview\` | 界面数据（含上次浏览的列表快照，启动时先显示） |
 | `data\cache\images\` | 海报、背景图缓存（上限 1 GB，按最近使用淘汰） |
+| `data\cache\video\` | 视频缓存：只留最近播放的那一集和已就绪的下一集，换片时自动删；最多 20 GB，且给磁盘留至少 10 GB |
+| `data\cache\subs\` | 外挂字幕缓存（上限 200 MB，按最近使用淘汰） |
 | `data\mpv-cache\` | mpv 着色器缓存 |
 | `data\telemetry\` | 诊断数据的待上传批次（打开「发送诊断数据」才有，上限 20 MB；关掉开关时清空） |
 
 安装目录不可写时（例如手动拷到只读位置）退回 `%LOCALAPPDATA%\com.stqfdyr.embymini`。旧版本放在 `%APPDATA%` / `%LOCALAPPDATA%` 下的配置，新版首次启动时自动搬过来并删掉旧目录。
+
+「设置 → 播放 → 缓存管理」可以查看并清理视频、图片、字幕、媒体库（列表快照）和临时缓存（mpv 着色器缓存、自动更新留在系统临时目录的安装包）。
 
 卸载走「设置 → 应用 → 已安装的应用」。勾选「删除应用程序数据」时 `data\` 一并删除；自动更新不动它。
 
@@ -68,4 +74,4 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
 - [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文
-- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA 和读超时；网络流只取关键帧、同时只有一个取图请求），标 `EmbyMini:`
+- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA、标明是预览的请求头和读超时；网络流只取关键帧、同时只有一个取图请求），标 `EmbyMini:`

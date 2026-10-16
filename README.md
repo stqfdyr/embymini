@@ -21,6 +21,8 @@ src-tauri/            Rust 后端（Tauri 2）
   src/main.rs         命令注册、应用状态、退出时收尾
   src/config.rs       本地配置：服务器列表、播放设置、地址规范化
   src/emby.rs         Emby HTTP：鉴权头、UA、通用请求、播放用的强类型
+  src/images.rs       海报、背景图的本地磁盘缓存（emby-img 协议）
+  src/telemetry.rs    诊断数据：记录、限流落盘、打包上传（默认关）
   src/player.rs       mpv 外部进程 + JSON IPC：队列、预加载、选轨、进度回传
   mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、选集菜单脚本（安装包里另附 mpv.exe）
   testdata/           单测用的回包样本（只保留测试用到的字段）

@@ -1,7 +1,8 @@
-<!-- 首页顶部轮播：背景图 + Logo（没有就显示标题）+ 简介 + 圆点，8 秒切换，鼠标停在上面时暂停。
+<!-- 首页顶部轮播：背景图 + Logo（没有或取不到就显示标题）+ 简介 + 圆点，8 秒切换，鼠标停在上面时暂停。
      整块点击进详情；悬停出左右箭头，箭头和圆点只切换不跳转。切换前预加载下一张背景图。 -->
 <script lang="ts">
   import { ChevronLeft, ChevronRight } from '@lucide/svelte'
+  import { SvelteSet } from 'svelte/reactivity'
   import { img } from './api.svelte'
   import { fade } from './fade'
   import { years } from './fmt'
@@ -15,6 +16,7 @@
   const cur = $derived(items[i % n])
   const bg = (it?: Item) => (it ? img(it.Id, 'Backdrop', it.BackdropImageTags?.[0], 1600) : '')
   const step = (d: number) => (i = (i + d + n) % n)
+  const badLogo = new SvelteSet<string>()
 
   $effect(() => {
     if (items.length < 2 || hold) return
@@ -36,8 +38,8 @@
     {/key}
     <div class="scrim"></div>
     <div class="info">
-      {#if cur.ImageTags?.Logo}
-        <img class="logo" src={img(cur.Id, 'Logo', cur.ImageTags.Logo, 420)} alt={cur.Name} />
+      {#if cur.ImageTags?.Logo && !badLogo.has(cur.Id)}
+        <img class="logo" src={img(cur.Id, 'Logo', cur.ImageTags.Logo, 420)} alt={cur.Name} onerror={() => badLogo.add(cur.Id)} />
       {:else}
         <div class="title">{cur.Name}</div>
       {/if}

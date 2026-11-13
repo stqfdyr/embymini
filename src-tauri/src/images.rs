@@ -6,6 +6,8 @@
 //! - 磁盘上限 [`CAP`]，超了按最近使用时间（命中时刷新文件修改时间）删最旧的，删到 90%。
 //! - 同一张图同时被要多次只向上游取一次；同时向上游取最多 [`PARALLEL`] 张，不把中继压垮。
 //! - 回给界面时声明一年不变（immutable），同一次运行里 WebView 自己的内存缓存照样生效。
+//! - 上游回 404 的图记 [`MISS_TTL`]，期间直接回 404 不再向上游要（有的服务器列表里给了 Logo 的 tag，图本身却不存在，
+//!   不记的话首页轮播每转一圈都要取一次）。
 //! - 只从已配置的服务器取图（路径里是服务器 id，不是地址），不是通用转发。
 //! - 诊断数据：按上游、图片类型每 30 秒汇总一条 `img`（张数、命中、失败与状态码、排队 / 下载耗时分桶、缩图前后字节）。
 
@@ -23,6 +25,8 @@ pub const SCHEME: &str = "emby-img";
 pub const CAP: u64 = 1024 * 1024 * 1024;
 const PARALLEL: usize = 8;
 const STATS_EVERY: Duration = Duration::from_secs(30);
+/// 上游 404 的图多久内不再取。
+const MISS_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// 界面要的一张图：路径 `<服务器 id>/<条目 id>/<类型>/<序号>/<tag>/<宽度>`。
 #[derive(Debug, PartialEq)]
@@ -187,6 +191,8 @@ pub struct Images {
     http: reqwest::Client,
     slots: Semaphore,
     inflight: Mutex<HashMap<String, Arc<OnceCell<Got>>>>,
+    /// 上游 404 的图（键同磁盘文件名）→ 记下的时刻。
+    missing: Mutex<HashMap<String, Instant>>,
     total: AtomicU64,
     stats: Mutex<HashMap<(String, String), Stats>>,
 }
@@ -204,6 +210,7 @@ impl Images {
             http,
             slots: Semaphore::new(PARALLEL),
             inflight: Mutex::new(HashMap::new()),
+            missing: Mutex::new(HashMap::new()),
             total: AtomicU64::new(0),
             stats: Mutex::new(HashMap::new()),
         })
@@ -242,6 +249,16 @@ impl Images {
             });
             return Ok(Arc::new(b));
         }
+        if lock(&self.missing)
+            .get(&req.file_name())
+            .is_some_and(|t| t.elapsed() < MISS_TTL)
+        {
+            self.note(srv, &req.kind, |s| {
+                s.fail += 1;
+                *s.fail_st.entry(404).or_default() += 1;
+            });
+            return Err(404);
+        }
         let cell = lock(&self.inflight)
             .entry(req.file_name())
             .or_default()
@@ -277,6 +294,11 @@ impl Images {
             .await
             .clone();
         lock(&self.inflight).remove(&req.file_name());
+        if got == Err(404) {
+            let mut m = lock(&self.missing);
+            m.retain(|_, t| t.elapsed() < MISS_TTL);
+            m.insert(req.file_name(), Instant::now());
+        }
         self.note(srv, &req.kind, |s| match (&got, &fetched) {
             (Err(st), _) => {
                 s.fail += 1;
@@ -334,6 +356,7 @@ impl Images {
     }
 
     pub fn clear(&self) {
+        lock(&self.missing).clear();
         for (p, ..) in list(&self.dir) {
             let _ = std::fs::remove_file(p);
         }
@@ -583,6 +606,16 @@ mod tests {
         let missing = Req::parse("s/404/Primary/0/t/240").unwrap();
         assert_eq!(img.get(&missing, &base, "x").await, Err(404));
         assert!(!dir.join(missing.file_name()).exists(), "失败的不落盘");
+        let before = hits.load(Ordering::SeqCst);
+        assert_eq!(img.get(&missing, &base, "x").await, Err(404));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before,
+            "404 记住了，不再向上游要"
+        );
+        img.clear();
+        assert_eq!(img.get(&missing, &base, "x").await, Err(404));
+        assert_eq!(hits.load(Ordering::SeqCst), before + 1, "清空缓存后重新取");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -65,6 +65,7 @@
   const item = $derived(q.data?.item ?? known(id))
   let pickedSeason = $state<string>()
   let expanded = $state(false)
+  let badLogo = $state<string>() // Logo 取不到（服务器给了 tag、图却 404）的条目 id，改显示片名
   restoreScrollWhen(() => q.data)
 
   // 单集行单独加载。换季才换内容（先用这一季的本地快照，没有就清空）；同一季重新取数时先保留旧列表
@@ -140,8 +141,8 @@
       {#if bd}<img class="backdrop" src={bd} alt="" fetchpriority="high" use:fade /><div class="scrim"></div>{/if}
       <div class="top-inner">
         <div class="left">
-          {#if item.ImageTags?.Logo}
-            <img class="logo" src={img(item.Id, 'Logo', item.ImageTags.Logo, 400)} alt={item.Name} />
+          {#if item.ImageTags?.Logo && badLogo !== item.Id}
+            <img class="logo" src={img(item.Id, 'Logo', item.ImageTags.Logo, 400)} alt={item.Name} onerror={() => (badLogo = item?.Id)} />
           {:else}
             <h1>{item.Name}</h1>
           {/if}

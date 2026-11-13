@@ -60,7 +60,7 @@ export function devBridge(): Plugin {
           const cmd = (req.url ?? '').replace(/^\//, '')
           if (cmd === 'config_get') {
             return reply(200, {
-              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: true, version: 'dev', telemetryAvailable: true, telemetry: telOn, telemetryName: '',
+              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: true, danmakuApi: '', danmakuWords: [], version: 'dev', telemetryAvailable: true, telemetry: telOn, telemetryName: '',
               servers: [{ id: 'dev', name: s.name, url: s.url, port: s.port, user: process.env.EMBY_USER, userId: s.userId, base: s.base, tag: 'dev', loggedIn: true }],
             })
           }
@@ -86,8 +86,8 @@ export function devBridge(): Plugin {
             for (const e of args.events ?? []) console.log('[dev-bridge] tel', JSON.stringify(e))
             return reply(200, null)
           }
-          // play / server_* / settings_set：浏览器里没有 mpv，也不改本地配置，只记一笔（密码不打印）
-          console.log(`[dev-bridge] ${cmd}`, JSON.stringify(args, (k, v) => (k === 'password' ? '***' : v)))
+          // play / server_* / settings_set / danmaku_set：浏览器里没有 mpv，也不改本地配置，只记一笔（密码、弹幕接口地址里的令牌不打印）
+          console.log(`[dev-bridge] ${cmd}`, JSON.stringify(args, (k, v) => (k === 'password' || k === 'api' ? '***' : v)))
           return reply(200, null)
         } catch (e) {
           return reply(500, { kind: 'other', message: String(e) })

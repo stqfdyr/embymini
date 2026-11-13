@@ -2,10 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
+mod danmaku;
 mod emby;
 mod images;
 mod lifecycle;
 mod player;
+mod status;
 mod stream;
 mod telemetry;
 mod updater;
@@ -39,6 +41,8 @@ struct App {
     images: std::sync::Arc<images::Images>,
     /// 本地缓存代理（视频、字幕）；起不来时为 None，播放直连。
     stream: Option<stream::Stream>,
+    /// 弹幕缓存目录（数据目录下的 `cache/danmaku`），缓存管理里算在「字幕和弹幕」。
+    danmaku_dir: PathBuf,
     /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
     play_seq: AtomicU64,
     /// 程序要退出了：起播中的 `play` 收到后放弃起播（见 [`App::unless_quit`]）。
@@ -196,6 +200,9 @@ struct ConfigView {
     user_mpv_conf: String,
     update_proxy: Option<String>,
     cache_whole: bool,
+    /// 弹幕接口地址（可能带令牌，只给本机界面看）和屏蔽词。
+    danmaku_api: String,
+    danmaku_words: Vec<String>,
     version: &'static str,
     /// 打包时注入了上报地址才有诊断数据开关。
     telemetry_available: bool,
@@ -216,6 +223,8 @@ fn config_get(app: State<'_, App>) -> ConfigView {
         user_mpv_conf: app.user_mpv_conf().display().to_string(),
         update_proxy: c.update_proxy.clone(),
         cache_whole: c.cache_whole,
+        danmaku_api: c.danmaku.api.clone(),
+        danmaku_words: c.danmaku.words.clone(),
         version: emby::VERSION,
         telemetry_available: telemetry::AVAILABLE,
         telemetry: c.telemetry,
@@ -369,11 +378,27 @@ fn settings_set(
     Ok(())
 }
 
+/// 弹幕设置页的两项：接口地址（`/api/v2` 格式，可带令牌）、屏蔽词（一行一个，空行去掉）。显示设置在播放器的弹幕面板里改。
+#[tauri::command]
+fn danmaku_set(app: State<'_, App>, api: String, words: Vec<String>) -> Result<(), Error> {
+    let api = danmaku::normalize(&api).map_err(Error::Other)?;
+    let words = words
+        .iter()
+        .map(|w| w.trim().to_owned())
+        .filter(|w| !w.is_empty())
+        .collect();
+    app.update(|c| {
+        c.danmaku.api = api;
+        c.danmaku.words = words;
+    })
+}
+
 /// 缓存管理里各项的字节数；`playing` 时视频缓存里正在播的那部片清不掉。媒体库缓存（列表快照）在界面的 localStorage 里，界面自己算。
 #[derive(Serialize)]
 struct CacheInfo {
     video: u64,
     images: u64,
+    /// 外挂字幕和弹幕缓存。
     subs: u64,
     temp: u64,
     playing: bool,
@@ -419,6 +444,7 @@ fn remove_path(p: &std::path::Path) {
 
 fn cache_info_now(app: &App) -> CacheInfo {
     let (video, subs) = app.stream.as_ref().map_or((0, 0), stream::Stream::usage);
+    let subs = subs + stream::dir_size(&app.danmaku_dir);
     let playing = lock(&app.player).is_some() || app.starting.load(Ordering::SeqCst) > 0;
     let temp = temp_paths(app)
         .iter()
@@ -452,7 +478,7 @@ async fn cache_info(handle: AppHandle) -> CacheInfo {
         })
 }
 
-/// 清理一项（`video` / `images` / `subs` / `temp`，`all` = 全部），返回清理后的占用。
+/// 清理一项（`video` / `images` / `subs`（字幕和弹幕）/ `temp`，`all` = 全部），返回清理后的占用。
 #[tauri::command]
 async fn cache_clear(handle: AppHandle, kind: String) -> CacheInfo {
     tauri::async_runtime::spawn_blocking(move || {
@@ -466,6 +492,9 @@ async fn cache_clear(handle: AppHandle, kind: String) -> CacheInfo {
             if all || kind == "subs" {
                 s.clear_subs();
             }
+        }
+        if all || kind == "subs" {
+            remove_path(&app.danmaku_dir);
         }
         if all || kind == "images" {
             app.images.clear();
@@ -691,9 +720,9 @@ async fn play(
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = app.stop_player(); // 换片：旧的 mpv 自己退出、回传，不用等
-    let (preload_percent, volume) = {
+    let (preload_percent, volume, dm) = {
         let c = app.cfg();
-        (f64::from(c.preload_percent), c.volume)
+        (f64::from(c.preload_percent), c.volume, c.danmaku.clone())
     };
     let opts = player::Options {
         mpv: app.mpv_path(),
@@ -703,6 +732,11 @@ async fn play(
         cache_dir: app.mpv_cache.clone(),
         user_conf: Some(app.user_mpv_conf()),
         stream: app.stream.clone(),
+        danmaku: Some(danmaku::Ctx {
+            api: danmaku::Api::new(app.http.clone(), &dm.api),
+            dir: app.danmaku_dir.clone(),
+            cfg: dm,
+        }),
         extra_args: Vec::new(),
     };
     let Some(session) = app
@@ -734,8 +768,21 @@ async fn play(
     // 转发播放事件；会话结束（Ended 发出、通道关闭）后它才结束，所以退出时等它就等到了回传和保存音量
     let task = tauri::async_runtime::spawn(async move {
         while let Some(ev) = ev_rx.recv().await {
-            if let player::Event::Ended { volume: Some(v) } = ev {
-                let _ = handle.state::<App>().update(|c| c.volume = Some(v));
+            let app = handle.state::<App>();
+            match ev {
+                player::Event::Ended { volume: Some(v) } => {
+                    let _ = app.update(|c| c.volume = Some(v));
+                }
+                // 弹幕面板里的改动：存进配置，界面不用知道
+                player::Event::DanmakuStyle { style } => {
+                    let _ = app.update(|c| c.danmaku.style = style);
+                    continue;
+                }
+                player::Event::DanmakuPick { key, pick } => {
+                    let _ = app.update(|c| c.danmaku.picks.insert(key, pick));
+                    continue;
+                }
+                _ => {}
             }
             let _ = handle.emit("player", &ev);
         }
@@ -868,6 +915,7 @@ fn main() {
                 http,
                 images,
                 stream,
+                danmaku_dir: root.join("cache").join("danmaku"),
                 mpv_dir,
                 mpv_cache,
                 player: Mutex::new(None),
@@ -886,6 +934,7 @@ fn main() {
             server_remove,
             server_use,
             settings_set,
+            danmaku_set,
             cache_info,
             cache_clear,
             emby,
@@ -961,6 +1010,7 @@ mod tests {
             // 这些测试不取图：空路径不建目录，不在临时目录留东西
             images: images::Images::new(PathBuf::new(), images::CAP, reqwest::Client::new()),
             stream: None,
+            danmaku_dir: PathBuf::new(),
             play_seq: AtomicU64::new(0),
             quit: watch::Sender::new(false),
             starting: AtomicUsize::new(0),

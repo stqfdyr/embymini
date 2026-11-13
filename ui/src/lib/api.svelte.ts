@@ -10,7 +10,7 @@ import type { Item, Page } from './types'
 export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; tag: string; loggedIn: boolean }
 export type ConfigView = {
   active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string
-  updateProxy: string | null; cacheWhole: boolean; version: string
+  updateProxy: string | null; cacheWhole: boolean; danmakuApi: string; danmakuWords: string[]; version: string
   telemetryAvailable: boolean; telemetry: boolean; telemetryName: string; startMs: number
 }
 export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }

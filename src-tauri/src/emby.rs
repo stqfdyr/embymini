@@ -20,7 +20,8 @@ pub const NO_QUERY: &[(&str, &str)] = &[];
 pub enum Error {
     #[error("未登录或登录已失效")]
     Unauthorized,
-    #[error("{}", status_msg(*.0, .1))]
+    /// 状态码 + 回包正文前 200 字；文案见 [`crate::status::describe`]。
+    #[error("{}", crate::status::describe(*.0, .1))]
     Status(u16, String),
     /// 文案已按连不上 / 超时 / 证书分好类，见 [`net`]。
     #[error("{0}")]
@@ -41,14 +42,6 @@ impl Serialize for Error {
         m.serialize_field("kind", kind)?;
         m.serialize_field("message", &self.to_string())?;
         m.end()
-    }
-}
-
-/// 5xx 多是上游或反代临时出错，回包是一页 HTML，不展示。
-fn status_msg(code: u16, body: &str) -> String {
-    match code {
-        500..=599 => format!("服务器暂时出错（{code}），稍后再试"),
-        _ => format!("服务器返回 {code}：{body}"),
     }
 }
 
@@ -103,13 +96,13 @@ fn template(path: &str) -> String {
 }
 
 /// 请求收尾：解析回包；失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）；
-/// 记一条诊断数据（方法、路径模板、状态码、耗时、字节数、错误类别）。
+/// 记一条诊断数据（方法、路径模板、状态码、耗时、字节数、错误类别、重试次数）。
 async fn finish(
     srv: &str,
     method: &str,
     path: &str,
     t0: Instant,
-    sent: reqwest::Result<reqwest::Response>,
+    (sent, retries): (reqwest::Result<reqwest::Response>, usize),
 ) -> Result<Value, Error> {
     let (r, status, bytes, class) = match sent {
         Err(e) => {
@@ -131,7 +124,8 @@ async fn finish(
     };
     let took = t0.elapsed();
     match &r {
-        Err(e) => log::warn!("{method} {path} 失败（{took:.1?}）：{e}"),
+        Err(e) => log::warn!("{method} {path} 失败（{took:.1?}，重试 {retries} 次）：{e}"),
+        Ok(_) if retries > 0 => log::info!("{method} {path} 重试 {retries} 次后成功（{took:.1?}）"),
         Ok(_) if took >= SLOW => log::info!("{method} {path} 慢请求：{took:.1?}"),
         Ok(_) => {}
     }
@@ -140,7 +134,7 @@ async fn finish(
             "api",
             serde_json::json!({
                 "srv": srv, "m": method, "p": template(path), "st": status,
-                "ms": took.as_millis() as u64, "b": bytes, "e": class,
+                "ms": took.as_millis() as u64, "b": bytes, "e": class, "rt": retries,
             }),
         );
     }
@@ -210,7 +204,7 @@ pub async fn server_name(http: &Client, base: &str) -> Result<String, Error> {
         "GET",
         PATH,
         t0,
-        http.get(format!("{base}{PATH}")).send().await,
+        crate::status::send(|| http.get(format!("{base}{PATH}"))).await,
     )
     .await;
     Ok(r?["ServerName"].as_str().unwrap_or("Emby").to_owned())
@@ -226,12 +220,12 @@ pub async fn login(
 ) -> Result<(String, String), Error> {
     const PATH: &str = "/Users/AuthenticateByName";
     let t0 = Instant::now();
-    let sent = http
-        .post(format!("{base}{PATH}"))
-        .header("X-Emby-Authorization", auth_header(device_id, "", ""))
-        .json(&serde_json::json!({ "Username": user, "Pw": password }))
-        .send()
-        .await;
+    let sent = crate::status::send(|| {
+        http.post(format!("{base}{PATH}"))
+            .header("X-Emby-Authorization", auth_header(device_id, "", ""))
+            .json(&serde_json::json!({ "Username": user, "Pw": password }))
+    })
+    .await;
     let v = match finish(&crate::config::server_tag(base), "POST", PATH, t0, sent).await {
         Err(Error::Unauthorized) => return Err(Error::Other("用户名或密码错误".into())),
         r => r?,
@@ -269,7 +263,7 @@ impl Emby {
     }
 
     /// 通用请求。`path` 是 `/emby` 之后的部分，必须以 `/` 开头；查询参数单独传（键值对列表）。
-    /// 失败和慢请求写日志、记诊断数据（[`finish`]）。
+    /// 暂时性失败（502 / 503 / 429 等、连不上）按 [`crate::status`] 的规则重试；失败和慢请求写日志、记诊断数据（[`finish`]）。
     pub async fn call<Q: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -279,16 +273,21 @@ impl Emby {
     ) -> Result<Value, Error> {
         check_path(path)?;
         let t0 = Instant::now();
-        let mut rb = self
-            .http
-            .request(method.clone(), format!("{}{path}", self.base))
-            .header("X-Emby-Authorization", &self.auth)
-            .header("X-Emby-Token", &self.token)
-            .query(query);
-        if let Some(b) = body {
-            rb = rb.json(b);
-        }
-        finish(&self.tag, method.as_str(), path, t0, rb.send().await).await
+        let url = format!("{}{path}", self.base);
+        let sent = crate::status::send(|| {
+            let rb = self
+                .http
+                .request(method.clone(), &url)
+                .header("X-Emby-Authorization", &self.auth)
+                .header("X-Emby-Token", &self.token)
+                .query(query);
+            match body {
+                Some(b) => rb.json(b),
+                None => rb,
+            }
+        })
+        .await;
+        finish(&self.tag, method.as_str(), path, t0, sent).await
     }
 
     async fn get<T: DeserializeOwned>(
@@ -473,6 +472,8 @@ pub struct Item {
     pub index_number: Option<i32>,
     pub parent_index_number: Option<i32>,
     pub run_time_ticks: Option<i64>,
+    /// 电影的年份，弹幕按「片名 (年份)」匹配。
+    pub production_year: Option<i32>,
     pub user_data: UserData,
 }
 
@@ -695,11 +696,11 @@ pub(crate) mod tests {
         assert!(e.to_string().starts_with("服务器响应超时"), "{e}");
         assert_eq!(
             Error::Status(502, "<html>".into()).to_string(),
-            "服务器暂时出错（502），稍后再试"
+            "服务器暂时不可用，稍后再试（502）"
         );
         assert_eq!(
             Error::Status(404, "x".into()).to_string(),
-            "服务器返回 404：x"
+            "服务器上找不到（404）：x"
         );
     }
 

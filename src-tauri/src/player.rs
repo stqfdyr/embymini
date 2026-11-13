@@ -7,6 +7,7 @@
 //! （见 [`State::jump`]）。换集时沿用上一集选的音轨、字幕。
 //! 视频和字幕经本地缓存代理（[`crate::stream`]）读：交给 mpv 时才登记（[`State::load`]），换集时只留当前集和下一集的缓存。
 
+use crate::danmaku::{self, Fail as DmFail};
 use crate::emby::{self, Emby, Error, Item, MediaStream, NO_QUERY};
 use crate::stream::Stream;
 use crate::telemetry;
@@ -32,6 +33,8 @@ const JUMP_MSG: &str = "embymini-jump";
 const NEXT_READY_MSG: &str = "embymini-next-ready";
 /// 发给 ModernZ：上游下载速度（字节 / 秒），顶栏网速显示它。经缓存代理时 mpv 自己的读取速度是本机磁盘的速度，不是网速。
 const SPEED_MSG: &str = "embymini-speed";
+/// 弹幕脚本（mpv/scripts/danmaku.lua）发来的消息前缀：`style`、`search`、`episodes`、`pick`、`reload`，见 [`State::on_danmaku`]。
+const DM_MSG: &str = "embymini-danmaku-";
 
 /// 资源目录里自带的 mpv 配置目录（`<资源>/mpv`），不存在返回 None。
 ///
@@ -57,6 +60,8 @@ pub struct Options {
     pub user_conf: Option<PathBuf>,
     /// 本地缓存代理；没有（起不来）时 mpv 直连上游、token 经请求头带。
     pub stream: Option<Stream>,
+    /// 弹幕（数据在这里取，渲染在 mpv 脚本里）；None = 不加载弹幕脚本的数据。
+    pub danmaku: Option<danmaku::Ctx>,
     pub extra_args: Vec<String>,
 }
 
@@ -124,6 +129,15 @@ pub enum Event {
     /// 整个播放会话结束；volume 是退出时的音量，下次起播沿用。
     Ended {
         volume: Option<f64>,
+    },
+    /// 弹幕面板里改了显示设置，存进配置。
+    DanmakuStyle {
+        style: danmaku::Style,
+    },
+    /// 手动匹配了弹幕，存进配置（键见 [`danmaku::key`]）。
+    DanmakuPick {
+        key: String,
+        pick: danmaku::Pick,
     },
 }
 
@@ -478,6 +492,7 @@ pub struct Session {
     ipc: PathBuf,
     preload: f64,
     stream: Option<Stream>,
+    danmaku: Option<danmaku::Ctx>,
     /// 点播放的时刻和起播各阶段耗时（诊断数据，首帧出来时记一条 `play`）。
     timeline: (Instant, Map<String, Value>),
 }
@@ -586,6 +601,7 @@ pub async fn start(
         ipc,
         preload: opts.preload_percent,
         stream: opts.stream,
+        danmaku: opts.danmaku,
         timeline: (
             t0,
             Map::from_iter([
@@ -620,18 +636,28 @@ impl Session {
             ipc,
             preload,
             stream,
+            danmaku,
             timeline,
         } = self;
         let (rd, wr) = tokio::io::split(io);
         let mut lines = BufReader::new(rd).lines();
         let (reports, reporter) = spawn_reporter(emby.clone());
         let (prepared, mut prepared_rx) = mpsc::unbounded_channel();
+        let (dm_tx, mut dm_rx) = mpsc::unbounded_channel();
         let mut st = State::new(emby, queue, wr, events, preload, reports, prepared);
         st.tel.on = telemetry::enabled();
         st.tel.first = Some(timeline);
         st.up_seen = stream.as_ref().map_or(0, Stream::up_bytes);
         st.tel.up_minute = st.up_seen;
         st.stream = stream;
+        st.dm = danmaku.map(|ctx| Dm {
+            ctx,
+            tx: dm_tx,
+            shown: None,
+            dead: None,
+            told: false,
+            init: false,
+        });
         let tel_on = st.tel.on;
 
         // 没有缓存代理时 mpv 直连上游：token 走请求头，不进 URL（见 emby::strip_key）；要在第一次 loadfile 之前设好
@@ -689,6 +715,7 @@ impl Session {
                     Some(Ctl::Mpv(cmd)) => { st.send(cmd).await; }
                 },
                 Some((i, after, r)) = prepared_rx.recv() => st.on_prepared(i, after, r).await,
+                Some(m) = dm_rx.recv() => st.on_dm_result(m).await,
                 _ = tick.tick() => st.progress("TimeUpdate"),
                 _ = minute.tick(), if st.tel.on => st.probe_minute().await,
                 _ = second.tick(), if st.stream.is_some() => st.send_speed().await,
@@ -748,6 +775,28 @@ impl Session {
     }
 }
 
+/// 弹幕的会话状态。
+struct Dm {
+    ctx: danmaku::Ctx,
+    /// 后台取数的结果送回 run 的循环（[`State::on_dm_result`]）。
+    tx: mpsc::UnboundedSender<DmMsg>,
+    /// 已经为哪一集发起过加载（避免重复取）。
+    shown: Option<usize>,
+    /// 地址或令牌不对（[`DmFail::Setup`]）：这次播放不再请求，面板里显示原因。
+    dead: Option<String>,
+    /// 已经弹过一次提示（没匹配上、取不到）：一次播放只提示一次，不每集都弹。
+    told: bool,
+    /// 已把设置发给脚本。
+    init: bool,
+}
+
+/// 后台弹幕任务的结果。
+enum DmMsg {
+    Loaded(usize, Result<Option<danmaku::Loaded>, DmFail>),
+    /// 回给脚本的消息（名字, JSON）：搜索结果、集列表。
+    Reply(&'static str, Value),
+}
+
 struct State {
     emby: Emby,
     queue: Vec<Entry>,
@@ -780,6 +829,7 @@ struct State {
     /// 已经给界面发过 Failed（起播没成、mpv 退出时就不再补发「意外退出」）。
     failed_sent: bool,
     stream: Option<Stream>,
+    dm: Option<Dm>,
     /// 上次看到的缓存代理上游总字节（顶栏网速按它算差）。
     up_seen: u64,
     tel: Tel,
@@ -908,6 +958,7 @@ impl State {
             pipe_broken: false,
             failed_sent: false,
             stream: None,
+            dm: None,
             up_seen: 0,
             tel: Tel::default(),
         }
@@ -1109,6 +1160,9 @@ impl State {
                 if let (Some(s), Some(r)) = (&self.stream, &self.queue[i].ready) {
                     s.prefetch(&r.name);
                 }
+                if self.dm_ready() {
+                    self.dm_fetch(i, false);
+                }
                 log::info!("预加载下一集：{id}");
                 let _ = self.events.send(Event::Preloaded { item_id: id });
             }
@@ -1214,6 +1268,7 @@ impl State {
                         self.tel.render_due = true;
                     }
                     self.report(i, "", json!({}));
+                    self.dm_show(i).await;
                     let _ = self.events.send(Event::Started {
                         item_id: self.queue[i].item.id.clone(),
                     });
@@ -1279,6 +1334,9 @@ impl State {
             }
             "property-change" => self.on_property(&v).await,
             "client-message" if v["args"][0] == NEXT_MSG => self.next().await,
+            "client-message" if v["args"][0].as_str().is_some_and(|a| a.starts_with(DM_MSG)) => {
+                self.on_danmaku(&v["args"]).await
+            }
             "client-message" if v["args"][0] == PREV_MSG => self.prev().await,
             "client-message" if v["args"][0] == JUMP_MSG => {
                 let to = v["args"][1].as_str().and_then(|s| s.parse::<usize>().ok());
@@ -1515,6 +1573,203 @@ impl State {
     }
 }
 
+/// 弹幕：取数、和脚本（`mpv/scripts/danmaku.lua`，脚本名 `danmaku`）往来。
+impl State {
+    async fn dm_send(&mut self, name: &str, v: Value) {
+        self.send(json!(["script-message-to", "danmaku", name, v.to_string()]))
+            .await;
+    }
+
+    /// 开着弹幕、填了接口、这次播放没判定地址不对。
+    fn dm_ready(&self) -> bool {
+        self.dm
+            .as_ref()
+            .is_some_and(|d| d.ctx.cfg.style.on && d.ctx.api.is_some() && d.dead.is_none())
+    }
+
+    /// 在后台取第 i 集的弹幕；`deliver` = 取完交给脚本（当前集），否则只是预取进缓存（下一集）。
+    fn dm_fetch(&mut self, i: usize, deliver: bool) {
+        let Some(d) = &self.dm else { return };
+        let Some(api) = d.ctx.api.clone() else { return };
+        let item = &self.queue[i].item;
+        let want = danmaku::Want {
+            name: danmaku::match_name(item),
+            index: danmaku::index(item),
+            pick: d
+                .ctx
+                .cfg
+                .picks
+                .get(&danmaku::key(&self.emby.tag, item))
+                .cloned(),
+        };
+        let (dir, tx) = (d.ctx.dir.clone(), d.tx.clone());
+        tokio::spawn(async move {
+            let r = danmaku::load(&api, &dir, &want).await;
+            match (deliver, r) {
+                (true, r) => {
+                    let _ = tx.send(DmMsg::Loaded(i, r));
+                }
+                (false, Err(e)) => log::info!("预取下一集弹幕没成：{e}"),
+                (false, Ok(_)) => {}
+            }
+        });
+    }
+
+    /// 第 i 集开播：第一次先把设置发给脚本，再按需取弹幕。
+    async fn dm_show(&mut self, i: usize) {
+        let Some(d) = &mut self.dm else { return };
+        let init = !std::mem::replace(&mut d.init, true);
+        let msg = json!({ "style": d.ctx.cfg.style, "words": d.ctx.cfg.words });
+        if init {
+            self.dm_send("init", msg).await;
+        }
+        self.dm_load(i).await;
+    }
+
+    /// 给脚本加载第 i 集：取数，或说明为什么没有。
+    async fn dm_load(&mut self, i: usize) {
+        let Some(d) = &mut self.dm else { return };
+        if !d.ctx.cfg.style.on {
+            return; // 关着就不取，打开时再取（见 on_danmaku 的 style）
+        }
+        d.shown = Some(i);
+        let status = match (&d.ctx.api, &d.dead) {
+            (None, _) => {
+                json!({ "kind": "setup", "text": "还没有填弹幕接口：在 EmbyMini 的设置里填写" })
+            }
+            (_, Some(why)) => json!({ "kind": "setup", "text": why }),
+            _ => json!({ "kind": "loading", "text": "正在加载弹幕…" }),
+        };
+        let go = status["kind"] == "loading";
+        self.dm_send("status", status).await;
+        if go {
+            self.dm_fetch(i, true);
+        }
+    }
+
+    async fn on_dm_result(&mut self, m: DmMsg) {
+        let (i, r) = match m {
+            DmMsg::Reply(name, v) => return self.dm_send(name, v).await,
+            DmMsg::Loaded(i, r) => (i, r),
+        };
+        if self.cur != Some(i) {
+            return; // 已经换集了
+        }
+        let Some(d) = &mut self.dm else { return };
+        // 没匹配上、取不到时提示一次（之后的集只在面板里显示），地址不对时也只提示一次
+        let toast = !std::mem::replace(&mut d.told, true);
+        let status = match r {
+            Ok(Some(l)) => {
+                d.told = !toast; // 成功不算提示过
+                // 弹幕本身经 IPC 发给脚本，不让脚本读文件：Windows 上 mpv 内置 Lua 的 io.open 走 ANSI 代码页，
+                // 数据目录带中文时打不开。缓存文件是我们写的 JSON 数组，原样拼进去
+                let list = match std::fs::read_to_string(&l.path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let text = format!("读弹幕缓存失败：{e}（可在弹幕设置里重试）");
+                        return self
+                            .dm_send(
+                                "status",
+                                json!({ "kind": "error", "text": text, "toast": toast }),
+                            )
+                            .await;
+                    }
+                };
+                let head =
+                    json!({ "title": l.title, "manual": l.manual, "stale": l.stale }).to_string();
+                let body = format!("{},\"list\":{list}}}", &head[..head.len() - 1]);
+                self.send(json!(["script-message-to", "danmaku", "load", body]))
+                    .await;
+                return;
+            }
+            Ok(None) => {
+                json!({ "kind": "none", "text": "没有匹配到弹幕，可在弹幕设置里手动匹配", "toast": toast })
+            }
+            Err(DmFail::Setup(why)) => {
+                log::warn!("{why}");
+                d.dead = Some(why.clone());
+                json!({ "kind": "setup", "text": why, "toast": toast })
+            }
+            Err(e @ (DmFail::Busy(_) | DmFail::Other(_))) => {
+                log::warn!("{e}");
+                json!({ "kind": "error", "text": format!("{e}（可在弹幕设置里重试）"), "toast": toast })
+            }
+        };
+        self.dm_send("status", status).await;
+    }
+
+    /// 脚本发来的消息：`args[0]` = `embymini-danmaku-<动作>`，后面是参数。
+    async fn on_danmaku(&mut self, args: &Value) {
+        let (Some(cur), Some(d)) = (self.cur, &mut self.dm) else {
+            return;
+        };
+        let what = args[0]
+            .as_str()
+            .unwrap_or_default()
+            .trim_start_matches(DM_MSG);
+        let arg = |k: usize| args[k].as_str().unwrap_or_default().to_owned();
+        let (api, tx) = (d.ctx.api.clone(), d.tx.clone());
+        let item = self.queue[cur].item.clone();
+        let key = danmaku::key(&self.emby.tag, &item);
+        match what {
+            "style" => {
+                let Ok(style) = serde_json::from_str::<danmaku::Style>(&arg(1)) else {
+                    return;
+                };
+                let style = style.clamped();
+                let was_on = d.ctx.cfg.style.on;
+                if style != d.ctx.cfg.style {
+                    d.ctx.cfg.style = style.clone();
+                    let _ = self.events.send(Event::DanmakuStyle { style });
+                }
+                if !was_on && d.ctx.cfg.style.on && d.shown != Some(cur) {
+                    self.dm_load(cur).await;
+                }
+            }
+            "reload" => {
+                d.dead = None; // 可能刚在设置里改好了地址
+                self.dm_load(cur).await;
+            }
+            "search" | "episodes" => {
+                let Some(api) = api else { return };
+                let (kw, pick) = (arg(1), d.ctx.cfg.picks.get(&key).cloned());
+                let search = what == "search";
+                tokio::spawn(async move {
+                    let (name, v) = if search {
+                        ("search", api.search(&kw).await.map(|l| json!(l)))
+                    } else {
+                        let anime = kw.parse().unwrap_or(0);
+                        let r = api.episodes(anime).await.map(|l| {
+                            // 默认选中：按已有的匹配偏移或集号算出的那一集
+                            let off = pick.filter(|p| p.anime == anime).map_or(0, |p| p.offset);
+                            let at = (danmaku::index(&item) + off)
+                                .clamp(0, l.len().saturating_sub(1) as i32);
+                            json!({ "anime": anime, "list": l, "at": at })
+                        });
+                        ("episodes", r)
+                    };
+                    let v = v.unwrap_or_else(|e| json!({ "error": e.to_string() }));
+                    let _ = tx.send(DmMsg::Reply(name, v));
+                });
+            }
+            "pick" => {
+                let (Ok(anime), Ok(at)) = (arg(1).parse::<i64>(), arg(2).parse::<i32>()) else {
+                    return;
+                };
+                let pick = danmaku::Pick {
+                    anime,
+                    offset: at - danmaku::index(&item),
+                };
+                d.ctx.cfg.picks.insert(key.clone(), pick.clone());
+                d.dead = None;
+                let _ = self.events.send(Event::DanmakuPick { key, pick });
+                self.dm_load(cur).await;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn ipc_path() -> PathBuf {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let name = format!(
@@ -1731,6 +1986,78 @@ mod tests {
         out.lines()
             .map(|l| serde_json::from_str::<Value>(l).unwrap()["command"].clone())
             .collect()
+    }
+
+    /// 弹幕：第一集先下发设置；没填接口时说明原因、不取数；面板改设置、手动匹配会存配置；
+    /// 取到的弹幕整集发给脚本；换集后到的旧结果丢掉；地址不对之后不再请求。
+    #[tokio::test]
+    async fn danmaku_messages() {
+        let (mut st, mpv, mut ev) = offline_state(2);
+        let dir = std::env::temp_dir().join(format!("embymini-dm-msg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        st.dm = Some(Dm {
+            ctx: danmaku::Ctx {
+                api: None,
+                dir: dir.clone(),
+                cfg: danmaku::Config::default(),
+            },
+            tx,
+            shown: None,
+            dead: None,
+            told: false,
+            init: false,
+        });
+        st.cur = Some(0);
+        st.dm_show(0).await;
+        st.dm_show(0).await; // init 只发一次
+        let style = json!({ "on": true, "opacity": 5, "speed": 4 }).to_string();
+        st.on_danmaku(&json!(["embymini-danmaku-style", style]))
+            .await;
+        st.on_danmaku(&json!(["embymini-danmaku-pick", "77", "3"]))
+            .await;
+        let file = dir.join("1.json");
+        std::fs::write(&file, r#"[[1.5,1,16777215,"好",1.0]]"#).unwrap();
+        let loaded = danmaku::Loaded {
+            path: file,
+            title: "某剧 第1集".into(),
+            manual: true,
+            stale: false,
+        };
+        st.on_dm_result(DmMsg::Loaded(1, Ok(None))).await; // 不是当前集：丢掉
+        st.on_dm_result(DmMsg::Loaded(0, Ok(Some(loaded)))).await;
+        st.on_dm_result(DmMsg::Loaded(0, Err(DmFail::Setup("地址不对".into()))))
+            .await;
+        assert!(!st.dm_ready());
+
+        assert!(
+            matches!(ev.try_recv(), Ok(Event::DanmakuStyle { style }) if style.opacity == 1.0 && style.speed == 4)
+        );
+        assert!(
+            matches!(ev.try_recv(), Ok(Event::DanmakuPick { pick, .. }) if pick.anime == 77 && pick.offset == 3)
+        );
+        let cmds: Vec<(String, Value)> = commands(st, mpv)
+            .await
+            .into_iter()
+            .filter(|c| c[1] == "danmaku")
+            .map(|c| {
+                let v = serde_json::from_str(c[3].as_str().unwrap()).unwrap();
+                (c[2].as_str().unwrap().to_owned(), v)
+            })
+            .collect();
+        let names: Vec<&str> = cmds.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["init", "status", "status", "status", "load", "status"]
+        );
+        assert_eq!(cmds[1].1["kind"], "setup"); // 没填接口
+        assert_eq!(cmds[4].1["list"][0][3], "好");
+        assert_eq!(cmds[4].1["manual"], true);
+        assert_eq!(
+            (cmds[5].1["kind"].as_str(), cmds[5].1["toast"].as_bool()),
+            (Some("setup"), Some(true))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 读出 State 写给 mpv 的全部 loadfile 命令：(url, 模式)。
@@ -1989,6 +2316,7 @@ mod tests {
             ipc: std::env::temp_dir().join("embymini-slow-test.sock"),
             preload: 80.0,
             stream: None,
+            danmaku: None,
             timeline: (Instant::now(), Map::new()),
         };
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
@@ -2378,6 +2706,7 @@ mod tests {
             cache_dir: None,
             user_conf: None,
             stream: None,
+            danmaku: None,
             extra_args,
         }
     }
@@ -2646,6 +2975,77 @@ mod tests {
                 "否（当前集未读到末尾前不会预取）"
             }
         );
+    }
+
+    /// 弹幕端到端：真服 + 真弹幕接口（`DANMU_API`），起播后弹幕自动匹配、加载进脚本；给了 SHOT_DIR 就截弹幕和设置面板两张图。
+    /// 选片用 `EMBY_TEST_ITEM`（最好是国产剧 / 动画，能匹配上），不给就随便挑一集（可能匹配不上，只验证流程不出错）。
+    /// 无显示器时同 [`e2e_ui_shots`]。
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "需要真服账号、弹幕接口、DISPLAY 和 PATH 里的 mpv"]
+    async fn e2e_danmaku() {
+        let c = login_from_env().await;
+        let id = match std::env::var("EMBY_TEST_ITEM") {
+            Ok(id) => id,
+            Err(_) => pick_pair(&c).await.0.id,
+        };
+        let before = c.item(&id).await.unwrap();
+        let dir = std::env::temp_dir().join(format!("embymini-e2e-dm-{}", std::process::id()));
+        let mut opts = test_opts(
+            std::env::var("MPV_EXTRA")
+                .map(|a| a.split_whitespace().map(String::from).collect())
+                .unwrap_or_default(),
+        );
+        opts.danmaku = Some(danmaku::Ctx {
+            api: danmaku::Api::new(crate::emby::http_client().unwrap(), &env("DANMU_API")),
+            dir: dir.clone(),
+            cfg: danmaku::Config::default(),
+        });
+        let (opts, cache) = proxied(opts, "danmaku");
+        let session = start(c.clone(), &id, None, false, opts).await.unwrap();
+        let ipc = session.ipc.clone();
+        let (ctl, ctl_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(session.run(ctl_rx, ev_tx));
+        let ev = tokio::time::timeout(Duration::from_secs(120), ev_rx.recv()).await;
+        assert!(matches!(ev, Ok(Some(Event::Started { .. }))), "{ev:?}");
+        let mut state = Value::Null;
+        for _ in 0..120 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            state = get_property(&ipc, "user-data/embymini/danmaku").await;
+            if matches!(
+                state["kind"].as_str(),
+                Some("ok" | "none" | "error" | "setup")
+            ) {
+                break;
+            }
+        }
+        println!("弹幕：{state}");
+        assert!(
+            matches!(state["kind"].as_str(), Some("ok" | "none")),
+            "{state}"
+        );
+        if let Ok(shots) = std::env::var("SHOT_DIR") {
+            let shot = async |name: &str| {
+                let f = PathBuf::from(&shots).join(format!("{name}.png"));
+                mpv_cmd(
+                    &ipc,
+                    json!(["screenshot-to-file", f.to_string_lossy(), "window"]),
+                )
+                .await;
+            };
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            shot("dm-1-play").await;
+            mpv_cmd(&ipc, json!(["keypress", "D"])).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            shot("dm-2-panel").await;
+        }
+        ctl.send(Ctl::Quit).unwrap();
+        run.await.unwrap();
+        let _ = std::fs::remove_dir_all(cache);
+        let _ = std::fs::remove_dir_all(dir);
+        if let Some(e) = restore(&c, &before).await {
+            panic!("{e}");
+        }
     }
 
     /// 播放界面截图 + 防泄露检查：真流程起播（有窗口），模拟常用操作并截图到 SHOT_DIR，

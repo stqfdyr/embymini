@@ -321,12 +321,14 @@ impl Images {
         got
     }
 
-    /// 向上游取原始字节；`wait_ms` 填上等并发名额花了多久。
+    /// 向上游取原始字节；`wait_ms` 填上等并发名额花了多久。失败返回状态码（网络错误算 502），原样回给界面。
     async fn fetch(&self, url: &str, wait_ms: &mut u64) -> Result<Vec<u8>, u16> {
         let t0 = Instant::now();
         let _slot = self.slots.acquire().await.map_err(|_| 503u16)?;
         *wait_ms = t0.elapsed().as_millis() as u64;
-        let resp = self.http.get(url).send().await.map_err(|e| {
+        // 暂时性失败按 crate::status 的规则重试（最多再等约 2 秒，期间占着这个名额）
+        let (sent, _) = crate::status::send(|| self.http.get(url)).await;
+        let resp = sent.map_err(|e| {
             log::warn!("取图失败：{}", e.without_url());
             502u16
         })?;

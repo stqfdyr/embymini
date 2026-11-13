@@ -1,4 +1,4 @@
-<!-- 缓存管理：逐项显示占用，可单独清理或一键清理。视频、图片、字幕、临时缓存在 Rust 里（cache_info / cache_clear），
+<!-- 缓存管理：逐项显示占用，可单独清理或一键清理。视频、图片、字幕和弹幕、临时缓存在 Rust 里（cache_info / cache_clear），
      媒体库缓存是界面的列表快照（snap.ts）。正在播放的那部片的视频缓存清不掉。Esc、点外面、「完成」关闭。 -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
@@ -37,7 +37,7 @@
       ? [
           { kind: 'video', label: '视频缓存', size: info.video, note: info.playing ? '正在播放的除外' : '' },
           { kind: 'images', label: '图片缓存', size: info.images, note: '' },
-          { kind: 'subs', label: '字幕缓存', size: info.subs, note: '' },
+          { kind: 'subs', label: '字幕和弹幕缓存', size: info.subs, note: '' },
           { kind: 'snap', label: '媒体库缓存', size: snap, note: '' },
           { kind: 'temp', label: '临时缓存', size: info.temp, note: '' },
         ]

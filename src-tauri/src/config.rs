@@ -82,6 +82,8 @@ pub struct Config {
     pub telemetry_name: Option<String>,
     /// 边播边缓存整个视频（默认开）；关掉时缓存代理只缓存播放位置前方一段。
     pub cache_whole: bool,
+    /// 弹幕：接口地址、屏蔽词、显示设置、手动匹配。
+    pub danmaku: crate::danmaku::Config,
 }
 
 impl Default for Config {
@@ -97,6 +99,7 @@ impl Default for Config {
             telemetry: false,
             telemetry_name: None,
             cache_whole: true,
+            danmaku: crate::danmaku::Config::default(),
         }
     }
 }

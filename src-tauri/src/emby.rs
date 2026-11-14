@@ -498,24 +498,32 @@ pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    pub fn fixture<T: DeserializeOwned>(name: &str) -> T {
+    fn testdata(name: &str) -> String {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join(name);
-        serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()
+        std::fs::read_to_string(p).unwrap()
     }
 
-    pub fn client() -> Emby {
-        let s = Server {
+    pub fn fixture<T: DeserializeOwned>(name: &str) -> T {
+        serde_json::from_str(&testdata(name)).unwrap()
+    }
+
+    /// Test server entry: user id `uid`, token `tok`.
+    pub fn server_at(url: &str, port: u16) -> Server {
+        Server {
             id: "s".into(),
             name: String::new(),
-            url: "https://h.example".into(),
-            port: 443,
+            url: url.into(),
+            port,
             user: "u".into(),
             user_id: "uid".into(),
             token: "tok".into(),
-        };
-        Emby::new(Client::new(), &s, "dev")
+        }
+    }
+
+    pub fn client() -> Emby {
+        Emby::new(Client::new(), &server_at("https://h.example", 443), "dev")
     }
 
     #[test]
@@ -668,7 +676,9 @@ pub(crate) mod tests {
 
     type Heads = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-    /// Local HTTP server: `route(path)` → (status line, body), the path lowercased. Returns its port and every request head, lowercased.
+    /// Local HTTP server: `route(path)` → (status line, body); the path is lowercased and the status line may carry
+    /// extra header lines. Reads each whole request (head + body) before replying so the client never sees a reset.
+    /// Returns its port and every request head as sent.
     async fn fake(route: fn(&str) -> (&'static str, String)) -> (u16, Heads) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -677,10 +687,30 @@ pub(crate) mod tests {
         let seen = heads.clone();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = l.accept().await {
-                let mut buf = [0u8; 4096];
-                let n = s.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-                let target = head.split(' ').nth(1).unwrap_or_default();
+                let (mut req, mut chunk) = (Vec::new(), [0u8; 4096]);
+                let head = loop {
+                    let n = s.read(&mut chunk).await.unwrap_or(0);
+                    req.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&req).to_string();
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        if n == 0 {
+                            break text;
+                        }
+                        continue;
+                    };
+                    let len: usize = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.to_lowercase();
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if n == 0 || req.len() >= end + 4 + len {
+                        break text[..end].to_owned();
+                    }
+                };
+                let target = head.split(' ').nth(1).unwrap_or_default().to_lowercase();
                 let (status, body) = route(target.split('?').next().unwrap_or_default());
                 seen.lock().unwrap().push(head);
                 let resp = format!(
@@ -694,25 +724,11 @@ pub(crate) mod tests {
     }
 
     fn local(port: u16) -> Emby {
-        let server = Server {
-            id: "s".into(),
-            name: String::new(),
-            url: "http://127.0.0.1".into(),
-            port,
-            user: "u".into(),
-            user_id: "uid".into(),
-            token: "tok".into(),
-        };
-        Emby::new(http_client().unwrap(), &server, "dev")
-    }
-
-    fn testdata(name: &str) -> String {
-        std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("testdata")
-                .join(name),
+        Emby::new(
+            http_client().unwrap(),
+            &server_at("http://127.0.0.1", port),
+            "dev",
         )
-        .unwrap()
     }
 
     /// `call` turns each kind of reply into the right result and sends our UA and auth headers.
@@ -744,18 +760,17 @@ pub(crate) mod tests {
         assert_eq!(e, "请求被服务器拒绝（400）");
 
         let head = heads.lock().unwrap()[0].clone();
-        // Independent of `device_name` so a broken lookup fails here
+        // A copy of `device_name`'s lookup: catches a wrong lookup, not one hard-coding the "PC" fallback
         let host = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "PC".into());
-        let device = format!(r#"device="{host}""#).to_lowercase();
+        // Header names arrive lowercased; values must match exactly
         for want in [
-            format!("user-agent: {}", UA.to_lowercase()),
-            r#"x-emby-authorization: emby userid="uid", client="embymini""#.into(),
-            device,
-            r#"deviceid="dev""#.into(),
-            r#"token="tok""#.into(),
-            "x-emby-token: tok".into(),
+            format!("user-agent: {UA}\r\n"),
+            format!(
+                r#"x-emby-authorization: Emby UserId="uid", Client="EmbyMini", Device="{host}", DeviceId="dev", Version="{VERSION}", Token="tok""#
+            ),
+            "x-emby-token: tok\r\n".into(),
         ] {
             assert!(head.contains(&want), "missing {want:?} in\n{head}");
         }
@@ -779,7 +794,9 @@ pub(crate) mod tests {
         assert_eq!(r, ("u1".to_owned(), "t1".to_owned()));
         let head = heads.lock().unwrap()[0].clone();
         assert!(
-            head.contains(r#"deviceid="dev""#) && !head.contains("token"),
+            head.contains(r#"DeviceId="dev""#)
+                && !head.contains("Token=")
+                && !head.contains("x-emby-token"),
             "{head}"
         );
         let e = login(&http, &at("denied"), "dev", "u", "pw")
@@ -799,6 +816,7 @@ pub(crate) mod tests {
             "/emby/users/uid/items/1" => ("200 OK", testdata("series.json")),
             "/emby/shows/s/episodes" => ("200 OK", testdata("episodes.json")),
             "/emby/items/1/playbackinfo" => ("200 OK", testdata("playbackinfo.json")),
+            "/r" => ("302 Found\r\nlocation: /v", String::new()),
             _ => ("403 Forbidden", String::new()),
         })
         .await;
@@ -806,16 +824,23 @@ pub(crate) mod tests {
         assert_eq!(c.item("1").await.unwrap().kind, "Series");
         let eps = c.episodes("s", "x").await.unwrap();
         assert!(eps.len() > 1 && eps.iter().all(|e| e.kind == "Episode" && !e.id.is_empty()));
-        let pi = c.playback_info("1", Some("ms")).await.unwrap();
-        assert!(pi.play_session_id.is_some() && !pi.media_sources.is_empty());
+        let source = "mediasource_1153511";
+        let pi = c.playback_info("1", Some(source)).await.unwrap();
+        assert!(pi.play_session_id.is_some() && pi.media_sources[0].id == source);
         let head = heads.lock().unwrap().last().unwrap().clone();
+        let query: Vec<&str> = head
+            .split(' ')
+            .nth(1)
+            .and_then(|t| t.split_once('?'))
+            .map_or(vec![], |(_, q)| q.split('&').collect());
+        let want = format!("MediaSourceId={source}");
         assert!(
-            head.contains("maxstreamingbitrate=400000000") && head.contains("mediasourceid=ms"),
+            query.contains(&"MaxStreamingBitrate=400000000") && query.contains(&want.as_str()),
             "{head}"
         );
-        // probe: final status of the direct URL, asked with the token and a one-byte range
+        // probe: final status after redirects, asked with the token and a one-byte range
         assert_eq!(
-            c.probe(&format!("http://127.0.0.1:{port}/v")).await,
+            c.probe(&format!("http://127.0.0.1:{port}/r")).await,
             Some(403)
         );
         let head = heads.lock().unwrap().last().unwrap().clone();

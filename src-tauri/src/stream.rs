@@ -2059,4 +2059,166 @@ mod tests {
         assert!(reqs(&u, "/f").len() <= 2, "{:?}", reqs(&u, "/f"));
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    fn src() -> Src {
+        Src {
+            url: "http://127.0.0.1:9/f".into(),
+            auth: Auth {
+                token: String::new(),
+                origin: String::new(),
+            },
+            resolved: None,
+        }
+    }
+
+    /// Startup recount (trash excluded, subdirs included), per-cache usage, clearing, and a synchronous sweep.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_accounting() {
+        let dir = tmp("account");
+        let v = dir.join("video");
+        std::fs::create_dir_all(v.join("a/nested")).unwrap();
+        std::fs::create_dir_all(v.join(".trash-old")).unwrap();
+        std::fs::create_dir_all(dir.join("subs")).unwrap();
+        std::fs::write(v.join("a/0"), [0u8; 10]).unwrap();
+        std::fs::write(v.join("a/nested/x"), [0u8; 5]).unwrap();
+        std::fs::write(v.join(".trash-old/y"), [0u8; 3]).unwrap();
+        std::fs::write(dir.join("subs/s.srt"), [0u8; 7]).unwrap();
+        assert!(free_space(&v).is_some());
+        let s = Stream::start(&dir, true).unwrap();
+        assert!(
+            until(|| s.total.load(Ordering::Relaxed) == 15, 5).await,
+            "startup recount"
+        );
+        assert!(
+            until(|| !v.join(".trash-old").exists(), 5).await,
+            "old trash removed"
+        );
+        let cap = s.cap.load(Ordering::Relaxed);
+        assert!((MIN_CAP..=MAX_CAP).contains(&cap));
+        std::fs::create_dir_all(v.join(".trash-new")).unwrap();
+        std::fs::write(v.join(".trash-new/z"), [0u8; 100]).unwrap();
+        assert_eq!(s.usage(), (15, 7), "trash dirs not counted");
+        s.clear_subs();
+        assert_eq!(s.usage(), (15, 0));
+        assert!(dir.join("subs").is_dir(), "subs dir recreated");
+
+        // A doomed name that is already gone is dropped; a real dir is moved out and the total recounted at once.
+        lock(&s.doomed).extend(["a".to_owned(), "ghost".to_owned()]);
+        s.sweep();
+        assert!(lock(&s.doomed).is_empty());
+        assert!(
+            !s.sweep_retry.load(Ordering::Relaxed),
+            "nothing left: no retry queued"
+        );
+        assert!(!v.join("a").exists());
+        assert_eq!(s.total.load(Ordering::Relaxed), 0);
+        // A dir that cannot be renamed stays doomed with exactly one retry queued.
+        std::fs::write(v.join("plain"), b"").unwrap();
+        lock(&s.doomed).insert("plain/sub".into());
+        s.sweep();
+        assert!(lock(&s.doomed).contains("plain/sub"));
+        assert!(s.sweep_retry.load(Ordering::Relaxed));
+        lock(&s.doomed).clear();
+
+        std::fs::create_dir_all(v.join("b")).unwrap();
+        s.clear_video(false);
+        assert!(
+            until(|| !v.join("b").exists(), 5).await,
+            "clear_video deletes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Opening keeps only blocks whose size matches meta.json; repair un-marks a block deleted from outside.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_keeps_valid_blocks_and_repairs() {
+        let dir = tmp("open");
+        let d = dir.join("video/r");
+        std::fs::create_dir_all(&d).unwrap();
+        let size = BLOCK + 10;
+        std::fs::write(d.join("meta.json"), format!(r#"{{"size":{size}}}"#)).unwrap();
+        for (name, len) in [
+            ("0", 3),
+            ("1", 10),
+            ("2", 10),
+            ("1.4.part", 1),
+            ("meta.json.tmp", 1),
+            ("junk", 1),
+        ] {
+            std::fs::write(d.join(name), vec![0u8; len]).unwrap();
+        }
+        let f = File::open(d.clone(), src());
+        assert_eq!(
+            f.st().done,
+            [false, true],
+            "short block 0 and out-of-range 2 dropped"
+        );
+        let mut left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["1", "meta.json"]);
+
+        let s = Stream::start(&dir, true).unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await; // startup recount
+        s.total.store(100, Ordering::Relaxed);
+        f.repair(&s, 0);
+        assert_eq!(
+            s.total.load(Ordering::Relaxed),
+            100,
+            "a block never done is left alone"
+        );
+        f.repair(&s, 1);
+        assert!(f.st().done[1], "present block stays");
+        std::fs::remove_file(d.join("1")).unwrap();
+        f.repair(&s, 1);
+        assert!(!f.st().done[1]);
+        assert_eq!(s.total.load(Ordering::Relaxed), 90);
+        sub_total(&s.total, 1000);
+        assert_eq!(s.total.load(Ordering::Relaxed), 0, "saturates at 0");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Failure backoff per kind, `status_since` only reports newer errors, and `bump` wakes readers.
+    #[test]
+    fn failure_backoff_and_wakeups() {
+        let dir = tmp("fail");
+        let f = File::open(dir.join("x"), src());
+        let rx = f.changed.subscribe();
+        let before = Instant::now();
+        let wait = |e: Fail| {
+            f.failed(e);
+            f.st().retry_at.unwrap() - Instant::now()
+        };
+        let w = wait(Fail::Status(404));
+        assert!(
+            w > Duration::from_millis(2900) && w <= Duration::from_secs(3),
+            "{w:?}"
+        );
+        assert_eq!(f.st().status_since(before), Some(404));
+        assert_eq!(
+            f.st().status_since(Instant::now()),
+            None,
+            "older errors are not reported"
+        );
+        let w = wait(Fail::Busy(503, Some(Duration::from_secs(2))));
+        assert!(
+            w > Duration::from_millis(1900) && w <= Duration::from_secs(2),
+            "{w:?}"
+        );
+        assert_eq!(
+            f.st().status_since(before),
+            None,
+            "busy is not a final status"
+        );
+        let w = wait(Fail::Net("x".into()));
+        assert!(
+            w > Duration::from_millis(900) && w <= Duration::from_secs(1),
+            "{w:?}"
+        );
+        assert!(rx.has_changed().unwrap(), "failures wake readers");
+        assert!(!f.st().busy());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

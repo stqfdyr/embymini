@@ -409,7 +409,7 @@ fn parse_range(h: &str) -> Option<Range> {
     let b = if b.is_empty() {
         None
     } else {
-        Some(b.parse().ok()?)
+        Some(b.parse::<u64>().ok().filter(|&b| b >= a)?)
     };
     Some(Range::From(a, b))
 }
@@ -571,13 +571,24 @@ impl Stream {
     /// 登记一个外挂字幕，返回本地地址（结尾带原文件名，mpv 按扩展名认格式）。第一次读时整个取下存进字幕缓存。
     pub fn sub(&self, file: &str, url: &str, auth: &Auth) -> String {
         let key = uuid::Uuid::new_v4().simple().to_string();
+        // The extension is the server's codec string: one plain name, or `/`, `\` and `..` would write outside the cache
+        let mut file: String = file
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '_' | '-' => c,
+                _ => '-',
+            })
+            .collect();
+        if file.trim_matches('.').is_empty() {
+            file.clone_from(&key);
+        }
         let src = Src {
             url: url.to_owned(),
             auth: auth.clone(),
             resolved: None,
         };
         let s = Arc::new(SubSrc {
-            file: file.to_owned(),
+            file: file.clone(),
             src: Mutex::new(src),
         });
         lock(&self.keys).insert(key.clone(), Key::Sub(s));
@@ -921,7 +932,8 @@ impl Stream {
         let t0 = Instant::now();
         let mut rx = f.changed.subscribe();
         let mut open: Option<(PathBuf, tokio::fs::File, u64)> = None;
-        while pos <= end {
+        // Checked every round, not only while waiting: a block that keeps failing to read must not outlive mpv
+        while pos <= end && !tx.is_closed() {
             let b = (pos / BLOCK) as usize;
             let off = pos % BLOCK;
             let next = {
@@ -1437,12 +1449,16 @@ impl File {
         back
     }
 
-    /// A block marked done but missing on disk (deleted from outside) goes back to not done.
+    /// A block marked done but missing or cut short on disk (changed from outside) goes back to not done;
+    /// the next write renames over it.
     fn repair(&self, s: &Inner, b: usize) {
         let mut st = self.st();
-        if st.done.get(b).copied().unwrap_or(false) && !self.block_path(b).is_file() {
+        let len = block_len(st.size.unwrap_or(0), b);
+        if st.done.get(b).copied().unwrap_or(false)
+            && std::fs::metadata(self.block_path(b)).map(|m| m.len()).ok() != Some(len)
+        {
             st.done[b] = false;
-            sub_total(&s.total, block_len(st.size.unwrap_or(0), b));
+            sub_total(&s.total, len);
         }
     }
 }
@@ -1543,6 +1559,9 @@ mod tests {
         assert_eq!(parse_range("bytes=-5"), Some(Range::Suffix(5)));
         assert_eq!(parse_range("bytes=1-2,5-6"), None);
         assert_eq!(parse_range("items=1-2"), None);
+        // An end before the start is invalid: ignored (whole file), never a negative length
+        assert_eq!(parse_range("bytes=5-3"), None);
+        assert_eq!(parse_range("bytes=5-5"), Some(Range::From(5, Some(5))));
         assert_eq!(resolve(Some(Range::From(10, None)), 100), Some((10, 99)));
         assert_eq!(
             resolve(Some(Range::From(10, Some(500))), 100),
@@ -1975,6 +1994,52 @@ mod tests {
             1,
             "second subtitle read must be local"
         );
+
+        // The name carries the server's codec string: it must not lead out of the subtitle cache
+        for evil in ["../escaped.srt", "..", "a/b\\c?.srt"] {
+            let sub = s.sub(evil, &format!("{}/sub", u.base), &auth(&u));
+            // By key: a client would collapse the `..` in the URL itself
+            let key = sub.split('/').nth(4).unwrap();
+            let sub = format!("http://127.0.0.1:{}/s/{key}/x", s.port);
+            assert_eq!(
+                get(&sub, None, false).await,
+                (200, b"hello".to_vec()),
+                "{evil}"
+            );
+        }
+        assert!(!dir.join("escaped.srt").exists(), "wrote outside the cache");
+        let names: Vec<_> = std::fs::read_dir(dir.join("subs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.contains(&"..-escaped.srt".to_owned()), "{names:?}");
+        assert!(names.contains(&"a-b-c-.srt".to_owned()), "{names:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A done block cut short on disk (outside tampering) is fetched again instead of re-read forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn truncated_block_is_refetched() {
+        let u = upstream((2 * BLOCK) as usize).await;
+        let dir = tmp("truncated");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_20_a", &format!("{}/f", u.base), &auth(&u));
+        assert_eq!(get(&url, Some("bytes=0-9"), false).await.0, 206);
+        let f = lock(&s.files).get("srv_20_a").unwrap().clone();
+        assert!(until(|| f.st().done.first() == Some(&true), 5).await);
+        std::fs::File::options()
+            .write(true)
+            .open(f.block_path(0))
+            .unwrap()
+            .set_len(5)
+            .unwrap();
+        let got = tokio::time::timeout(
+            Duration::from_secs(10),
+            get(&url, Some("bytes=0-99"), false),
+        )
+        .await
+        .expect("reader spins on the short block");
+        assert_eq!((got.0, got.1.as_slice()), (206, &u.data[..100]));
         let _ = std::fs::remove_dir_all(dir);
     }
 

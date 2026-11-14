@@ -217,18 +217,34 @@ pub fn normalize(input: &str, port: Option<u16>) -> Result<(String, u16), String
     Ok((u.as_str().trim_end_matches('/').to_owned(), port))
 }
 
-/// Missing file gives defaults. A corrupt or unreadable file (e.g. locked by antivirus) is renamed to
-/// `config.json.bad` first: startup saves right after loading and must not overwrite the user's servers.
-pub fn load(path: &Path) -> Config {
-    let parsed = match fs::read(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Config::default(),
-        Err(e) => Err(e.to_string()),
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+/// Startup saves right after loading, so this must never hand back defaults while the user's file is still
+/// in place. Missing file: defaults. Corrupt file: moved to a new `config.json.bad[.N]` (older backups kept),
+/// then defaults. Unreadable file (e.g. briefly locked by antivirus): retried, then an error that stops startup.
+pub fn load(path: &Path) -> io::Result<Config> {
+    let mut retries = 3;
+    let bytes = loop {
+        match fs::read(path) {
+            Ok(b) => break b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) if retries > 0 => {
+                log::warn!("读取配置失败，稍后重试：{e}");
+                retries -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
     };
-    parsed.unwrap_or_else(|e| {
-        log::warn!("配置文件读不了或已损坏，改名为 config.json.bad 后重建：{e}");
-        let _ = fs::rename(path, path.with_extension("json.bad"));
-        Config::default()
+    serde_json::from_slice(&bytes).or_else(|e| {
+        let bad = (1..)
+            .map(|n| match n {
+                1 => path.with_extension("json.bad"),
+                n => path.with_extension(format!("json.bad.{n}")),
+            })
+            .find(|p| !p.exists())
+            .expect("unbounded");
+        log::warn!("配置文件损坏，改名为 {} 后重建：{e}", bad.display());
+        fs::rename(path, bad)?;
+        Ok(Config::default())
     })
 }
 
@@ -237,12 +253,17 @@ pub fn save(path: &Path, cfg: &Config) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
+    let bytes = serde_json::to_vec_pretty(cfg)?;
     let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(cfg)?)?;
-        f.sync_all()?;
-    } // closed before the rename (Windows refuses to rename an open file)
+    // The file is closed before the rename (Windows refuses to rename an open file).
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(&bytes)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     fs::rename(tmp, path)
 }
 
@@ -353,22 +374,27 @@ mod tests {
             ..Default::default()
         };
         save(&path, &c).unwrap();
-        assert_eq!(load(&path).device_id, c.device_id);
+        assert_eq!(load(&path).unwrap().device_id, c.device_id);
         assert!(!path.with_extension("json.tmp").exists());
-        fs::write(&path, b"{not json").unwrap();
-        assert_eq!(load(&path).preload_percent, 80);
-        assert!(path.with_extension("json.bad").exists());
+        // A second corruption keeps the first backup.
+        for (i, junk) in [&b"{not json"[..], b"nope"].into_iter().enumerate() {
+            fs::write(&path, junk).unwrap();
+            assert_eq!(load(&path).unwrap().preload_percent, 80);
+            let bad = ["json.bad", "json.bad.2"][i];
+            assert_eq!(fs::read(path.with_extension(bad)).unwrap(), junk);
+        }
+        assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn unreadable_config_is_kept_aside() {
+    fn unreadable_config_stops_startup() {
         let dir = std::env::temp_dir().join(format!("embymini-unread-{}", std::process::id()));
         let path = dir.join("config.json");
         // A directory in its place: reading fails with something other than NotFound.
         fs::create_dir_all(&path).unwrap();
-        assert_eq!(load(&path).preload_percent, 80);
-        assert!(dir.join("config.json.bad").is_dir());
+        assert!(load(&path).is_err());
+        assert!(path.is_dir(), "left in place");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -389,7 +415,7 @@ mod tests {
         });
         assert_eq!(out.unwrap(), 7);
         assert_eq!(c.preload_percent, 60);
-        assert_eq!(load(&good).preload_percent, 60);
+        assert_eq!(load(&good).unwrap().preload_percent, 60);
         fs::remove_dir_all(dir).unwrap();
     }
 

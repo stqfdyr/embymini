@@ -169,6 +169,15 @@ impl App {
             .map_err(|e| Error::Other(format!("保存配置失败：{e}")))
     }
 
+    /// Best-effort change (player state, token cleared after a 401): kept in memory even if the save fails.
+    fn remember(&self, f: impl FnOnce(&mut Config)) {
+        let mut c = self.cfg();
+        f(&mut c);
+        if let Err(e) = config::save(&self.path, &c) {
+            log::warn!("保存配置失败：{e}");
+        }
+    }
+
     /// A copy of the saved server `id`.
     fn server(&self, id: &str) -> Result<Server, Error> {
         let c = self.cfg();
@@ -332,7 +341,13 @@ async fn server_login(
 ) -> Result<ServerView, Error> {
     let mut s = app.server(&id)?;
     app.login(&mut s, &password).await?;
-    app.put_server(s)
+    // Only the login fields: an edit saved while logging in keeps its address.
+    app.update(|c| {
+        let t = c.servers.iter_mut().find(|t| t.id == id)?;
+        (t.user_id, t.token) = (s.user_id, s.token);
+        Some(t.view())
+    })?
+    .ok_or_else(no_server)
 }
 
 #[tauri::command]
@@ -570,7 +585,7 @@ async fn emby(
     let r = client.call(method, &path, &query, body.as_ref()).await;
     if matches!(r, Err(Error::Unauthorized)) {
         // Clear the server that was asked: the user may have switched servers meanwhile
-        let _ = app.update(|c| {
+        app.remember(|c| {
             if let Some(s) = c.servers.iter_mut().find(|s| s.id == server_id) {
                 s.token.clear();
             }
@@ -642,15 +657,17 @@ async fn play(
             let app = handle.state::<App>();
             match ev {
                 player::Event::Ended { volume: Some(v) } => {
-                    let _ = app.update(|c| c.volume = Some(v));
+                    app.remember(|c| c.volume = Some(v));
                 }
                 // 弹幕面板里的改动：存进配置，界面不用知道
                 player::Event::DanmakuStyle { style } => {
-                    let _ = app.update(|c| c.danmaku.style = style);
+                    app.remember(|c| c.danmaku.style = style);
                     continue;
                 }
                 player::Event::DanmakuPick { key, pick } => {
-                    let _ = app.update(|c| c.danmaku.picks.insert(key, pick));
+                    app.remember(|c| {
+                        c.danmaku.picks.insert(key, pick);
+                    });
                     continue;
                 }
                 _ => {}
@@ -732,7 +749,8 @@ fn main() {
                 .data_directory(root.join("webview"))
                 .build()?;
             let path = root.join("config.json");
-            let cfg = config::load(&path);
+            let cfg = config::load(&path)
+                .map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
             config::save(&path, &cfg)?; // 首次启动把生成的 device_id 落盘
             if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
                 log::warn!("上次没有正常退出（版本 {v}）");

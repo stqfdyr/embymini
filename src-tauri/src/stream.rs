@@ -1784,7 +1784,7 @@ mod tests {
                 let mut sent = 0u64;
                 for chunk in data[a as usize..=b as usize].chunks(64 << 10) {
                     // Slow upstream: about 1.3 MB/s
-                    if path.starts_with("/slow") {
+                    if path.contains("slow") {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                     // First request: cut after 6 MiB (mid-stream drop)
@@ -2489,6 +2489,9 @@ mod tests {
             v
         };
         assert!(ensure(0, Role::Main).is_empty());
+        // Within MAIN_NEAR blocks past the main task's write point: wait for it, nothing new
+        assert!(ensure(MAIN_NEAR as usize, Role::Main).is_empty());
+        assert!(slots().is_empty(), "{:?}", slots());
         // Young main task: the far read gets blocks 40–41 on the side, the main task stays at 0
         assert!(ensure(40, Role::Main).is_empty());
         assert_eq!(f.st().main.as_ref().map(|m| m.at), Some(0));
@@ -2555,6 +2558,73 @@ mod tests {
         // Every byte received counts, including the partial blocks lost to the cuts
         assert!(s.up_bytes() >= 10 * BLOCK, "{}", s.up_bytes());
         drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A prefetch the upstream refuses asks once and stops.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prefetch_gives_up_on_refusal() {
+        let u = upstream(BLOCK as usize).await;
+        let dir = tmp("prefetch-403");
+        let s = Stream::start(&dir, false).unwrap();
+        let _ = s.video("srv_34_a", &format!("{}/403", u.base), &auth(&u));
+        s.prefetch("srv_34_a");
+        // A refused prefetch stops; retrying would ask again once the 3 s hold-off ends
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert_eq!(reqs(&u, "/403").len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The main task stops at a block that is already done and restarts at the next missing one (no second download).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn main_task_skips_done_blocks() {
+        let u = upstream((8 * BLOCK) as usize).await;
+        let dir = tmp("skip-done");
+        let s = Stream::start(&dir, true).unwrap();
+        let url = s.video("srv_35_a", &format!("{}/f", u.base), &auth(&u));
+        let at = 5 * BLOCK;
+        let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+        assert_eq!(st, 206);
+        let f = lock(&s.files).get("srv_35_a").unwrap().clone();
+        assert!(until(|| !f.st().busy(), 5).await);
+        let _ = get(&url, Some("bytes=0-99"), false).await;
+        assert!(until(|| f.st().done.iter().all(|&d| d), 10).await);
+        let r: Vec<_> = reqs(&u, "/f").into_iter().map(|r| r.1).collect();
+        assert!(r.contains(&format!("bytes={}-", 6 * BLOCK)), "{r:?}");
+        drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A refusal seen by another task does not cut a reader whose data is still coming from a running task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refusal_elsewhere_keeps_running_reads() {
+        let u = upstream((4 * BLOCK) as usize).await;
+        let dir = tmp("busy-read");
+        let s = Stream::start(&dir, false).unwrap();
+        // First request streams slowly (about 1.3 MB/s); every later one gets 403
+        let url = s.video("srv_36_a", &format!("{}/expire-slow", u.base), &auth(&u));
+        let reading = tokio::spawn({
+            let url = url.clone();
+            async move { get(&url, Some(&format!("bytes=0-{}", 2 * BLOCK - 1)), false).await }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // A preview past MAIN_NEAR gets a task of its own, which the upstream refuses (that reader waits on too)
+        let at = 3 * BLOCK;
+        let preview = url.clone();
+        tokio::spawn(
+            async move { get(&preview, Some(&format!("bytes={at}-{}", at + 9)), true).await },
+        );
+        assert!(until(|| reqs(&u, "/expire").len() >= 2, 5).await);
+        let (st, body) = tokio::time::timeout(Duration::from_secs(20), reading)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(st, 206);
+        assert!(
+            body == u.data[..2 * BLOCK as usize],
+            "cut short at {} bytes",
+            body.len()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2705,6 +2775,21 @@ mod tests {
             },
             resolved: None,
         }
+    }
+
+    /// Every retain recounts, even with no dir to delete (sweep only recounts after renaming one).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retain_recounts_even_with_nothing_to_delete() {
+        let dir = tmp("recount");
+        let s = Stream::start(&dir, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await; // startup recount first
+        s.total.store(12345, Ordering::Relaxed);
+        s.retain(&[]);
+        assert!(
+            until(|| s.total.load(Ordering::Relaxed) == 0, 5).await,
+            "every retain corrects drift in the total"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Startup recount (trash excluded, subdirs included), per-cache usage, clearing, and a synchronous sweep.

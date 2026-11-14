@@ -1,21 +1,31 @@
-//! 本地缓存代理：mpv 和进度条预览子进程都从这里读视频（`http://127.0.0.1:<端口>/v/<key>/…`）、字幕（`/s/<key>/…`），
-//! 这里边播边把整个文件按块落盘，已下好的部分从磁盘回，没有的向上游要。
+//! Local caching proxy: mpv and the seek-bar preview process read video (`http://127.0.0.1:<port>/v/<key>/…`) and
+//! subtitles (`/s/<key>/…`) from here; it saves whole files block by block while playing, serving what is on disk
+//! and fetching the rest upstream.
 //!
-//! - 只绑回环地址；`key` 是每个文件登记时随机生成的 128 位 id，只对应那一个文件，不是通用转发。
-//! - token 只在这里：mpv 和预览子进程都拿不到；重定向自己跟，只向服务器同源发 token。
-//! - 磁盘：`<缓存>/<上游>_<条目>_<版本>/`，按 [`BLOCK`] 分块，完成的块叫 `<n>`，正在写的 `<n>.<序号>.part`，
-//!   `meta.json` 记总大小（和上游对不上就整个作废）。有哪些块 = 目录里有哪些文件，淘汰就是删文件。
-//! - 下载任务（同一块同一时刻只有一个任务在写）：
-//!   - 主任务：每个文件一个，开区间顺序往后写；碰到已有的块就断开，从主播放器最近读的位置之后的下一个缺块重开，
-//!     到文件尾回绕补前面的缺块，直到整片下完（「整片」模式）。只缓存前方（关掉整片或到了容量上限）时只写到读的位置前方 [`AHEAD`] 块。
-//!     主任务刚开不到 2 秒又有主播放器要别处（mkv 打开时先读头、再读文件尾的索引）：给一个两块的短任务，不来回抢。
-//!   - 预览任务：进度条预览（请求头 `X-EmbyMini-Role: thumb`）和预取下一集用，闭区间只取 1–2 块，每个文件最多 [`PREVIEWS`] 个。
-//!   - 卡住对冲：请求 3 秒没收到正文，在同一位置再开一个，先出数据的留下；最多同时 2 个，之后按 5、8 秒再换。
-//! - 保留：播放器每次换集调 [`Stream::retain`]（当前集 + 已在 mpv 列表里的下一集），其余的停掉并删除；退出不删，下次打开同一部片直接走本地。
-//! - 容量：min(20 GiB, 可用空间 + 现有视频缓存 − 10 GiB)，到了就只缓存前方，读需要的块时删当前文件里最久没读的块。
+//! - Loopback only; `key` is a random 128-bit id per registered file, so this is no open relay.
+//! - The token stays here: mpv and the preview process never see it; redirects are followed here, with the token
+//!   only for the server's origin.
+//! - Disk: `<cache>/<server>_<item>_<version>/`, [`BLOCK`]-sized blocks; done blocks are `<n>`, ones being written
+//!   `<n>.<seq>.part`, and `meta.json` holds the total size (a mismatch with upstream discards the dir). The blocks
+//!   present are the files in the dir; evicting is deleting a file.
+//! - Download tasks (one writer per block at a time):
+//!   - Main task: one per file, open-ended and sequential; at a block that is done or being written it disconnects
+//!     and restarts at the next missing block after the main player's last read, wrapping at the end until the whole
+//!     file is there ("whole" mode). Ahead-only (whole off, or at the cap) writes [`AHEAD`] blocks past the read position.
+//!     A main-player read elsewhere within 2 s of a new main task (mkv reads the header, then the index at the end)
+//!     gets a two-block short task instead of a tug of war.
+//!   - Preview tasks: for the seek-bar preview (`X-EmbyMini-Role: thumb`) and next-episode prefetch, closed ranges
+//!     of 1–2 blocks, at most [`PREVIEWS`] per file.
+//!   - Hedging: a request with no body after 3 s gets a twin at the same position; the first with data wins; at most
+//!     two at once, later replaced at 5 and 8 s.
+//! - Keeping: the player calls [`Stream::retain`] on each episode change (current + queued next); the rest stop and
+//!   are deleted. Exit deletes nothing, so reopening a film plays from disk.
+//! - Capacity: min(20 GiB, free space + current video cache − 10 GiB); at the cap only the window ahead is cached and
+//!   writing a block evicts the file's least recently used ones.
 
 use bytes::Bytes;
 use hyper::body::{Frame, Incoming};
+use hyper::header::HeaderValue;
 use hyper::{Request, Response, StatusCode};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -46,6 +56,9 @@ const PREVIEWS: usize = 2;
 const HEDGE: [u64; 3] = [3, 5, 8];
 /// Give up when no request yields data (504); the reader will ask again.
 const OPEN_LIMIT: Duration = Duration::from_secs(30);
+/// A first read's wait for the size: a little past [`OPEN_LIMIT`], so the first request's own verdict lands first.
+const SIZE_WAIT: Duration = Duration::from_secs(OPEN_LIMIT.as_secs() + 5);
+/// Largest chunk per body frame sent to mpv.
 const READ_CHUNK: u64 = 256 << 10;
 /// Video cache cap when the disk has room.
 const MAX_CAP: u64 = 20 << 30;
@@ -65,12 +78,12 @@ fn block_len(size: u64, b: usize) -> u64 {
     BLOCK.min(size - b as u64 * BLOCK)
 }
 
-/// Who reads: the main player, the seek-bar preview, or the next-episode prefetch (no HTTP, started by [`Stream::prefetch`]).
+/// Who reads: the main player, or a preview-type reader (the seek-bar preview, or the next-episode prefetch
+/// started by [`Stream::prefetch`] without HTTP); the two kinds of preview are scheduled alike.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Role {
     Main,
-    Thumb,
-    Prefetch,
+    Preview,
 }
 
 /// Credentials for upstream requests: the token only goes to hosts with the API root's origin.
@@ -332,24 +345,24 @@ pub struct Inner {
     video: PathBuf,
     subs: PathBuf,
     http: reqwest::Client,
-    /// 边播边缓存整个视频（设置项，默认开）；关掉时只缓存读的位置前方一段。
+    /// Cache whole videos while playing (setting, on by default); off caches only a window ahead of the reader.
     whole: AtomicBool,
     cap: AtomicU64,
-    /// 视频缓存的总字节（完成的块）。
+    /// Bytes of done blocks in the video cache.
     total: AtomicU64,
-    /// 上游下载的总字节（顶栏网速按它算差）。
+    /// Bytes downloaded upstream (the title bar's speed is its rate of change).
     up_bytes: AtomicU64,
     tick: AtomicU64,
     ids: AtomicU64,
     files: Mutex<HashMap<String, Arc<File>>>,
     keys: Mutex<HashMap<String, Key>>,
-    /// 等着删的目录：先改名进回收目录再慢慢删；改名前又被登记（又要播它）就不删了。
+    /// Dirs due for deletion: renamed into a trash dir, then deleted slowly; one registered again before the rename stays.
     doomed: Mutex<HashSet<String>>,
     /// A delayed sweep retry is queued: one is enough, however many retains happen meanwhile.
     sweep_retry: AtomicBool,
 }
 
-/// 本地缓存代理的句柄（可随意克隆）。
+/// Handle to the proxy (cheap to clone).
 #[derive(Clone)]
 pub struct Stream(Arc<Inner>);
 
@@ -360,7 +373,8 @@ impl Deref for Stream {
     }
 }
 
-/// 回给 mpv 的正文：整段（小的）、空、或从读任务经有界通道一块块来（背压：mpv 不读，读任务就停）。
+/// Body sent to mpv: empty, whole (small), or chunks from a read task over a bounded channel (backpressure: when mpv
+/// stops reading, so does the task).
 pub enum Body {
     Empty,
     Full(Option<Bytes>),
@@ -388,7 +402,8 @@ fn status(code: u16) -> Response<Body> {
     r
 }
 
-/// 请求里的 Range：`bytes=a-`、`bytes=a-b`、`bytes=-n`；别的写法（多段）当没有，回整个文件。
+/// A request's Range: `bytes=a-`, `bytes=a-b`, `bytes=-n`; anything else (several ranges, end before start) is
+/// ignored and the whole file is sent, as RFC 9110 allows.
 #[derive(Debug, PartialEq, Clone, Copy)]
 enum Range {
     From(u64, Option<u64>),
@@ -414,7 +429,7 @@ fn parse_range(h: &str) -> Option<Range> {
     Some(Range::From(a, b))
 }
 
-/// 按总大小落成闭区间；起点超出文件返回 None（416）。
+/// The closed span for a file of `size`; None (416) when the start is past the end.
 fn resolve(r: Option<Range>, size: u64) -> Option<(u64, u64)> {
     match r {
         None => (size > 0).then(|| (0, size - 1)),
@@ -423,7 +438,7 @@ fn resolve(r: Option<Range>, size: u64) -> Option<(u64, u64)> {
     }
 }
 
-/// `Content-Range: bytes a-b/total` → (a, total)。
+/// `Content-Range: bytes a-b/total` → (a, total).
 fn content_range(h: &str) -> Option<(u64, u64)> {
     let r = h.trim().strip_prefix("bytes ")?;
     let (span, total) = r.split_once('/')?;
@@ -454,8 +469,18 @@ async fn maybe<F: Future + Unpin>(f: &mut Option<F>) -> F::Output {
     }
 }
 
+/// A reader's next step ([`Stream::locate`]).
+enum Next {
+    /// Read from this file, which holds the block up to the given length; `true` for a done block.
+    Read(PathBuf, u64, bool),
+    /// Wait for the block; the tasks were superseded and are aborted outside the lock.
+    Wait(Vec<Task>),
+    /// Stop: retained away or refused upstream.
+    Gone,
+}
+
 impl Stream {
-    /// 起本地服务。绑不上端口（极少见）时返回 None，播放退回直连。
+    /// Starts the server. None if no port can be bound (rare): playback then goes direct.
     pub fn start(root: &Path, whole: bool) -> Option<Self> {
         let l = std::net::TcpListener::bind(("127.0.0.1", 0))
             .and_then(|l| l.set_nonblocking(true).map(|_| l))
@@ -465,10 +490,10 @@ impl Stream {
         let http = reqwest::Client::builder()
             .no_proxy()
             .user_agent(crate::emby::UA)
-            // HTTP/2 默认 64 KB 的流窗口在高延迟线路上限速；连接池让预览的短请求复用连接
+            // HTTP/2's default 64 KB stream window throttles high-latency links; the pool lets preview requests reuse connections
             .http1_only()
             .connect_timeout(Duration::from_secs(10))
-            // 一直没数据就断开重连（对冲只管第一个字节，这里管中途卡住）
+            // Reconnect when data stops mid-body (hedging only covers the first byte)
             .read_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -491,31 +516,10 @@ impl Stream {
         }));
         let _ = std::fs::create_dir_all(&me.video);
         let _ = std::fs::create_dir_all(&me.subs);
-        let m = me.clone();
-        tauri::async_runtime::spawn(async move {
-            let l = match tokio::net::TcpListener::from_std(l) {
-                Ok(l) => l,
-                Err(e) => return log::warn!("本地缓存代理起不来：{e}"),
-            };
-            loop {
-                let Ok((sock, _)) = l.accept().await else {
-                    continue;
-                };
-                let m = m.clone();
-                tauri::async_runtime::spawn(async move {
-                    let svc = hyper::service::service_fn(move |req| {
-                        let m = m.clone();
-                        async move { Ok::<_, Infallible>(m.handle(req).await) }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(sock), svc)
-                        .await;
-                });
-            }
-        });
+        tauri::async_runtime::spawn(me.clone().accept(l));
         let m = me.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            // 上次没删完的回收目录
+            // Trash dirs a previous run did not finish deleting
             for e in std::fs::read_dir(&m.video).into_iter().flatten().flatten() {
                 if e.file_name().to_string_lossy().starts_with(".trash-") {
                     let _ = std::fs::remove_dir_all(e.path());
@@ -527,6 +531,34 @@ impl Stream {
         Some(me)
     }
 
+    /// Serves connections for the life of the process.
+    async fn accept(self, l: std::net::TcpListener) {
+        let l = match tokio::net::TcpListener::from_std(l) {
+            Ok(l) => l,
+            Err(e) => return log::warn!("本地缓存代理起不来：{e}"),
+        };
+        loop {
+            let sock = match l.accept().await {
+                Ok((sock, _)) => sock,
+                Err(_) => {
+                    // Out of handles and the like: retrying at once would spin a core
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let m = self.clone();
+            tauri::async_runtime::spawn(async move {
+                let svc = hyper::service::service_fn(move |req| {
+                    let m = m.clone();
+                    async move { Ok::<_, Infallible>(m.handle(req).await) }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(sock), svc)
+                    .await;
+            });
+        }
+    }
+
     pub fn set_whole(&self, on: bool) {
         self.whole.store(on, Ordering::Relaxed);
         for f in lock(&self.files).values() {
@@ -534,12 +566,13 @@ impl Stream {
         }
     }
 
-    /// 上游下载的总字节（只增）。
+    /// Bytes downloaded upstream so far (only grows).
     pub fn up_bytes(&self) -> u64 {
         self.up_bytes.load(Ordering::Relaxed)
     }
 
-    /// 登记一个视频文件，返回给 mpv 的本地地址。`name` 是缓存目录名（同一个文件每次都一样，下次直接用上次的缓存）。
+    /// Registers a video and returns its local URL for mpv. `name` is the cache dir, the same for a file every time,
+    /// so a later run reuses its cache.
     pub fn video(&self, name: &str, url: &str, auth: &Auth) -> String {
         lock(&self.doomed).remove(name);
         let mut files = lock(&self.files);
@@ -568,7 +601,8 @@ impl Stream {
         format!("http://127.0.0.1:{}/v/{}/stream", self.port, f.key)
     }
 
-    /// 登记一个外挂字幕，返回本地地址（结尾带原文件名，mpv 按扩展名认格式）。第一次读时整个取下存进字幕缓存。
+    /// Registers an external subtitle and returns its local URL, ending in the file name (mpv tells the format by
+    /// the extension). The first read fetches it whole into the subtitle cache.
     pub fn sub(&self, file: &str, url: &str, auth: &Auth) -> String {
         let key = uuid::Uuid::new_v4().simple().to_string();
         // The extension is the server's codec string: one plain name, or `/`, `\` and `..` would write outside the cache
@@ -595,7 +629,7 @@ impl Stream {
         format!("http://127.0.0.1:{}/s/{key}/{file}", self.port)
     }
 
-    /// 最近一次失败是不是上游回的 HTTP 错误（播放失败时给出 403 / 404 的原因）。
+    /// The upstream HTTP status of the last failure, if it was one (explains a 403 / 404 when playback fails).
     pub fn fail_status(&self, name: &str) -> Option<u16> {
         let f = lock(&self.files).get(name)?.clone();
         match &f.st().fail {
@@ -758,8 +792,8 @@ impl Stream {
                     if let Some(size) = st.size {
                         let n = blocks(size);
                         let lo = n.saturating_sub(2);
-                        let a = me.ensure(&f, &mut st, lo, n.saturating_sub(1), Role::Prefetch);
-                        let b = me.ensure(&f, &mut st, 0, 0, Role::Prefetch);
+                        let a = me.ensure(&f, &mut st, lo, n.saturating_sub(1), Role::Preview);
+                        let b = me.ensure(&f, &mut st, 0, 0, Role::Preview);
                         drop(st);
                         abort_all(a.into_iter().chain(b));
                         return;
@@ -767,7 +801,7 @@ impl Stream {
                     if st.fail.is_some() || t0.elapsed() > OPEN_LIMIT {
                         return;
                     }
-                    me.ensure(&f, &mut st, 0, 0, Role::Prefetch)
+                    me.ensure(&f, &mut st, 0, 0, Role::Preview)
                 };
                 abort_all(abort);
                 let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
@@ -793,7 +827,7 @@ impl Stream {
             return status(405);
         }
         let role = match req.headers().get(ROLE).and_then(|v| v.to_str().ok()) {
-            Some("thumb") => Role::Thumb,
+            Some("thumb") => Role::Preview,
             _ => Role::Main,
         };
         let range = req
@@ -803,7 +837,7 @@ impl Stream {
             .and_then(parse_range);
         let mut seg = req.uri().path().trim_start_matches('/').split('/');
         let (kind, key) = (seg.next(), seg.next().unwrap_or_default());
-        // 先放开 keys 再拿 files（登记时是先 files 后 keys）
+        // Release `keys` before taking `files` (registration takes `files`, then `keys`)
         let found = match lock(&self.keys).get(key) {
             Some(Key::Video(n)) if kind == Some("v") => Some(Ok(n.clone())),
             Some(Key::Sub(s)) if kind == Some("s") => Some(Err(s.clone())),
@@ -845,7 +879,7 @@ impl Stream {
             );
             return r;
         };
-        // 要的位置没缓存、上游刚回过错误：直接回那个错误码（mpv 报错，界面给出原因），不让它干等
+        // Not cached here and upstream just refused: answer with that code (mpv fails, the UI says why) instead of a stall
         {
             let st = f.st();
             let b = (start / BLOCK) as usize;
@@ -859,14 +893,17 @@ impl Stream {
         }
         let mut r = Response::new(Body::Empty);
         let h = r.headers_mut();
-        h.insert(hyper::header::ACCEPT_RANGES, "bytes".parse().unwrap());
+        h.insert(
+            hyper::header::ACCEPT_RANGES,
+            HeaderValue::from_static("bytes"),
+        );
         h.insert(
             hyper::header::CONTENT_TYPE,
-            "application/octet-stream".parse().unwrap(),
+            HeaderValue::from_static("application/octet-stream"),
         );
         h.insert(
             hyper::header::CONTENT_LENGTH,
-            (end - start + 1).to_string().parse().unwrap(),
+            HeaderValue::from(end - start + 1),
         );
         if range.is_some() {
             *r.status_mut() = StatusCode::PARTIAL_CONTENT;
@@ -884,7 +921,8 @@ impl Stream {
         r
     }
 
-    /// 等文件总大小（第一次读这个文件时要先从上游拿到）。上游回了 HTTP 错误就回那个码；网络不通一直重试到 [`OPEN_LIMIT`]。
+    /// Waits for the file's total size (the first read needs it from upstream). An upstream HTTP error is answered
+    /// with its code; network trouble is retried for [`SIZE_WAIT`].
     async fn wait_size(
         &self,
         f: &Arc<File>,
@@ -897,7 +935,7 @@ impl Stream {
             let abort = {
                 let mut st = f.st();
                 if f.gone.load(Ordering::Relaxed) {
-                    return Err(410); // 换片时被删了
+                    return Err(410); // retained away on an episode change
                 }
                 if let Some(s) = st.size {
                     return Ok(s);
@@ -905,7 +943,7 @@ impl Stream {
                 if let Some(s) = st.status_since(t0) {
                     return Err(s);
                 }
-                if t0.elapsed() > OPEN_LIMIT + Duration::from_secs(5) {
+                if t0.elapsed() > SIZE_WAIT {
                     return Err(st.fail.as_ref().map_or(504, |(e, _)| e.code()));
                 }
                 self.ensure(f, &mut st, b, b, role)
@@ -915,7 +953,8 @@ impl Stream {
         }
     }
 
-    /// 把 [start, end] 一段段交给 mpv：块在磁盘上就读文件，正在下载就读已写到的部分，都没有就安排下载再等。
+    /// Streams [pos, end] to mpv in chunks: from the block file when done, from the `.part` as far as written,
+    /// otherwise schedules a download and waits.
     async fn read_loop(
         self,
         f: Arc<File>,
@@ -924,11 +963,6 @@ impl Stream {
         role: Role,
         tx: mpsc::Sender<Bytes>,
     ) {
-        enum Next {
-            Read(PathBuf, u64, bool),
-            Wait(Vec<Task>),
-            Gone,
-        }
         let t0 = Instant::now();
         let mut rx = f.changed.subscribe();
         let mut open: Option<(PathBuf, tokio::fs::File, u64)> = None;
@@ -936,34 +970,11 @@ impl Stream {
         while pos <= end && !tx.is_closed() {
             let b = (pos / BLOCK) as usize;
             let off = pos % BLOCK;
-            let next = {
-                let mut st = f.st();
-                if role == Role::Main {
-                    st.last_read = pos;
-                }
-                if f.gone.load(Ordering::Relaxed) {
-                    Next::Gone // 换片时被删了：断开，mpv 那边这时已经在播别的
-                } else if st.done.get(b).copied().unwrap_or(false) {
-                    st.touched[b] = self.tick.fetch_add(1, Ordering::Relaxed);
-                    let len = block_len(st.size.unwrap_or(0), b);
-                    Next::Read(f.block_path(b), len, true)
-                } else if let Some(p) = st.writing.get(&b).filter(|p| p.written > off) {
-                    Next::Read(p.path.clone(), p.written, false)
-                } else if st.status_since(t0).is_some() && !st.busy() {
-                    Next::Gone // 上游在这之后回了错误：断开，mpv 重连时会拿到错误码
-                } else {
-                    let hi = if off + (1 << 20) > BLOCK { b + 1 } else { b };
-                    Next::Wait(self.ensure(&f, &mut st, b, hi, role))
-                }
-            };
-            let (path, avail, hit) = match next {
+            let (path, avail, hit) = match self.locate(&f, pos, role, t0) {
                 Next::Gone => break,
                 Next::Wait(abort) => {
                     abort_all(abort);
                     let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
-                    if tx.is_closed() {
-                        break;
-                    }
                     continue;
                 }
                 Next::Read(p, avail, hit) => (p, avail, hit),
@@ -973,7 +984,7 @@ impl Stream {
                 match tokio::fs::File::open(&path).await {
                     Ok(h) => open = Some((path.clone(), h, u64::MAX)),
                     Err(_) => {
-                        // `.part` 刚写完改了名，或者块被删了：重新看状态
+                        // The `.part` was just renamed, or the block deleted: look again
                         if hit {
                             f.repair(&self, b);
                         }
@@ -1000,9 +1011,34 @@ impl Stream {
             }
             *at = off + n;
             if tx.send(Bytes::from(buf)).await.is_err() {
-                break; // mpv 断开了（拖动进度会关掉旧连接）
+                break; // mpv hung up (a seek closes the old connection)
             }
             pos += n;
+        }
+    }
+
+    /// What a reader at `pos` does next; a main-player read also records its position.
+    fn locate(&self, f: &Arc<File>, pos: u64, role: Role, t0: Instant) -> Next {
+        let b = (pos / BLOCK) as usize;
+        let off = pos % BLOCK;
+        let mut st = f.st();
+        if role == Role::Main {
+            st.last_read = pos;
+        }
+        if f.gone.load(Ordering::Relaxed) {
+            Next::Gone // retained away: mpv is playing something else by now
+        } else if st.done.get(b).copied().unwrap_or(false) {
+            st.touched[b] = self.tick.fetch_add(1, Ordering::Relaxed);
+            let len = block_len(st.size.unwrap_or(0), b);
+            Next::Read(f.block_path(b), len, true)
+        } else if let Some(p) = st.writing.get(&b).filter(|p| p.written > off) {
+            Next::Read(p.path.clone(), p.written, false)
+        } else if st.status_since(t0).is_some() && !st.busy() {
+            Next::Gone // upstream refused since: hang up, mpv's reconnect gets the code
+        } else {
+            // In the block's last MiB, ask for the next one too
+            let hi = if off + (1 << 20) > BLOCK { b + 1 } else { b };
+            Next::Wait(self.ensure(f, &mut st, b, hi, role))
         }
     }
 
@@ -1466,23 +1502,17 @@ impl File {
 impl Stream {
     async fn serve_sub(&self, s: &SubSrc, head: bool) -> Response<Body> {
         let path = self.subs.join(&s.file);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => {
-                let _ = std::fs::File::options()
-                    .write(true)
-                    .open(&path)
-                    .and_then(|f| f.set_modified(std::time::SystemTime::now()));
-                Bytes::from(b)
-            }
-            Err(_) => {
-                // mpv 只在加载时要一次字幕，取不到这一集就没字幕了：暂时性失败按 crate::status 的规则重试
+        let bytes = match crate::images::cached(&path).await {
+            Some(b) => Bytes::from(b),
+            None => {
+                // mpv asks for a subtitle once, at load: without it the episode has none, so retry per crate::status
                 let mut n = 0;
                 let resp = loop {
                     let (code, wait) = match self.send(&s.src, None).await {
                         Ok(r) if r.status().is_success() => break r,
                         Ok(r) => (r.status().as_u16(), crate::status::retry_after(r.headers())),
                         Err(e @ Fail::Connect(_)) => (e.code(), None),
-                        Err(e) => return status(e.code()), // 超时、证书错误等：再试也一样
+                        Err(e) => return status(e.code()), // timeout, bad certificate…: a retry fails alike
                     };
                     if n >= crate::status::RETRIES || !crate::status::retry_code(code, true) {
                         return status(code);
@@ -1494,7 +1524,9 @@ impl Stream {
                     return status(502);
                 };
                 let tmp = path.with_extension("tmp");
-                if std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                if tokio::fs::write(&tmp, &b).await.is_ok()
+                    && tokio::fs::rename(&tmp, &path).await.is_ok()
+                {
                     let dir = self.subs.clone();
                     tauri::async_runtime::spawn_blocking(move || {
                         crate::images::trim_dir(&dir, SUBS_CAP)
@@ -1510,7 +1542,7 @@ impl Stream {
         });
         r.headers_mut().insert(
             hyper::header::CONTENT_LENGTH,
-            bytes.len().to_string().parse().unwrap(),
+            HeaderValue::from(bytes.len()),
         );
         r
     }
@@ -2307,28 +2339,28 @@ mod tests {
         // Young main task: the far read gets blocks 40–41 on the side, the main task stays at 0
         assert!(ensure(40, Role::Main).is_empty());
         assert_eq!(f.st().main.as_ref().map(|m| m.at), Some(0));
-        assert!(ensure(10, Role::Thumb).is_empty());
-        assert!(ensure(20, Role::Prefetch).is_empty());
+        assert!(ensure(10, Role::Preview).is_empty());
+        assert!(ensure(20, Role::Preview).is_empty());
         assert_eq!(
             slots(),
             [
-                (10, 10, Role::Thumb),
-                (20, 20, Role::Prefetch),
+                (10, 10, Role::Preview),
+                (20, 20, Role::Preview),
                 (40, 41, Role::Main)
             ]
         );
         // A third preview cancels the oldest preview, never the main player's short task
-        assert_eq!(ensure(30, Role::Thumb).len(), 1);
+        assert_eq!(ensure(30, Role::Preview).len(), 1);
         assert_eq!(
             slots(),
             [
-                (20, 20, Role::Prefetch),
-                (30, 30, Role::Thumb),
+                (20, 20, Role::Preview),
+                (30, 30, Role::Preview),
                 (40, 41, Role::Main)
             ]
         );
         // Nothing new for blocks already being fetched
-        assert!(ensure(41, Role::Thumb).is_empty());
+        assert!(ensure(41, Role::Preview).is_empty());
         assert_eq!(slots().len(), 3);
         f.stop();
         drop(f);

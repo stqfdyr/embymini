@@ -324,9 +324,9 @@ fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
         .collect()
 }
 
-/// Reads a cached image and refreshes its mtime, which trimming reads as "last used".
-/// One blocking-pool trip: a grid hits dozens at once, and slow disks or antivirus must not stall async workers.
-async fn cached(path: &Path) -> Option<Vec<u8>> {
+/// Reads a cached file (an image, or a subtitle for the proxy) and refreshes its mtime, which trimming reads as
+/// "last used". One blocking-pool trip: a grid hits dozens at once, and slow disks or antivirus must not stall async workers.
+pub(crate) async fn cached(path: &Path) -> Option<Vec<u8>> {
     let p = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let b = std::fs::read(&p).ok()?;

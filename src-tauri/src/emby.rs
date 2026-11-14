@@ -45,14 +45,9 @@ impl Serialize for Error {
     }
 }
 
-/// 网络层错误按连不上 / 超时 / 证书分类，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
+/// 网络错误 → 给人看的错误：超时、证书、连不上分开说，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
 /// 只取 source 链，不取顶层：顶层带完整 URL（含查询参数，如搜索词）。
-fn net(e: reqwest::Error) -> Error {
-    net_classified(&e).1
-}
-
-/// 网络错误的类别（诊断数据用：connect / timeout / tls / net）和给人看的错误。
-pub(crate) fn net_classified(e: &reqwest::Error) -> (&'static str, Error) {
+pub(crate) fn net(e: &reqwest::Error) -> Error {
     let mut chain = Vec::new();
     let mut src = std::error::Error::source(e);
     while let Some(s) = src {
@@ -61,66 +56,35 @@ pub(crate) fn net_classified(e: &reqwest::Error) -> (&'static str, Error) {
     }
     let detail = chain.join("：");
     let lower = detail.to_ascii_lowercase();
-    let (class, what) = if e.is_timeout() {
-        ("timeout", "服务器响应超时")
+    let what = if e.is_timeout() {
+        "服务器响应超时"
     } else if ["certificate", "tls", "ssl"]
         .iter()
         .any(|k| lower.contains(k))
     {
-        ("tls", "证书或 TLS 握手失败")
+        "证书或 TLS 握手失败"
     } else if e.is_connect() {
-        ("connect", "连不上服务器")
+        "连不上服务器"
     } else {
-        ("net", "网络错误")
+        "网络错误"
     };
-    let err = Error::Network(if detail.is_empty() {
+    Error::Network(if detail.is_empty() {
         what.into()
     } else {
         format!("{what}（{detail}）")
-    });
-    (class, err)
+    })
 }
 
-/// 路径模板：id 段换成 `{id}`，诊断数据按接口聚合，也不把用户 id 发出去。
-/// 服务器的 id 格式各不相同（纯数字、32 位十六进制、`m01KXAMQ…` 这类带前缀的 ULID），
-/// 而 Emby 的路由名都不含数字：段里有数字，或是 16 位以上的十六进制，就当 id。
-fn template(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            let id = seg.bytes().any(|b| b.is_ascii_digit())
-                || (seg.len() >= 16 && seg.bytes().all(|b| b.is_ascii_hexdigit()));
-            if id { "{id}" } else { seg }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-/// 请求收尾：解析回包；失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）；
-/// 记一条诊断数据（方法、路径模板、状态码、耗时、字节数、错误类别、重试次数）。
+/// 请求收尾：解析回包；失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）。
 async fn finish(
-    srv: &str,
     method: &str,
     path: &str,
     t0: Instant,
     (sent, retries): (reqwest::Result<reqwest::Response>, usize),
 ) -> Result<Value, Error> {
-    let (r, status, bytes, class) = match sent {
-        Err(e) => {
-            let (class, err) = net_classified(&e);
-            (Err(err), 0, 0, class)
-        }
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let (r, bytes) = json_or_error(resp).await;
-            let class = match &r {
-                Ok(_) => "",
-                Err(Error::Unauthorized) => "auth",
-                Err(Error::Status(..)) => "status",
-                Err(Error::Network(_)) => "net",
-                Err(Error::Other(_)) => "decode",
-            };
-            (r, status, bytes, class)
-        }
+    let r = match sent {
+        Err(e) => Err(net(&e)),
+        Ok(resp) => json_or_error(resp).await,
     };
     let took = t0.elapsed();
     match &r {
@@ -128,15 +92,6 @@ async fn finish(
         Ok(_) if retries > 0 => log::info!("{method} {path} 重试 {retries} 次后成功（{took:.1?}）"),
         Ok(_) if took >= SLOW => log::info!("{method} {path} 慢请求：{took:.1?}"),
         Ok(_) => {}
-    }
-    if crate::telemetry::enabled() {
-        crate::telemetry::rec(
-            "api",
-            serde_json::json!({
-                "srv": srv, "m": method, "p": template(path), "st": status,
-                "ms": took.as_millis() as u64, "b": bytes, "e": class, "rt": retries,
-            }),
-        );
     }
     r
 }
@@ -169,25 +124,21 @@ fn auth_header(device_id: &str, user_id: &str, token: &str) -> String {
     h
 }
 
-/// 回包 → JSON（同时返回正文字节数）。
-async fn json_or_error(resp: reqwest::Response) -> (Result<Value, Error>, usize) {
+/// 回包 → JSON。
+async fn json_or_error(resp: reqwest::Response) -> Result<Value, Error> {
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
-        return (Err(Error::Unauthorized), 0);
+        return Err(Error::Unauthorized);
     }
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => return (Err(net(e)), 0),
-    };
-    let r = if !status.is_success() {
+    let bytes = resp.bytes().await.map_err(|e| net(&e))?;
+    if !status.is_success() {
         let text = String::from_utf8_lossy(&bytes).chars().take(200).collect();
         Err(Error::Status(status.as_u16(), text))
     } else if bytes.is_empty() {
         Ok(Value::Null)
     } else {
         serde_json::from_slice(&bytes).map_err(|e| Error::Other(format!("回包不是 JSON：{e}")))
-    };
-    (r, bytes.len())
+    }
 }
 
 /// 把通用 JSON 回包转成播放要用的强类型；`what` 写进错误信息，方便定位是哪个接口变了形状。
@@ -200,7 +151,6 @@ pub async fn server_name(http: &Client, base: &str) -> Result<String, Error> {
     const PATH: &str = "/System/Info/Public";
     let t0 = Instant::now();
     let r = finish(
-        &crate::config::server_tag(base),
         "GET",
         PATH,
         t0,
@@ -227,7 +177,7 @@ pub async fn login(
             .json(&serde_json::json!({ "Username": user, "Pw": password }))
     })
     .await;
-    let v = match finish(&crate::config::server_tag(base), "POST", PATH, t0, sent).await {
+    let v = match finish("POST", PATH, t0, sent).await {
         Err(Error::Unauthorized) => return Err(Error::Other("用户名或密码错误".into())),
         r => r?,
     };
@@ -247,7 +197,7 @@ pub struct Emby {
     auth: String,
     token: String,
     pub user_id: String,
-    /// 上游标识，诊断数据用（见 [`crate::config::server_tag`]）。
+    /// 上游标识（见 [`crate::config::server_tag`]），缓存文件名、弹幕匹配记录按它区分服务器。
     pub tag: String,
 }
 
@@ -264,7 +214,7 @@ impl Emby {
     }
 
     /// 通用请求。`path` 是 `/emby` 之后的部分，必须以 `/` 开头；查询参数单独传（键值对列表）。
-    /// 暂时性失败（502 / 503 / 429 等、连不上）按 [`crate::status`] 的规则重试；失败和慢请求写日志、记诊断数据（[`finish`]）。
+    /// 暂时性失败（502 / 503 / 429 等、连不上）按 [`crate::status`] 的规则重试；失败和慢请求写日志（[`finish`]）。
     pub async fn call<Q: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -288,7 +238,7 @@ impl Emby {
             }
         })
         .await;
-        finish(&self.tag, method.as_str(), path, t0, sent).await
+        finish(method.as_str(), path, t0, sent).await
     }
 
     async fn get<T: DeserializeOwned>(
@@ -510,9 +460,6 @@ impl PlaybackInfo {
 pub struct MediaSource {
     pub id: String,
     pub container: Option<String>,
-    /// 总码率（bit/s）、文件大小（字节），诊断数据用。
-    pub bitrate: Option<i64>,
-    pub size: Option<i64>,
     pub direct_stream_url: Option<String>,
     pub default_audio_stream_index: Option<i32>,
     pub default_subtitle_stream_index: Option<i32>,
@@ -623,32 +570,6 @@ pub(crate) mod tests {
         assert_eq!(c.token_header(), "X-Emby-Token: tok");
         assert_eq!(subtitle_ext(Some("subrip")), "srt");
         assert_eq!(subtitle_ext(Some("PGSSUB")), "sup");
-    }
-
-    #[test]
-    fn path_template_hides_ids() {
-        assert_eq!(
-            template("/Users/0123456789abcdef0123456789abcdef/Items/1354593"),
-            "/Users/{id}/Items/{id}"
-        );
-        assert_eq!(template("/Shows/NextUp"), "/Shows/NextUp");
-        assert_eq!(
-            template("/Items/12/PlaybackInfo"),
-            "/Items/{id}/PlaybackInfo"
-        );
-        // ULID 样式的用户 id、带前缀的条目 id
-        assert_eq!(
-            template("/Users/01KHGE98GAAPFWP1M30XY3KRS8/Items/m01M3H8YV26WE88S0W5BEM88JBW"),
-            "/Users/{id}/Items/{id}"
-        );
-        assert_eq!(
-            template("/Users/01KHGE98GAAPFWP1M30XY3KRS8/Items/Latest"),
-            "/Users/{id}/Items/Latest"
-        );
-        assert_eq!(
-            template("/Sessions/Playing/Progress"),
-            "/Sessions/Playing/Progress"
-        );
     }
 
     #[test]

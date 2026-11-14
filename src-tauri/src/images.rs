@@ -9,10 +9,7 @@
 //! - 上游回 404 的图按「API 根 + 文件名」记 [`MISS_TTL`]，期间直接回 404 不再向上游要（有的服务器列表里给了 Logo 的 tag，
 //!   图本身却不存在，不记的话首页轮播每转一圈都要取一次）；改地址后重新取，清理图片缓存时作废。
 //! - 只从已配置的服务器取图（路径里是服务器 id，不是地址），不是通用转发。
-//! - 诊断数据：按上游、图片类型每 30 秒汇总一条 `img`（张数、命中、记着的 404、失败与状态码、排队 / 下载耗时分桶、缩图前后字节）。
 
-use crate::telemetry;
-use serde_json::json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +21,6 @@ pub const SCHEME: &str = "emby-img";
 /// 磁盘缓存上限。海报（240–480 px）一张 20–60 KB，背景图（1600 px）一张 200–400 KB，1 GB 够存几万张。
 pub const CAP: u64 = 1024 * 1024 * 1024;
 const PARALLEL: usize = 8;
-const STATS_EVERY: Duration = Duration::from_secs(30);
 /// 上游 404 的图多久内不再取。
 const MISS_TTL: Duration = Duration::from_secs(30 * 60);
 
@@ -150,43 +146,6 @@ pub fn downsample(bytes: Vec<u8>, width: u32) -> Vec<u8> {
 /// 一次取图的结果：图片字节，或者给界面的 HTTP 状态码。
 type Got = Result<Arc<Vec<u8>>, u16>;
 
-/// 耗时分桶的上界（毫秒）：第 k 桶是 `[BOUNDS[k-1], BOUNDS[k])`，最后一桶是 30 秒以上。
-/// 上报分桶计数而不是分位数：分桶可以跨时间段相加，分位数不行。报表按同一组边界解读，不能改。
-pub const BOUNDS: [u32; 9] = [50, 100, 200, 500, 1000, 2000, 5000, 10000, 30000];
-
-fn bucket(ms: u64) -> usize {
-    BOUNDS
-        .iter()
-        .position(|&b| ms < u64::from(b))
-        .unwrap_or(BOUNDS.len())
-}
-
-/// 一次未命中、由自己向上游取的图：等并发名额、下载 + 缩图各多久，上游给了多少字节。
-struct Fetched {
-    wait_ms: u64,
-    fetch_ms: u64,
-    up_bytes: usize,
-}
-
-/// 30 秒内某个上游、某类图（Primary / Backdrop / Logo …）的汇总。
-#[derive(Default)]
-struct Stats {
-    n: u64,
-    hit: u64,
-    /// 同一张图正被别的请求取，等它的结果（不算一次上游请求）。
-    shared: u64,
-    /// 记着的上游 404（[`MISS_TTL`] 内），直接回 404、没问上游。
-    miss: u64,
-    fail: u64,
-    fail_st: std::collections::BTreeMap<u16, u64>,
-    /// 存进缓存 / 给界面的字节（缩图后）。
-    bytes: u64,
-    /// 上游给的原始字节：远大于 `bytes` 说明上游不理会 maxWidth、给了原图。
-    up_bytes: u64,
-    wait: [u64; BOUNDS.len() + 1],
-    fetch: [u64; BOUNDS.len() + 1],
-}
-
 pub struct Images {
     dir: PathBuf,
     cap: u64,
@@ -197,7 +156,6 @@ pub struct Images {
     /// 第一项是清理次数：清理前发出的请求晚到的 404 不再记（否则清理后又被记上 30 分钟）。
     missing: Mutex<(u64, HashMap<String, Instant>)>,
     total: AtomicU64,
-    stats: Mutex<HashMap<(String, String), Stats>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -215,11 +173,10 @@ impl Images {
             inflight: Mutex::new(HashMap::new()),
             missing: Mutex::new((0, HashMap::new())),
             total: AtomicU64::new(0),
-            stats: Mutex::new(HashMap::new()),
         })
     }
 
-    /// 后台任务：统计现有缓存大小（启动时）、按上游定时汇总诊断数据。
+    /// 后台任务：统计现有缓存大小（启动时）。
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -227,25 +184,15 @@ impl Images {
             me.total.store(total, Ordering::Relaxed);
             me.trim();
         });
-        let me = self.clone();
-        tauri::async_runtime::spawn(async move {
-            let mut t = tokio::time::interval(STATS_EVERY);
-            loop {
-                t.tick().await;
-                me.flush_stats();
-            }
-        });
     }
 
     /// 取一张图：磁盘缓存 → 上游。`api_base` 是这台服务器的 API 根（找不到服务器时调用方直接回 404）。
-    pub async fn get(&self, req: &Req, api_base: &str, srv: &str) -> Got {
+    pub async fn get(&self, req: &Req, api_base: &str) -> Got {
         let key = req.file_name();
         let miss_key = format!("{api_base} {key}");
         let epoch = {
             let m = lock(&self.missing);
             if m.1.get(&miss_key).is_some_and(|t| t.elapsed() < MISS_TTL) {
-                drop(m);
-                self.note(srv, &req.kind, |s| s.miss += 1);
                 return Err(404);
             }
             m.0
@@ -257,36 +204,18 @@ impl Images {
                 .write(true)
                 .open(&path)
                 .and_then(|f| f.set_modified(SystemTime::now()));
-            self.note(srv, &req.kind, |s| {
-                s.hit += 1;
-                s.bytes += b.len() as u64;
-            });
             return Ok(Arc::new(b));
         }
         let cell = lock(&self.inflight).entry(key.clone()).or_default().clone();
-        let mut fetched = None; // 只有真正向上游取的那个请求才有
         let got = cell
             .get_or_init(|| async {
                 let width = req.width;
-                let t0 = Instant::now();
-                let mut wait_ms = 0;
-                let r = match self.fetch(&req.upstream(api_base), &mut wait_ms).await {
-                    Ok(b) => {
-                        let up_bytes = b.len();
-                        // 解码、缩放是 CPU 活，不占异步线程
-                        let r = tokio::task::spawn_blocking(move || downsample(b, width))
-                            .await
-                            .map(Arc::new)
-                            .map_err(|_| 500u16);
-                        fetched = Some(Fetched {
-                            wait_ms,
-                            fetch_ms: (t0.elapsed().as_millis() as u64).saturating_sub(wait_ms),
-                            up_bytes,
-                        });
-                        r
-                    }
-                    Err(s) => Err(s),
-                };
+                let b = self.fetch(&req.upstream(api_base)).await?;
+                // 解码、缩放是 CPU 活，不占异步线程
+                let r = tokio::task::spawn_blocking(move || downsample(b, width))
+                    .await
+                    .map(Arc::new)
+                    .map_err(|_| 500u16);
                 if let Ok(b) = &r {
                     self.store(&path, b).await;
                 }
@@ -302,33 +231,15 @@ impl Images {
                 m.1.insert(miss_key, Instant::now());
             }
         }
-        self.note(srv, &req.kind, |s| match (&got, &fetched) {
-            (Err(st), _) => {
-                s.fail += 1;
-                *s.fail_st.entry(*st).or_default() += 1;
-            }
-            (Ok(b), Some(f)) => {
-                s.bytes += b.len() as u64;
-                s.up_bytes += f.up_bytes as u64;
-                s.wait[bucket(f.wait_ms)] += 1;
-                s.fetch[bucket(f.fetch_ms)] += 1;
-            }
-            (Ok(b), None) => {
-                s.shared += 1;
-                s.bytes += b.len() as u64;
-            }
-        });
         got
     }
 
-    /// 向上游取原始字节；`wait_ms` 填上等并发名额花了多久。失败返回状态码（网络错误算 502），原样回给界面。
-    async fn fetch(&self, url: &str, wait_ms: &mut u64) -> Result<Vec<u8>, u16> {
+    /// 向上游取原始字节。失败返回状态码（网络错误算 502），原样回给界面。
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, u16> {
         // 暂时性失败按 crate::status 的规则重试；等重试时先让出名额，不让几张限流的图堵住整页
         let mut n = 0;
         loop {
-            let t0 = Instant::now();
             let slot = self.slots.acquire().await.map_err(|_| 503u16)?;
-            *wait_ms += t0.elapsed().as_millis() as u64;
             let sent = self.http.get(url).send().await;
             match crate::status::retry_wait(&sent, true) {
                 Some(wait) if n < crate::status::RETRIES => {
@@ -382,33 +293,6 @@ impl Images {
         }
         self.trim();
     }
-
-    /// 记一张图（诊断数据关着时什么都不做）。
-    fn note(&self, srv: &str, kind: &str, f: impl FnOnce(&mut Stats)) {
-        if !telemetry::enabled() {
-            return;
-        }
-        let mut stats = lock(&self.stats);
-        let s = stats.entry((srv.to_owned(), kind.to_owned())).or_default();
-        s.n += 1;
-        f(s);
-    }
-
-    fn flush_stats(&self) {
-        let all = std::mem::take(&mut *lock(&self.stats));
-        for ((srv, kind), s) in all {
-            telemetry::rec("img", stats_json(&srv, &kind, &s));
-        }
-    }
-}
-
-/// 一条 `img` 记录：`wait` / `fetch` 是按 [`BOUNDS`] 分桶的张数（只算自己向上游取的），`fail_st` 是失败的状态码计数。
-fn stats_json(srv: &str, kind: &str, s: &Stats) -> serde_json::Value {
-    json!({
-        "srv": srv, "kind": kind, "n": s.n, "hit": s.hit, "shared": s.shared, "miss": s.miss, "fail": s.fail,
-        "fail_st": s.fail_st.iter().map(|(k, v)| (k.to_string(), *v)).collect::<HashMap<_, _>>(),
-        "kb": s.bytes / 1024, "up_kb": s.up_bytes / 1024, "wait": s.wait, "fetch": s.fetch,
-    })
 }
 
 /// 目录超过 `cap` 时按最近使用时间（修改时间，命中时刷新）删最旧的，删到上限的 90%（留出余量，不至于每存一个就删一次）。
@@ -461,34 +345,6 @@ pub fn response(got: Got) -> tauri::http::Response<Vec<u8>> {
 #[cfg(test)]
 mod tests {
 
-    /// 耗时分桶的边界；一条 img 记录的字段（报表按这些字段解读）。
-    #[test]
-    fn stats_buckets_and_record() {
-        assert_eq!(bucket(0), 0);
-        assert_eq!(bucket(49), 0);
-        assert_eq!(bucket(50), 1);
-        assert_eq!(bucket(29_999), 8);
-        assert_eq!(bucket(30_000), 9);
-        let mut s = Stats {
-            n: 3,
-            hit: 1,
-            fail: 1,
-            bytes: 2048,
-            up_bytes: 10240,
-            ..Default::default()
-        };
-        s.fail_st.insert(403, 1);
-        s.wait[bucket(10)] += 1;
-        s.fetch[bucket(2500)] += 1;
-        let v = stats_json("s1", "Primary", &s);
-        assert_eq!(v["kind"], "Primary");
-        assert_eq!(v["fail_st"]["403"], 1);
-        assert_eq!(v["kb"], 2);
-        assert_eq!(v["up_kb"], 10);
-        assert_eq!(v["wait"][0], 1);
-        assert_eq!(v["fetch"][6], 1);
-        assert_eq!(v["fetch"].as_array().unwrap().len(), BOUNDS.len() + 1);
-    }
     use super::*;
 
     #[test]
@@ -618,26 +474,23 @@ mod tests {
                 .all(|r| r.as_ref().unwrap().as_slice() == b"\x89PNG")
         );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "并发的同一张图只取一次");
-        assert_eq!(
-            img.get(&req, &base, "x").await.unwrap().as_slice(),
-            b"\x89PNG"
-        );
+        assert_eq!(img.get(&req, &base).await.unwrap().as_slice(), b"\x89PNG");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "第二次从磁盘出");
         let missing = Req::parse("s/404/Primary/0/t/240").unwrap();
-        assert_eq!(img.get(&missing, &base, "x").await, Err(404));
+        assert_eq!(img.get(&missing, &base).await, Err(404));
         assert!(!dir.join(missing.file_name()).exists(), "失败的不落盘");
         let before = hits.load(Ordering::SeqCst);
-        assert_eq!(img.get(&missing, &base, "x").await, Err(404));
+        assert_eq!(img.get(&missing, &base).await, Err(404));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before,
             "404 记住了，不再向上游要"
         );
         img.clear();
-        assert_eq!(img.get(&missing, &base, "x").await, Err(404));
+        assert_eq!(img.get(&missing, &base).await, Err(404));
         assert_eq!(hits.load(Ordering::SeqCst), before + 1, "清空缓存后重新取");
         let other = base.replace("/emby", "/emby2");
-        assert_eq!(img.get(&missing, &other, "x").await, Err(404));
+        assert_eq!(img.get(&missing, &other).await, Err(404));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 2,
@@ -647,13 +500,13 @@ mod tests {
         let gone = Req::parse("s/404/Logo/0/t/240").unwrap();
         let t = {
             let (img, base) = (img.clone(), base.clone());
-            tokio::spawn(async move { img.get(&gone, &base, "x").await })
+            tokio::spawn(async move { img.get(&gone, &base).await })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         img.clear();
         assert_eq!(t.await.unwrap(), Err(404));
         let gone = Req::parse("s/404/Logo/0/t/240").unwrap();
-        assert_eq!(img.get(&gone, &base, "x").await, Err(404));
+        assert_eq!(img.get(&gone, &base).await, Err(404));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 4,
@@ -672,7 +525,7 @@ mod tests {
                     req.server, req.item, req.kind, req.index, req.tag, req.width
                 ))
                 .unwrap();
-                tokio::spawn(async move { img.get(&req, &base, "x").await })
+                tokio::spawn(async move { img.get(&req, &base).await })
             })
             .collect();
         for t in tasks {

@@ -23,8 +23,7 @@ dunce = "1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tauri-plugin-updater = "2"
-flate2 = "1"
-sysinfo = { version = "0.38", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.38", default-features = false, features = ["disk"] }
 # 本地缓存代理（stream.rs）：树里本来就有，只打开服务端
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

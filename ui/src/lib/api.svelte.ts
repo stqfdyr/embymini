@@ -3,15 +3,13 @@ import { untrack } from 'svelte'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
 import type { MenuItem } from './menu.svelte'
-import { op, pageFresh, pageSnap, setTel } from './tel'
 import { readSnap, writeSnap } from './snap'
 import type { Item, Page } from './types'
 
-export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; tag: string; loggedIn: boolean }
+export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; loggedIn: boolean }
 export type ConfigView = {
   active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string
   updateProxy: string | null; cacheWhole: boolean; danmakuApi: string; danmakuWords: string[]; version: string
-  telemetryAvailable: boolean; telemetry: boolean; telemetryName: string; startMs: number
 }
 export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }
 
@@ -59,7 +57,6 @@ export async function loadConfig() {
   const c = await invoke<ConfigView>('config_get')
   session.cfg = c
   session.server = c.servers.find((s) => s.id === c.active) ?? null
-  setTel(c.telemetry, c.startMs)
   cache.clear()
   seen.clear()
 }
@@ -91,19 +88,13 @@ export function loader<T>(fn: () => Promise<T>, key?: () => string) {
   $effect(() => {
     let alive = true
     const k = key && snapKey(key())
-    let fromSnap = false
     if (k && untrack(() => s.data) === undefined) {
       const snap = readSnap<T>(k)
-      if (snap !== undefined) {
-        s.data = snap
-        fromSnap = true
-        pageSnap()
-      }
+      if (snap !== undefined) s.data = snap
     }
     fn().then(
       (d) => {
         if (!alive) return
-        if (fromSnap) pageFresh()
         s.data = d
         s.error = undefined
         if (k) writeSnap(k, d)
@@ -165,14 +156,12 @@ export function send(method: 'POST' | 'DELETE', path: string, query?: Record<str
 
 /** 收藏 / 已看：成功后后台刷新；失败（上游 502 之类）弹提示，不能点了没反应。 */
 const mark = (kind: 'FavoriteItems' | 'PlayedItems', what: string) => (id: string, on: boolean) => {
-  op(`${kind}:${on}`)
   return send(on ? 'POST' : 'DELETE', `/Users/${uid()}/${kind}/${id}`).then(refreshQuiet, (e) => notify(`${what}失败：${errText(e)}`))
 }
 export const setFavorite = mark('FavoriteItems', '收藏')
 export const setPlayed = mark('PlayedItems', '标记已看')
 /** 从「继续观看」移除（服务端 HideFromResume，进度保留），提示条里可撤销。 */
 function hideResume(it: Item, hide = true): Promise<unknown> {
-  op(hide ? 'hide_resume' : 'hide_resume_undo')
   return send('POST', `/Users/${uid()}/Items/${it.Id}/HideFromResume`, { Hide: hide }).then(
     () => {
       refreshQuiet()
@@ -186,7 +175,6 @@ export const resumeMenu = (it: Item): MenuItem[] => [...itemMenu(it), 'sep', { l
 /** 起播。出错（服务器拒绝、找不到 mpv 等）直接弹提示；加载失败由播放事件 failed 另行提示。
  *  `sourceId`：多版本（1080p / 4K 等）时详情页选的那个，不给就用服务器排的第一个。 */
 export function play(itemId: string, fromStart = false, sourceId?: string) {
-  op(fromStart ? 'play_from_start' : 'play')
   return invoke('play', { itemId, fromStart, sourceId: sourceId ?? null }).catch((e: ApiError) => {
     if (e?.kind === 'unauthorized') onUnauthorized()
     notify(`播放失败：${errText(e)}`)
@@ -232,7 +220,6 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
       const p = await get<Page>(`/Users/${uid()}/Items`, { ...q, StartIndex: start, Limit: size })
       if (mine !== gen) return
       if (start === 0) {
-        if (fromSnap) pageFresh()
         s.items = p.Items
         fromSnap = false
         writeSnap(key(), { items: p.Items, total: p.TotalRecordCount })
@@ -253,7 +240,6 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
     gen++
     const snap = readSnap<{ items: Item[]; total: number }>(key())
     fromSnap = !!snap
-    if (snap) pageSnap()
     Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap })
     untrack(more)
   })

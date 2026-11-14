@@ -10,14 +10,13 @@
 use crate::danmaku::{self, Fail as DmFail};
 use crate::emby::{self, Emby, Error, Item, MediaStream, NO_QUERY};
 use crate::stream::Stream;
-use crate::telemetry;
 use reqwest::Method;
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -316,8 +315,6 @@ struct Ready {
     aid: Track,
     sid: Track,
     streams: Vec<MediaStream>,
-    /// 片源信息（容器、码率、大小、视频编码），诊断数据的起播 / 换集记录带上，按片子分析慢在哪。
-    media: Map<String, Value>,
 }
 
 async fn prepare(emby: &Emby, item: &Item) -> Result<Ready, Error> {
@@ -366,7 +363,6 @@ fn ready(emby: &Emby, item: &Item, info: emby::PlaybackInfo) -> Result<Ready, Er
             "Subtitle",
             src.default_subtitle_stream_index,
         ),
-        media: media_info(&src),
         source_id: src.id,
         session_id: info.play_session_id,
         subs,
@@ -391,50 +387,6 @@ fn cache_name(parts: &[&str]) -> String {
         })
         .collect::<Vec<_>>()
         .join("_")
-}
-
-/// mpv 警告日志去掉会泄露或打散去重的内容：URL（含条目 id、token 之外的路径）换成 `<url>`，数字换成 `#`
-/// （字节偏移、秒数每次都不一样，不换的话同一种警告去不了重），最长 200 字。
-fn scrub_log(text: &str) -> String {
-    let mut out = String::new();
-    for (k, word) in text.split(' ').enumerate() {
-        if k > 0 {
-            out.push(' ');
-        }
-        if word.contains("://") {
-            out.push_str("<url>");
-            continue;
-        }
-        let mut last_hash = false;
-        for ch in word.chars() {
-            if ch.is_ascii_digit() {
-                if !last_hash {
-                    out.push('#');
-                }
-                last_hash = true;
-            } else {
-                out.push(ch);
-                last_hash = false;
-            }
-        }
-    }
-    out.chars().take(200).collect()
-}
-
-fn media_info(src: &emby::MediaSource) -> Map<String, Value> {
-    let video = src.media_streams.iter().find(|s| s.kind == "Video");
-    Map::from_iter([
-        ("container".to_owned(), json!(src.container)),
-        (
-            "mbps".to_owned(),
-            json!(src.bitrate.map(|b| (b as f64 / 1e5).round() / 10.0)),
-        ),
-        ("mb".to_owned(), json!(src.size.map(|b| b >> 20))),
-        (
-            "vcodec".to_owned(),
-            json!(video.and_then(|v| v.codec.clone())),
-        ),
-    ])
 }
 
 struct Entry {
@@ -498,8 +450,6 @@ pub struct Session {
     preload: f64,
     stream: Option<Stream>,
     danmaku: Option<danmaku::Ctx>,
-    /// 点播放的时刻和起播各阶段耗时（诊断数据，首帧出来时记一条 `play`）。
-    timeline: (Instant, Map<String, Value>),
 }
 
 /// 启动 mpv（窗口立刻出来），同时建队列（剧集 = 本集所在整季）、准备首集，再连上 IPC。出错直接返回给界面。
@@ -511,8 +461,6 @@ pub async fn start(
     from_start: bool,
     opts: Options,
 ) -> Result<Session, Error> {
-    let t0 = Instant::now();
-    let ms = move || t0.elapsed().as_millis() as u64;
     let ipc = ipc_path();
     let args = mpv_args(&opts, &ipc);
     // 参数里只有路径和开关，没有 token（token 在缓存代理里，没有代理时经 IPC 设置），可以整串记日志
@@ -538,14 +486,12 @@ pub async fn start(
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::Other(format!("无法启动 mpv（{}）：{e}", opts.mpv.display())))?;
-    let spawn_ms = ms();
 
     let queue = async {
         // 条目和 PlaybackInfo 只依赖 id，并行取；单集列表要等条目里的剧 / 季 id
         let (item, info) =
             tokio::try_join!(emby.item(item_id), emby.playback_info(item_id, source))?;
         let first = ready(&emby, &item, info)?;
-        let info_ms = ms();
         let mut items = Vec::new();
         if let (true, Some(series), Some(season)) =
             (item.kind == "Episode", &item.series_id, &item.season_id)
@@ -577,14 +523,10 @@ pub async fn start(
         if !from_start {
             queue[at].start = item.user_data.playback_position_ticks as f64 / TICKS_PER_SEC;
         }
-        Ok::<_, Error>((queue, at, info_ms))
+        Ok::<_, Error>((queue, at))
     };
-    let ipc_done = async {
-        let r = connect(&ipc, &mut child).await;
-        (r, ms())
-    };
-    let (queue, (io, ipc_ms)) = tokio::join!(queue, ipc_done);
-    let ((queue, at, info_ms), io) = match (queue, io) {
+    let (queue, io) = tokio::join!(queue, connect(&ipc, &mut child));
+    let ((queue, at), io) = match (queue, io) {
         (Ok(q), Ok(io)) => (q, io),
         (Err(e), _) | (_, Err(e)) => {
             let _ = child.kill().await;
@@ -607,15 +549,6 @@ pub async fn start(
         preload: opts.preload_percent,
         stream: opts.stream,
         danmaku: opts.danmaku,
-        timeline: (
-            t0,
-            Map::from_iter([
-                ("spawn_ms".to_owned(), spawn_ms.into()),
-                ("info_ms".to_owned(), info_ms.into()),
-                ("ipc_ms".to_owned(), ipc_ms.into()),
-                ("from_start".to_owned(), from_start.into()),
-            ]),
-        ),
     })
 }
 
@@ -642,7 +575,6 @@ impl Session {
             preload,
             stream,
             danmaku,
-            timeline,
         } = self;
         let (rd, wr) = tokio::io::split(io);
         let mut lines = BufReader::new(rd).lines();
@@ -650,10 +582,7 @@ impl Session {
         let (prepared, mut prepared_rx) = mpsc::unbounded_channel();
         let (dm_tx, mut dm_rx) = mpsc::unbounded_channel();
         let mut st = State::new(emby, queue, wr, events, preload, reports, prepared);
-        st.tel.on = telemetry::enabled();
-        st.tel.first = Some(timeline);
         st.up_seen = stream.as_ref().map_or(0, Stream::up_bytes);
-        st.tel.up_minute = st.up_seen;
         st.stream = stream;
         st.dm = danmaku.map(|ctx| Dm {
             ctx,
@@ -663,7 +592,6 @@ impl Session {
             told: false,
             init: false,
         });
-        let tel_on = st.tel.on;
 
         // 没有缓存代理时 mpv 直连上游：token 走请求头，不进 URL（见 emby::strip_key）；要在第一次 loadfile 之前设好
         if st.stream.is_none() {
@@ -686,21 +614,14 @@ impl Session {
             "sid",
         ]
         .into_iter()
-        .chain(TEL_PROPS.iter().copied().filter(|_| tel_on))
         .enumerate()
         {
             st.send(json!(["observe_property", id + 1, name])).await;
-        }
-        if tel_on {
-            // ffmpeg / 拉流的警告（HTTP 错误、重连）：查卡顿和起播慢的原因
-            st.send(json!(["request_log_messages", "warn"])).await;
         }
         st.load(at, "append-play").await;
 
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut minute =
-            tokio::time::interval_at(tokio::time::Instant::now() + TEL_EVERY, TEL_EVERY);
         let mut second = tokio::time::interval(Duration::from_secs(1));
         let mut ctl_open = true;
         let mut quit_sent = false;
@@ -723,7 +644,6 @@ impl Session {
                 Some((i, after, r)) = prepared_rx.recv() => st.on_prepared(i, after, r).await,
                 Some(m) = dm_rx.recv() => st.on_dm_result(m).await,
                 _ = tick.tick() => st.progress("TimeUpdate"),
-                _ = minute.tick(), if st.tel.on => st.probe_minute().await,
                 _ = second.tick(), if st.stream.is_some() => st.send_speed().await,
             }
         }
@@ -731,7 +651,7 @@ impl Session {
             st.stop(i); // mpv 被直接关掉、没来得及发 end-file 时补发
         }
         let status = child.wait().await;
-        crate::lifecycle::exit_mark("mpv_exited");
+        crate::exit_mark("mpv_exited");
         if let Some(s) = &st.stream {
             let names: Vec<String> = st
                 .queue
@@ -741,9 +661,6 @@ impl Session {
             s.idle(&names);
         }
         let code = status.as_ref().ok().and_then(|s| s.code());
-        if st.tel.on {
-            telemetry::rec("mpv_exit", json!({ "srv": st.emby.tag, "code": code }));
-        }
         // 一集都没播起来 mpv 就异常退出（显卡初始化失败、崩溃），又不是我们叫它退的：告诉界面，不能悄无声息
         if !quit_sent
             && !st.failed_sent
@@ -775,7 +692,7 @@ impl Session {
         } = st;
         drop(reports);
         let _ = reporter.await;
-        crate::lifecycle::exit_mark("reported");
+        crate::exit_mark("reported");
         log::info!("播放结束");
         let _ = events.send(Event::Ended { volume });
     }
@@ -838,97 +755,6 @@ struct State {
     dm: Option<Dm>,
     /// 上次看到的缓存代理上游总字节（顶栏网速按它算差）。
     up_seen: u64,
-    tel: Tel,
-}
-
-/// 诊断数据（开了才有）要多订阅的属性：缓冲卡顿、缓存秒数、下载速度。
-const TEL_PROPS: &[&str] = &[
-    "paused-for-cache",
-    "demuxer-cache-duration",
-    "cache-speed",
-    "demuxer-cache-idle",
-];
-/// 每隔这么久记一条丢帧与下载速度的汇总。
-const TEL_EVERY: Duration = Duration::from_secs(60);
-/// 开播后取一次的解码 / 渲染信息。
-const RENDER_PROPS: &[&str] = &[
-    "mpv-version",
-    "hwdec-current",
-    "current-gpu-context",
-    "current-vo",
-    "video-codec",
-    "video-params",
-    "container-fps",
-    "display-fps",
-];
-/// 每分钟取一次、记增量的计数器（排查拖动窗口发卡、掉帧）；`vsync-jitter` 记当时的值。
-const FRAME_PROPS: &[&str] = &[
-    "frame-drop-count",
-    "decoder-frame-drop-count",
-    "mistimed-frame-count",
-    "vo-delayed-frame-count",
-    "vsync-jitter",
-];
-
-/// 每分钟汇总：计数器记和上一分钟的差（`vsync-jitter` 记当时的值），下载速度记本分钟正在读数据时的最小 / 平均 / 最大（KB/s，
-/// 这一分钟没读就没有 `kbps`），重连次数。
-fn minute_summary(tel: &mut Tel, data: Map<String, Value>) -> Value {
-    let mut out = Map::new();
-    for (k, v) in &data {
-        // 换集那一刻取不到值（null）：这一项这分钟不记
-        let Some(now) = v.as_f64() else { continue };
-        let prev = tel.last_frames.get(k).and_then(Value::as_f64);
-        let d = match prev {
-            // 计数器每集从 0 开始（换集时清了 last_frames）；比上次小说明中途清零了，记当前值
-            Some(p) if k != "vsync-jitter" && now >= p => now - p,
-            _ => now,
-        };
-        out.insert(k.clone(), json!(d));
-    }
-    tel.last_frames = data.into_iter().filter(|(_, v)| v.is_number()).collect();
-    out.insert(
-        "reconnects".into(),
-        json!(std::mem::take(&mut tel.reconnects)),
-    );
-    let sp = std::mem::take(&mut tel.speeds);
-    if !sp.is_empty() {
-        let kb = |x: f64| (x / 1024.0).round();
-        let min = sp.iter().copied().fold(f64::MAX, f64::min);
-        let max = sp.iter().copied().fold(0.0, f64::max);
-        let avg = sp.iter().sum::<f64>() / sp.len() as f64;
-        out.insert("kbps".into(), json!([kb(min), kb(avg), kb(max)]));
-    }
-    out.insert("cache_s".into(), json!(tel.cache_s.round()));
-    Value::Object(out)
-}
-
-/// 播放相关的诊断数据状态。每条记录都带上游标识 `srv`：不同上游、不同线路的表现分开统计。
-#[derive(Default)]
-struct Tel {
-    on: bool,
-    /// 首次起播：点播放的时刻 + 已有阶段；首帧（第一次 playback-restart）时记 `play`。
-    first: Option<(Instant, Map<String, Value>)>,
-    /// 换集：发起时刻 + 已有字段（cause = next / prev / menu / auto，api_ready = 不用等接口，queued = 已在 mpv 列表里，
-    /// file-loaded 时补 loaded_ms）；首帧时记 `switch`。
-    switch: Option<(Instant, Map<String, Value>)>,
-    /// seek：第一次 seek 的时刻、当时的位置和缓存秒数；之后的首帧（playback-restart）记 `seek`。连续拖动只算一次。
-    seek: Option<(Instant, f64, f64)>,
-    stall: Option<Instant>,
-    /// mpv 正在读数据（`demuxer-cache-idle` = no）。不读时 `cache-speed` 停在旧值，那时的采样不算。
-    reading: bool,
-    /// 本分钟 ffmpeg 报的重连次数（mpv 警告日志里的 reconnect）。
-    reconnects: u32,
-    /// 这一集加载完了、还没取解码 / 渲染信息：等首帧再取（`file-loaded` 时解码器还没建，`hwdec-current` 是空的）。
-    render_due: bool,
-    cache_s: f64,
-    /// 本分钟的下载速度采样（字节 / 秒）。经缓存代理时这是 mpv 从代理读的速度，上游速度另记 `up_kb`。
-    speeds: Vec<f64>,
-    /// 上一分钟结束时缓存代理的上游总字节。
-    up_minute: u64,
-    /// get_property 的 request_id → (哪一组, 属性名)；一组凑齐后一起记。
-    probes: HashMap<u64, (&'static str, &'static str)>,
-    probe_data: HashMap<&'static str, (usize, Map<String, Value>)>,
-    last_frames: Map<String, Value>,
 }
 
 impl State {
@@ -966,94 +792,7 @@ impl State {
             stream: None,
             dm: None,
             up_seen: 0,
-            tel: Tel::default(),
         }
-    }
-
-    /// 记一条播放诊断数据，补上上游标识和当前条目。
-    fn tel_rec(&self, k: &str, mut v: Value) {
-        if let Some(m) = v.as_object_mut() {
-            m.insert("srv".into(), self.emby.tag.clone().into());
-            if let Some(i) = self.cur {
-                m.insert("item".into(), self.queue[i].item.id.clone().into());
-            }
-        }
-        telemetry::rec(k, v);
-    }
-
-    /// 发一组 get_property，回包凑齐后由 [`Self::on_probe`] 记一条。
-    async fn probe(&mut self, tag: &'static str, props: &'static [&'static str]) {
-        self.tel.probe_data.insert(tag, (props.len(), Map::new()));
-        for p in props {
-            let rid = self.send(json!(["get_property", p])).await;
-            self.tel.probes.insert(rid, (tag, p));
-        }
-    }
-
-    async fn probe_minute(&mut self) {
-        if self.cur.is_some() && !self.paused {
-            self.probe("minute", FRAME_PROPS).await;
-        }
-    }
-
-    fn on_probe(&mut self, tag: &'static str, prop: &'static str, v: Value) {
-        let Some((left, data)) = self.tel.probe_data.get_mut(tag) else {
-            return;
-        };
-        data.insert(prop.into(), v);
-        *left -= 1;
-        if *left > 0 {
-            return;
-        }
-        let Some((_, data)) = self.tel.probe_data.remove(tag) else {
-            return;
-        };
-        match tag {
-            "render" => {
-                let mut data = data;
-                // video-params 有 30 多项，只留分辨率、像素格式和看 HDR 用的几项
-                if let Some(Value::Object(vp)) = data.get_mut("video-params") {
-                    vp.retain(|k, _| {
-                        ["w", "h", "pixelformat", "gamma", "primaries", "sig-peak"]
-                            .contains(&k.as_str())
-                    });
-                }
-                self.tel_rec("render", Value::Object(data))
-            }
-            _ => {
-                let mut out = minute_summary(&mut self.tel, data);
-                if let Some(s) = &self.stream {
-                    let up = s.up_bytes();
-                    let d = up.saturating_sub(std::mem::replace(&mut self.tel.up_minute, up));
-                    out["up_kb"] = json!(d >> 10);
-                }
-                self.tel_rec("pmin", out);
-            }
-        }
-    }
-
-    /// 换集（next / prev / menu / auto）：记下发起时刻和目标集的状态，首帧出来时记耗时。
-    fn tel_switch(&mut self, to: usize, cause: &'static str) {
-        if self.tel.on {
-            let e = &self.queue[to];
-            let m = Map::from_iter([
-                ("cause".to_owned(), json!(cause)),
-                (
-                    "api_ready".to_owned(),
-                    json!(e.loaded || (e.ready.is_some() && !e.stopped)),
-                ),
-                ("queued".to_owned(), json!(e.loaded)),
-            ]);
-            self.tel.switch = Some((Instant::now(), m));
-        }
-    }
-
-    /// 当前这一集的片源信息（还没准备好时为空）。
-    fn media(&self) -> Map<String, Value> {
-        self.cur
-            .and_then(|i| self.queue[i].ready.as_ref())
-            .map(|r| r.media.clone())
-            .unwrap_or_default()
     }
 
     async fn send(&mut self, cmd: Value) -> u64 {
@@ -1195,13 +934,6 @@ impl State {
 
     async fn on_message(&mut self, v: Value) {
         let Some(ev) = v["event"].as_str() else {
-            if let Some((tag, prop)) = v["request_id"]
-                .as_u64()
-                .and_then(|rid| self.tel.probes.remove(&rid))
-            {
-                self.on_probe(tag, prop, v["data"].clone());
-                return;
-            }
             if let Some(i) = v["request_id"]
                 .as_u64()
                 .and_then(|rid| self.pending.remove(&rid))
@@ -1251,12 +983,6 @@ impl State {
                     self.dur = 0.0;
                     self.sync_next_ready().await;
                     self.keep_cache();
-                    // 播完自动进下一集（不是用户点的）也算一次换集
-                    if self.tel.on && self.tel.first.is_none() && self.tel.switch.is_none() {
-                        self.tel_switch(i, "auto");
-                    }
-                    self.tel.last_frames.clear(); // 丢帧类计数器每集从 0 开始
-                    self.tel.seek = None;
                 }
             }
             "file-loaded" => {
@@ -1264,15 +990,6 @@ impl State {
                     // 真正加载出来才算开播；没加载出来的不回传 Playing / Stopped
                     self.queue[i].started = true;
                     self.apply_tracks(i).await;
-                    if self.tel.on {
-                        if let Some((t0, m)) = &mut self.tel.first {
-                            m.insert("loaded_ms".into(), (t0.elapsed().as_millis() as u64).into());
-                        }
-                        if let Some((t0, m)) = &mut self.tel.switch {
-                            m.insert("loaded_ms".into(), (t0.elapsed().as_millis() as u64).into());
-                        }
-                        self.tel.render_due = true;
-                    }
                     self.report(i, "", json!({}));
                     self.dm_show(i).await;
                     let _ = self.events.send(Event::Started {
@@ -1280,55 +997,7 @@ impl State {
                     });
                 }
             }
-            // 首帧（也会在 seek 后触发，只在等首帧时处理）
-            // 用户拖进度条 / 快进快退（换集、起播时的跳转不算，由 play / switch 记）
-            "seek"
-                if self.tel.on
-                    && self.tel.first.is_none()
-                    && self.tel.switch.is_none()
-                    && self.tel.seek.is_none() =>
-            {
-                self.tel.seek = Some((Instant::now(), self.pos, self.tel.cache_s));
-            }
-            "log-message" if self.tel.on => {
-                let text = v["text"].as_str().unwrap_or("").trim();
-                if text.to_ascii_lowercase().contains("reconnect") {
-                    self.tel.reconnects += 1;
-                }
-                let msg = scrub_log(text);
-                self.tel_rec(
-                    "mpv_log",
-                    json!({ "lvl": v["level"], "mod": v["prefix"], "msg": msg }),
-                );
-            }
-            "playback-restart" if self.tel.on => {
-                if std::mem::take(&mut self.tel.render_due) {
-                    self.probe("render", RENDER_PROPS).await;
-                }
-                if let Some((t0, mut m)) = self.tel.first.take() {
-                    m.insert("frame_ms".into(), (t0.elapsed().as_millis() as u64).into());
-                    m.extend(self.media());
-                    self.tel_rec("play", Value::Object(m));
-                } else if let Some((t0, mut m)) = self.tel.switch.take() {
-                    m.insert("ms".into(), (t0.elapsed().as_millis() as u64).into());
-                    m.extend(self.media());
-                    self.tel_rec("switch", Value::Object(m));
-                } else if let Some((t0, from, cache_s)) = self.tel.seek.take() {
-                    let ms = t0.elapsed().as_millis() as u64;
-                    let dist = (self.pos - from).round();
-                    self.tel_rec(
-                        "seek",
-                        json!({ "ms": ms, "dist": dist, "cache_s": cache_s.round() }),
-                    );
-                }
-            }
             "end-file" => {
-                if self.tel.on {
-                    self.tel_rec(
-                        "end",
-                        json!({ "reason": v["reason"], "err": v["file_error"], "pos": self.pos.round() }),
-                    );
-                }
                 if let Some(i) = entry {
                     if v["reason"] == "error" {
                         self.fail(i, v["file_error"].as_str().unwrap_or("未知错误"))
@@ -1347,7 +1016,6 @@ impl State {
             "client-message" if v["args"][0] == JUMP_MSG => {
                 let to = v["args"][1].as_str().and_then(|s| s.parse::<usize>().ok());
                 if let Some(i) = to.filter(|&i| i < self.queue.len() && Some(i) != self.cur) {
-                    self.tel_switch(i, "menu");
                     self.jump(i).await;
                 }
             }
@@ -1375,23 +1043,6 @@ impl State {
                 }
             }
             (Some("duration"), d) => self.dur = d.as_f64().unwrap_or(0.0),
-            (Some("paused-for-cache"), d) => match (d.as_bool(), self.tel.stall) {
-                (Some(true), None) => self.tel.stall = Some(Instant::now()),
-                (Some(false), Some(t0)) => {
-                    self.tel.stall = None;
-                    let ms = t0.elapsed().as_millis() as u64;
-                    let kbps = self.tel.speeds.last().map_or(0.0, |s| (s / 1024.0).round());
-                    self.tel_rec("stall", json!({ "ms": ms, "cache_s": self.tel.cache_s, "kbps": kbps, "pos": self.pos.round() }));
-                }
-                _ => {}
-            },
-            (Some("demuxer-cache-duration"), d) => self.tel.cache_s = d.as_f64().unwrap_or(0.0),
-            (Some("cache-speed"), d) => {
-                if let Some(x) = d.as_f64().filter(|_| self.tel.reading) {
-                    self.tel.speeds.push(x);
-                }
-            }
-            (Some("demuxer-cache-idle"), d) => self.tel.reading = *d == json!(false),
             (Some("volume"), d) => self.volume = d.as_f64().or(self.volume),
             // 只记「选好轨之后」的变化；换集卸载时的 null 不算（关字幕看 sid=no）
             (Some("current-tracks/audio"), d) if self.tracking() && d.is_object() => {
@@ -1424,7 +1075,6 @@ impl State {
             self.osd("没有下一集了").await;
             return;
         }
-        self.tel_switch(i + 1, "next");
         if self.queue[i + 1].loaded {
             self.send(json!(["playlist-next"])).await;
         } else {
@@ -1435,10 +1085,7 @@ impl State {
     async fn prev(&mut self) {
         match self.cur {
             Some(0) => self.osd("已经是第一集").await,
-            Some(i) => {
-                self.tel_switch(i - 1, "prev");
-                self.jump(i - 1).await;
-            }
+            Some(i) => self.jump(i - 1).await,
             None => {}
         }
     }
@@ -1832,6 +1479,7 @@ async fn connect(path: &Path, child: &mut Child) -> Result<Box<dyn Io>, Error> {
 mod tests {
     use super::*;
     use crate::emby::{MediaSource, PlaybackInfo, tests::fixture};
+    use std::time::Instant;
 
     #[test]
     fn tracks_from_real_playbackinfo() {
@@ -1987,7 +1635,6 @@ mod tests {
             aid: Track::Auto,
             sid: Track::Auto,
             streams: Vec::new(),
-            media: Map::from_iter([("container".to_owned(), json!("mkv"))]),
         }
     }
 
@@ -2150,141 +1797,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn minute_summary_reports_deltas_and_speed() {
-        let mut tel = Tel::default();
-        let m = |drop: f64, jitter: f64| {
-            Map::from_iter([
-                ("frame-drop-count".to_owned(), json!(drop)),
-                ("vsync-jitter".to_owned(), json!(jitter)),
-            ])
-        };
-        tel.speeds = vec![1024.0, 3072.0];
-        let first = minute_summary(&mut tel, m(5.0, 0.1));
-        assert_eq!(first["frame-drop-count"], json!(5.0));
-        assert_eq!(first["kbps"], json!([1.0, 2.0, 3.0]));
-        let second = minute_summary(&mut tel, m(12.0, 0.2));
-        assert_eq!(second["frame-drop-count"], json!(7.0));
-        assert_eq!(second["vsync-jitter"], json!(0.2));
-        assert!(second.get("kbps").is_none());
-    }
-
-    /// 每分钟汇总：计数器求差；换集清零后不出负数；取不到的值不记；下载速度只收正在读数据时的采样。
-    #[tokio::test]
-    async fn minute_summary_handles_resets_and_idle() {
-        let (mut st, _mpv, _ev) = offline_state(2);
-        st.tel.on = true;
-        let props = |drop: Value| {
-            Map::from_iter([
-                ("frame-drop-count".to_owned(), drop),
-                ("vsync-jitter".to_owned(), json!(0.05)),
-            ])
-        };
-        let v = minute_summary(&mut st.tel, props(json!(10)));
-        assert_eq!(v["frame-drop-count"], 10.0);
-        let v = minute_summary(&mut st.tel, props(json!(15)));
-        assert_eq!(v["frame-drop-count"], 5.0);
-        assert_eq!(v["vsync-jitter"], 0.05);
-        // 换集那一刻取不到：这一项不记，也不覆盖上次的值
-        let v = minute_summary(&mut st.tel, props(Value::Null));
-        assert!(v.get("frame-drop-count").is_none());
-        // 新的一集计数从 0 开始（start-file 时清 last_frames）
-        st.cur = Some(0);
-        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 1 }))
-            .await;
-        st.queue[1].entry_id = Some(2);
-        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 2 }))
-            .await;
-        let v = minute_summary(&mut st.tel, props(json!(3)));
-        assert_eq!(v["frame-drop-count"], 3.0);
-        // 下载速度：不在读的时候（cache-speed 停在旧值）不收
-        st.on_property(&json!({ "name": "demuxer-cache-idle", "data": true }))
-            .await;
-        st.on_property(&json!({ "name": "cache-speed", "data": 999_999 }))
-            .await;
-        st.on_property(&json!({ "name": "demuxer-cache-idle", "data": false }))
-            .await;
-        st.on_property(&json!({ "name": "cache-speed", "data": 2048 }))
-            .await;
-        st.on_message(json!({ "event": "log-message", "level": "warn", "prefix": "ffmpeg", "text": "Will reconnect at 123 in 0 second(s)" })).await;
-        let v = minute_summary(&mut st.tel, props(json!(3)));
-        assert_eq!(v["kbps"], json!([2.0, 2.0, 2.0]));
-        assert_eq!(v["reconnects"], 1);
-        let v = minute_summary(&mut st.tel, props(json!(3)));
-        assert!(v.get("kbps").is_none(), "这一分钟没读数据就没有 kbps");
-    }
-
-    /// mpv 警告去掉 URL、数字归一（同一种警告才能去重）。
-    #[test]
-    fn mpv_log_is_scrubbed() {
-        assert_eq!(
-            scrub_log("Will reconnect at 1048576 in 0 second(s), error=Connection reset."),
-            "Will reconnect at # in # second(s), error=Connection reset."
-        );
-        assert_eq!(
-            scrub_log("http: HTTP error 403 Forbidden https://h.example/emby/videos/1/stream?x=1"),
-            "http: HTTP error # Forbidden <url>"
-        );
-    }
-
-    /// seek：从 seek 事件到下一个首帧记一条；起播、换集期间的跳转不算；连续拖动只算一次。
-    #[tokio::test]
-    async fn seek_is_timed_until_playback_restart() {
-        let (mut st, mpv, _ev) = offline_state(2);
-        st.tel.on = true;
-        st.cur = Some(0);
-        st.tel.first = Some((Instant::now(), Map::new()));
-        st.on_message(json!({ "event": "seek" })).await; // 起播时的跳转
-        assert!(st.tel.seek.is_none());
-        st.on_message(json!({ "event": "playback-restart" })).await; // 记 play
-        st.pos = 100.0;
-        st.on_message(json!({ "event": "seek" })).await;
-        st.pos = 50.0;
-        st.on_message(json!({ "event": "seek" })).await; // 拖动中又一次：不重置起点
-        assert_eq!(st.tel.seek.as_ref().map(|s| s.1), Some(100.0));
-        st.pos = 400.0;
-        st.on_message(json!({ "event": "playback-restart" })).await;
-        assert!(st.tel.seek.is_none());
-        // 换集：带上 api_ready / queued 和片源信息
-        st.queue[1].ready = Some(ready_for("e1"));
-        st.tel_switch(1, "next");
-        let m = &st.tel.switch.as_ref().unwrap().1;
-        assert_eq!(
-            (
-                m["cause"].clone(),
-                m["api_ready"].clone(),
-                m["queued"].clone()
-            ),
-            (json!("next"), json!(true), json!(false))
-        );
-        st.cur = Some(1);
-        assert_eq!(st.media()["container"], "mkv");
-        st.on_message(json!({ "event": "playback-restart" })).await;
-        assert!(st.tel.switch.is_none());
-        drop(commands(st, mpv).await);
-    }
-
-    /// 解码 / 渲染信息等首帧（playback-restart）才取：file-loaded 时解码器还没建，hwdec-current 是空的。
-    #[tokio::test]
-    async fn render_probe_waits_for_first_frame() {
-        let (mut st, mpv, _ev) = offline_state(1);
-        st.tel.on = true;
-        st.cur = Some(0);
-        st.on_message(json!({ "event": "file-loaded" })).await;
-        let after_load = st.tel.probes.len();
-        st.on_message(json!({ "event": "playback-restart" })).await;
-        st.on_message(json!({ "event": "playback-restart" })).await; // seek 后再触发：不重复取
-        assert_eq!(after_load, 0);
-        assert_eq!(st.tel.probes.len(), RENDER_PROPS.len());
-        let asked: Vec<Value> = commands(st, mpv)
-            .await
-            .into_iter()
-            .filter(|c| c[0] == "get_property")
-            .map(|c| c[1].clone())
-            .collect();
-        assert_eq!(asked, RENDER_PROPS);
-    }
-
     /// 下一集追加进列表后按钮变绿（yes），换到下一集或追加失败后恢复（no），状态没变不重复发。
     #[tokio::test]
     async fn next_ready_follows_the_queue() {
@@ -2350,7 +1862,6 @@ mod tests {
             preload: 80.0,
             stream: None,
             danmaku: None,
-            timeline: (Instant::now(), Map::new()),
         };
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
@@ -2873,23 +2384,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "需要真服账号（EMBY_SERVER / PORT / EMBY_USER / EMBY_PASS）和 PATH 里的 mpv"]
     async fn e2e_real_server() {
-        // 设了 TEL_DIR（且编译时注入了上报地址）就把诊断数据也打开，播完到这个目录看记了什么
-        let tel_dir = std::env::var("TEL_DIR").ok();
-        if let Some(d) = &tel_dir {
-            // 编译期常量：没注入上报地址时 rec 什么都不记，测了也白测
-            if !telemetry::AVAILABLE {
-                panic!("TEL_DIR 要配合编译时的 EMBYMINI_TEL_URL / EMBYMINI_TEL_TOKEN");
-            }
-            telemetry::set_enabled(true);
-            telemetry::start(
-                d.into(),
-                telemetry::Meta {
-                    device: "e2e".into(),
-                    name: "e2e".into(),
-                    version: emby::VERSION,
-                },
-            );
-        }
         let c = login_from_env().await;
 
         let (ep1, ep2) = pick_pair(&c).await;
@@ -2997,9 +2491,6 @@ mod tests {
             "经缓存代理时 mpv 不该拿到 token"
         );
         eprintln!("事件序列：{seen:?}");
-        if tel_dir.is_some() {
-            tokio::time::sleep(Duration::from_secs(6)).await; // 等写入任务落盘（每 5 秒）
-        }
         eprintln!(
             "mpv 预取下一集：{}",
             if mpv_log.contains("Prefetching") {

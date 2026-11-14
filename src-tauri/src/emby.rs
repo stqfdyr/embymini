@@ -626,6 +626,53 @@ pub(crate) mod tests {
         );
     }
 
+    /// `call` turns each kind of reply into the right result.
+    #[tokio::test]
+    async fn call_maps_replies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split(' ').nth(1).unwrap_or_default();
+                let (status, body) = match path {
+                    "/emby/unauth" => ("401 Unauthorized", ""),
+                    "/emby/empty" => ("204 No Content", ""),
+                    "/emby/html" => ("200 OK", "<html>"),
+                    "/emby/denied" => ("403 Forbidden", "Access denied"),
+                    _ => ("200 OK", r#"{"a":1}"#),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let server = Server {
+            id: "s".into(),
+            name: String::new(),
+            url: "http://127.0.0.1".into(),
+            port,
+            user: "u".into(),
+            user_id: "uid".into(),
+            token: "tok".into(),
+        };
+        let c = Emby::new(http_client().unwrap(), &server, "dev");
+        let call = |p: &'static str| c.call(Method::GET, p, NO_QUERY, None);
+        assert_eq!(call("/ok").await.unwrap()["a"], 1);
+        assert_eq!(call("/empty").await.unwrap(), Value::Null);
+        assert!(matches!(call("/unauth").await, Err(Error::Unauthorized)));
+        assert!(matches!(call("/html").await, Err(Error::Other(_))));
+        assert!(matches!(
+            call("/denied").await,
+            Err(Error::Status(403, ref d)) if d == "Access denied"
+        ));
+    }
+
     #[test]
     fn error_serializes_with_kind() {
         let v = serde_json::to_value(Error::Unauthorized).unwrap();

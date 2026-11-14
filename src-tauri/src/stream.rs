@@ -58,6 +58,7 @@ const HEDGE: [u64; 3] = [3, 5, 8];
 const OPEN_LIMIT: Duration = Duration::from_secs(30);
 /// A first read's wait for the size: a little past [`OPEN_LIMIT`], so the first request's own verdict lands first.
 const SIZE_WAIT: Duration = Duration::from_secs(OPEN_LIMIT.as_secs() + 5);
+const _: () = assert!(SIZE_WAIT.as_secs() > OPEN_LIMIT.as_secs());
 /// Largest chunk per body frame sent to mpv.
 const READ_CHUNK: u64 = 256 << 10;
 /// Video cache cap when the disk has room.
@@ -451,6 +452,20 @@ fn same_origin(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a.origin() == b.origin(),
         _ => false,
     }
+}
+
+/// Blocks a read at `pos` asks for, [b, hi]: in the block's last MiB the next one too, since a preview decodes past
+/// its position (only previews use `hi`).
+fn wanted(pos: u64) -> (usize, usize) {
+    let b = (pos / BLOCK) as usize;
+    (
+        b,
+        if pos % BLOCK + (1 << 20) > BLOCK {
+            b + 1
+        } else {
+            b
+        },
+    )
 }
 
 /// A request that produced data: the response, its first body chunk and the file's total size.
@@ -864,7 +879,7 @@ impl Stream {
     ) -> Response<Body> {
         let t0 = Instant::now();
         let first = match range {
-            Some(Range::From(a, _)) => (a / BLOCK) as usize,
+            Some(Range::From(a, _)) => a,
             _ => 0,
         };
         let size = match self.wait_size(&f, first, role, t0).await {
@@ -926,10 +941,11 @@ impl Stream {
     async fn wait_size(
         &self,
         f: &Arc<File>,
-        b: usize,
+        pos: u64,
         role: Role,
         t0: Instant,
     ) -> Result<u64, u16> {
+        let (b, hi) = wanted(pos);
         let mut rx = f.changed.subscribe();
         loop {
             let abort = {
@@ -946,7 +962,7 @@ impl Stream {
                 if t0.elapsed() > SIZE_WAIT {
                     return Err(st.fail.as_ref().map_or(504, |(e, _)| e.code()));
                 }
-                self.ensure(f, &mut st, b, b, role)
+                self.ensure(f, &mut st, b, hi, role)
             };
             abort_all(abort);
             let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
@@ -1036,8 +1052,7 @@ impl Stream {
         } else if st.status_since(t0).is_some() && !st.busy() {
             Next::Gone // upstream refused since: hang up, mpv's reconnect gets the code
         } else {
-            // In the block's last MiB, ask for the next one too
-            let hi = if off + (1 << 20) > BLOCK { b + 1 } else { b };
+            let (b, hi) = wanted(pos);
             Next::Wait(self.ensure(f, &mut st, b, hi, role))
         }
     }
@@ -1602,6 +1617,11 @@ mod tests {
         assert_eq!(resolve(Some(Range::Suffix(5)), 100), Some((95, 99)));
         assert_eq!(resolve(Some(Range::From(100, None)), 100), None);
         assert_eq!(resolve(None, 100), Some((0, 99)));
+        // Empty file, or an empty suffix: nothing to send (416)
+        assert_eq!(resolve(None, 0), None);
+        assert_eq!(resolve(Some(Range::Suffix(0)), 100), None);
+        assert_eq!(resolve(Some(Range::Suffix(5)), 0), None);
+        assert_eq!(resolve(Some(Range::Suffix(500)), 100), Some((0, 99)));
         assert_eq!(
             content_range("bytes 4194304-8388607/44040192"),
             Some((4194304, 44040192))
@@ -2079,29 +2099,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Request handling around the reads: methods, key kinds, a read across a block boundary, HEAD.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn requests_and_block_edges() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("edges");
+        let s = Stream::start(&dir, true).unwrap();
+        let url = s.video("srv_30_a", &format!("{}/f", u.base), &auth(&u));
+        let sub = s.sub("srv_30_a_1.srt", &format!("{}/sub", u.base), &auth(&u));
+        let c = reqwest::Client::builder().no_proxy().build().unwrap();
+        let post = c.post(&url).send().await.unwrap();
+        assert_eq!(post.status().as_u16(), 405);
+        let head = c.head(&url).send().await.unwrap();
+        assert_eq!(head.status().as_u16(), 200);
+        assert_eq!(
+            head.headers()["content-length"],
+            (3 * BLOCK).to_string().as_str()
+        );
+        // A key only answers under its own kind
+        let vkey = url.split('/').nth(4).unwrap();
+        let skey = sub.split('/').nth(4).unwrap();
+        let wrong = |k: &str, key: &str| format!("http://127.0.0.1:{}/{k}/{key}/x", s.port);
+        assert_eq!(get(&wrong("s", vkey), None, false).await.0, 404);
+        assert_eq!(
+            get(&wrong("v", skey), Some("bytes=0-9"), false).await.0,
+            404
+        );
+        // Across a block boundary, starting near the end of block 0: the chunk stops at the block's end
+        let a = BLOCK - 1000;
+        let (st, body) = get(&url, Some(&format!("bytes={a}-{}", a + 1999)), false).await;
+        assert_eq!((st, body.len()), (206, 2000));
+        assert!(body == u.data[a as usize..a as usize + 2000]);
+        let f = lock(&s.files).get("srv_30_a").unwrap().clone();
+        assert!(until(|| f.st().done.iter().all(|&d| d), 10).await);
+        let (_, body) = get(&url, Some(&format!("bytes={a}-{}", a + 1999)), false).await;
+        assert!(body == u.data[a as usize..a as usize + 2000], "from disk");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A preview in the last MiB of a block fetches the next block too (decoding runs past the position).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preview_near_block_end_takes_next_block() {
+        let u = upstream((10 * BLOCK) as usize).await;
+        let dir = tmp("preview-end");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_31_a", &format!("{}/f", u.base), &auth(&u));
+        let at = 5 * BLOCK - 1000;
+        let (st, body) = get(&url, Some(&format!("bytes={at}-{}", at + 99)), true).await;
+        assert!(st == 206 && body == u.data[at as usize..at as usize + 100]);
+        let f = lock(&s.files).get("srv_31_a").unwrap().clone();
+        assert!(until(|| !f.st().busy(), 5).await);
+        let r = reqs(&u, "/f");
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].1, format!("bytes={}-{}", 4 * BLOCK, 6 * BLOCK - 1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Registering a cache name again with a new upstream URL drops the old one and its redirect target.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reregistering_moves_to_new_url() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("rereg");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_32_a", &format!("{}/redir", u.base), &auth(&u));
+        let (st, _) = get(&url, Some("bytes=0-9"), true).await;
+        assert_eq!(st, 206);
+        let url = s.video("srv_32_a", &format!("{}/g", u.base), &auth(&u));
+        let at = 2 * BLOCK;
+        let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+        assert_eq!(st, 206);
+        assert_eq!(reqs(&u, "/g").len(), 1, "still reading the old address");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Subtitles: transient failures are retried, a definitive refusal is passed on after one request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subtitle_retries_transient_only() {
+        let u = upstream(1000).await;
+        let dir = tmp("sub-retry");
+        let s = Stream::start(&dir, false).unwrap();
+        let sub = s.sub("srv_33_a_1.srt", &format!("{}/flaky", u.base), &auth(&u));
+        let (st, body) = get(&sub, None, false).await;
+        assert_eq!((st, body.as_slice()), (200, &u.data[..]));
+        assert_eq!(reqs(&u, "/flaky").len(), 3, "two 502s, then data");
+        let sub = s.sub("srv_33_a_2.srt", &format!("{}/403", u.base), &auth(&u));
+        assert_eq!(get(&sub, None, false).await.0, 403);
+        assert_eq!(reqs(&u, "/403").len(), 1, "a 403 must not be retried");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A done block cut short on disk (outside tampering) is fetched again instead of re-read forever.
     #[tokio::test(flavor = "multi_thread")]
     async fn truncated_block_is_refetched() {
-        let u = upstream((2 * BLOCK) as usize).await;
+        let u = upstream((3 * BLOCK) as usize).await;
         let dir = tmp("truncated");
         let s = Stream::start(&dir, false).unwrap();
         let url = s.video("srv_20_a", &format!("{}/f", u.base), &auth(&u));
         assert_eq!(get(&url, Some("bytes=0-9"), false).await.0, 206);
         let f = lock(&s.files).get("srv_20_a").unwrap().clone();
-        assert!(until(|| f.st().done.first() == Some(&true), 5).await);
+        assert!(until(|| f.st().done.iter().all(|&d| d), 5).await);
+        // Block 1, not 0: the repaired block must be the one read, not block 0 by accident
         std::fs::File::options()
             .write(true)
-            .open(f.block_path(0))
+            .open(f.block_path(1))
             .unwrap()
             .set_len(5)
             .unwrap();
         let got = tokio::time::timeout(
             Duration::from_secs(10),
-            get(&url, Some("bytes=0-99"), false),
+            get(&url, Some(&format!("bytes={BLOCK}-{}", BLOCK + 99)), false),
         )
         .await
         .expect("reader spins on the short block");
-        assert_eq!((got.0, got.1.as_slice()), (206, &u.data[..100]));
+        let at = BLOCK as usize;
+        assert_eq!((got.0, got.1.as_slice()), (206, &u.data[at..at + 100]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2340,6 +2451,12 @@ mod tests {
         let (st, _) = get(&url, Some("bytes=0-99"), false).await;
         assert_eq!(st, 403);
         assert_eq!(reqs(&u, "/expire").len(), 2, "a 403 must not be retried");
+        // Judged by the block asked for: uncached block 1 fails at once, cached block 2 still plays
+        let (st, _) = get(&url, Some(&format!("bytes={BLOCK}-{}", BLOCK + 9)), false).await;
+        assert_eq!(st, 403);
+        let (st, body) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), false).await;
+        let a = at as usize;
+        assert_eq!((st, body.as_slice()), (206, &u.data[a..a + 10]));
         let _ = std::fs::remove_dir_all(dir);
     }
 

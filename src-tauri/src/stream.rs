@@ -1622,6 +1622,11 @@ mod tests {
         assert_eq!(resolve(Some(Range::Suffix(0)), 100), None);
         assert_eq!(resolve(Some(Range::Suffix(5)), 0), None);
         assert_eq!(resolve(Some(Range::Suffix(500)), 100), Some((0, 99)));
+        // In the last MiB of a block, the next one too
+        let mib = 1 << 20;
+        assert_eq!(wanted(BLOCK - mib), (0, 0));
+        assert_eq!(wanted(BLOCK - mib + 1), (0, 1));
+        assert_eq!(wanted(BLOCK + 5), (1, 1));
         assert_eq!(
             content_range("bytes 4194304-8388607/44040192"),
             Some((4194304, 44040192))
@@ -1749,6 +1754,11 @@ mod tests {
                 // Every request after the first: 403 (a signed URL that expired)
                 if path.starts_with("/expire") && flaky.fetch_add(1, Ordering::SeqCst) >= 1 {
                     let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    return;
+                }
+                // Always 502 (an upstream that never recovers)
+                if path.starts_with("/always502") {
+                    let _ = s.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
                 }
                 if path.starts_with("/sub") {
@@ -2185,6 +2195,34 @@ mod tests {
         let sub = s.sub("srv_33_a_2.srt", &format!("{}/403", u.base), &auth(&u));
         assert_eq!(get(&sub, None, false).await.0, 403);
         assert_eq!(reqs(&u, "/403").len(), 1, "a 403 must not be retried");
+        // Never recovers: the first try and crate::status::RETRIES more, then the code goes to mpv
+        let sub = s.sub(
+            "srv_33_a_3.srt",
+            &format!("{}/always502", u.base),
+            &auth(&u),
+        );
+        let got = tokio::time::timeout(Duration::from_secs(15), get(&sub, None, false)).await;
+        assert_eq!(got.expect("retries without end").0, 502);
+        assert_eq!(reqs(&u, "/always502").len(), 1 + crate::status::RETRIES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A block still being written is served as far as it has arrived, not after the whole block.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_follow_a_block_being_written() {
+        let u = upstream((2 * BLOCK) as usize).await;
+        let dir = tmp("partial");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_37_a", &format!("{}/slow", u.base), &auth(&u));
+        let t0 = Instant::now();
+        let (st, body) = get(&url, Some("bytes=0-99"), false).await;
+        assert!(st == 206 && body == u.data[..100]);
+        // The slow upstream takes about 3 s per block; the first 100 bytes are in the `.part` well before that
+        assert!(
+            t0.elapsed() < Duration::from_millis(2000),
+            "{:?}",
+            t0.elapsed()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

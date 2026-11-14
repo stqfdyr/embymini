@@ -444,35 +444,16 @@ mod tests {
     /// passed on and remembered (per address, forgotten on clear).
     #[tokio::test]
     async fn fetch_once_then_serve_from_disk() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/emby", l.local_addr().unwrap());
-        let hits = Arc::new(AtomicU64::new(0));
-        let h = hits.clone();
-        tokio::spawn(async move {
-            while let Ok((mut s, _)) = l.accept().await {
-                let h = h.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0; 4096];
-                    let n = s.read(&mut buf).await.unwrap();
-                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    h.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(100)).await; // let the concurrent asks overlap
-                    let resp: &[u8] = if head.contains("/Items/404/") {
-                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                    } else {
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nJPEG"
-                    };
-                    s.write_all(resp).await.unwrap();
-                });
+        let (base, hits) = upstream(|head, _| {
+            if head.contains("/Items/404/") {
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            } else {
+                OK
             }
-        });
+        })
+        .await;
         let dir = tmpdir("fetch");
-        let img = Images::new(
-            dir.clone(),
-            CAP,
-            reqwest::Client::builder().no_proxy().build().unwrap(),
-        );
+        let img = images(&dir, CAP);
         let req = Req::parse("s/1/Primary/0/t/240").unwrap();
         let all = futures_join(&img, &req, &base).await;
         assert!(
@@ -545,6 +526,91 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    const OK: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nJPEG";
+    const BUSY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nretry-after: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    /// Local upstream answering request number `n` (from 1) with `reply(head, n)`; returns its API root and hit count.
+    async fn upstream(reply: fn(&str, u64) -> &'static [u8]) -> (String, Arc<AtomicU64>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/emby", l.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let h = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let h = h.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0; 4096];
+                    let n = s.read(&mut buf).await.unwrap();
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let k = h.fetch_add(1, Ordering::SeqCst) + 1;
+                    tokio::time::sleep(Duration::from_millis(100)).await; // let concurrent asks overlap
+                    s.write_all(reply(&head, k)).await.unwrap();
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    fn images(dir: &Path, cap: u64) -> Arc<Images> {
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        Images::new(dir.to_owned(), cap, http)
+    }
+
+    /// Transient upstream failures are retried; a persistent one gives up after `RETRIES` and passes the status on.
+    #[tokio::test]
+    async fn transient_failures_retry() {
+        let dir = tmpdir("retry");
+        let req = Req::parse("s/1/Primary/0/t/240").unwrap();
+        let (base, hits) = upstream(|_, n| if n == 1 { BUSY } else { OK }).await;
+        assert_eq!(
+            images(&dir, CAP).get(&req, &base).await.unwrap().as_slice(),
+            b"JPEG"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let req = Req::parse("s/2/Primary/0/t/240").unwrap();
+        let (base, hits) = upstream(|_, _| BUSY).await;
+        assert_eq!(images(&dir, CAP).get(&req, &base).await, Err(503));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1 + crate::status::RETRIES as u64
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A store that crosses the cap trims the oldest right away and keeps `usage` exact.
+    #[tokio::test]
+    async fn store_over_cap_trims() {
+        let dir = tmpdir("cap");
+        let (base, _) = upstream(|_, _| OK).await;
+        let img = images(&dir, 10);
+        for i in 1..=3 {
+            let req = Req::parse(&format!("s/{i}/Primary/0/t/240")).unwrap();
+            img.get(&req, &base).await.unwrap();
+            assert_eq!(img.usage(), [4, 8, 8][i - 1], "after image {i}");
+        }
+        let first = Req::parse("s/1/Primary/0/t/240").unwrap();
+        assert!(!dir.join(first.file_name()).exists(), "oldest trimmed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Startup sums up what is already on disk.
+    #[test]
+    fn start_counts_existing_cache() {
+        let dir = tmpdir("start");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), [0u8; 3]).unwrap();
+        std::fs::write(dir.join("b"), [0u8; 5]).unwrap();
+        let img = Images::new(dir.clone(), CAP, reqwest::Client::new());
+        img.start();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while img.usage() != 8 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(img.usage(), 8);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     async fn futures_join(img: &Arc<Images>, req: &Req, base: &str) -> Vec<Got> {
         let mut v = Vec::new();
         let tasks: Vec<_> = (0..5)
@@ -584,6 +650,10 @@ mod tests {
             "recently used kept"
         );
         assert_eq!(img.total.load(Ordering::Relaxed), 200);
+        // Exactly at the cap nothing goes; half-written temp files are not counted.
+        std::fs::write(dir.join("x.tmp"), [0u8; 50]).unwrap();
+        assert_eq!(trim_dir(&dir, 200), 200);
+        assert!(dir.join("mid").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

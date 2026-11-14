@@ -549,7 +549,7 @@ async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Ve
     images::response(app.images.get(&req, &base).await)
 }
 
-/// 通用 Emby 请求（当前服务器）。401 时清掉该服务器的 token，界面据此引导重新登录。
+/// Generic Emby request to the active server. On 401 that server's token is cleared and the UI asks to sign in.
 #[tauri::command]
 async fn emby(
     app: State<'_, App>,
@@ -573,7 +573,7 @@ async fn emby(
         .collect();
     let r = client.call(method, &path, &query, body.as_ref()).await;
     if matches!(r, Err(Error::Unauthorized)) {
-        // 清发请求的那台：请求途中用户可能已经切到别的服务器
+        // Clear the server that was asked: the user may have switched servers meanwhile
         let _ = app.update(|c| {
             if let Some(s) = c.servers.iter_mut().find(|s| s.id == server_id) {
                 s.token.clear();

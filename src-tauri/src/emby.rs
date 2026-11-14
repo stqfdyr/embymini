@@ -1,7 +1,8 @@
-//! Emby HTTP：鉴权头、UA、通用请求，以及播放要用的几个强类型接口。
-//! 浏览类数据只有前端用，不在这里定义 DTO（前端经 `emby` 命令拿原始 JSON）。
+//! Emby HTTP: auth headers, UA, the generic request, and the few typed endpoints playback needs.
+//! Browsing data is only used by the UI, so it has no DTOs here (the UI gets raw JSON via the `emby` command).
 
 use crate::config::Server;
+use crate::status;
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
@@ -9,27 +10,33 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// 客户端自己的 UA，不伪装成别的客户端；个别服务器对 UA 的限制交给反向代理处理。
+/// Our own UA, never impersonating another client; per-server UA rules belong in the reverse proxy.
 pub const UA: &str = concat!("EmbyMini/", env!("CARGO_PKG_VERSION"));
-/// 超过这个时长的请求记一条日志，用来对照「起播慢 / 页面慢」是不是卡在上游。
+/// Requests slower than this are logged, to tell whether a slow start or page is waiting on upstream.
 const SLOW: Duration = Duration::from_secs(3);
-/// 不带查询参数时传给 [`Emby::call`]。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole-request timeout; timeouts are not retried (see [`status`]).
+const API_TIMEOUT: Duration = Duration::from_secs(30);
+/// 400 Mbps: high enough that the server never asks to transcode, so the original file is played.
+const MAX_BITRATE: &str = "400000000";
+/// Pass to [`Emby::call`] when there is no query.
 pub const NO_QUERY: &[(&str, &str)] = &[];
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("未登录或登录已失效")]
     Unauthorized,
-    /// 状态码 + 回包正文前 200 字；文案见 [`crate::status::describe`]。
-    #[error("{}", crate::status::describe(*.0, .1))]
+    /// Status code + start of the body; wording in [`status::describe`].
+    #[error("{}", status::describe(*.0, .1))]
     Status(u16, String),
-    /// 文案已按连不上 / 超时 / 证书分好类，见 [`net`]。
+    /// Already worded by kind (unreachable / timeout / TLS), see [`net`].
     #[error("{0}")]
     Network(String),
     #[error("{0}")]
     Other(String),
 }
 
+/// Serialized as `{kind, message}`; the UI keys off `kind` (e.g. `unauthorized` → sign in again).
 impl Serialize for Error {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let kind = match self {
@@ -45,8 +52,8 @@ impl Serialize for Error {
     }
 }
 
-/// 网络错误 → 给人看的错误：超时、证书、连不上分开说，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
-/// 只取 source 链，不取顶层：顶层带完整 URL（含查询参数，如搜索词）。
+/// Network error → readable error: timeout, TLS and unreachable worded apart, with the source chain in brackets
+/// (reqwest's top level only says "error sending request"). The top level is skipped: it holds the full URL and query.
 pub(crate) fn net(e: &reqwest::Error) -> Error {
     let mut chain = Vec::new();
     let mut src = std::error::Error::source(e);
@@ -75,13 +82,15 @@ pub(crate) fn net(e: &reqwest::Error) -> Error {
     })
 }
 
-/// 请求收尾：解析回包；失败和慢请求写日志（只记方法和路径，不记查询参数、token、密码）。
-async fn finish(
+/// Runs `send` (a [`status::send`] call), decodes the reply and logs failures, retries and slow calls.
+/// Logs only method and path: never the query, token or password.
+async fn request(
     method: &str,
     path: &str,
-    t0: Instant,
-    (sent, retries): (reqwest::Result<reqwest::Response>, usize),
+    send: impl Future<Output = (reqwest::Result<reqwest::Response>, usize)>,
 ) -> Result<Value, Error> {
+    let t0 = Instant::now();
+    let (sent, retries) = send.await;
     let r = match sent {
         Err(e) => Err(net(&e)),
         Ok(resp) => json_or_error(resp).await,
@@ -96,18 +105,18 @@ async fn finish(
     r
 }
 
-/// Emby 请求一律直连，不读系统代理：reqwest 只在建 Client 时读一次系统代理，
-/// 之后代理软件开关、换端口都不会跟着变，读到的旧地址会让请求一直失败到重启。
+/// Always direct, never the system proxy: reqwest reads it once when the client is built, so after the proxy
+/// app is switched off or moves port, requests keep failing until restart.
 pub fn http_client() -> reqwest::Result<Client> {
     Client::builder()
         .no_proxy()
         .user_agent(UA)
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(API_TIMEOUT)
         .build()
 }
 
-pub fn device_name() -> String {
+fn device_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "PC".into())
@@ -124,7 +133,7 @@ fn auth_header(device_id: &str, user_id: &str, token: &str) -> String {
     h
 }
 
-/// 回包 → JSON。
+/// Reply → JSON. 401 is decided before reading the body; an empty body (204) is `Null`.
 async fn json_or_error(resp: reqwest::Response) -> Result<Value, Error> {
     let status = resp.status();
     if status == StatusCode::UNAUTHORIZED {
@@ -132,7 +141,12 @@ async fn json_or_error(resp: reqwest::Response) -> Result<Value, Error> {
     }
     let bytes = resp.bytes().await.map_err(|e| net(&e))?;
     if !status.is_success() {
-        let text = String::from_utf8_lossy(&bytes).chars().take(200).collect();
+        // Trimmed first (as `describe` does); one char over the limit tells it the body is too long
+        let text = String::from_utf8_lossy(&bytes)
+            .trim()
+            .chars()
+            .take(status::DETAIL_MAX + 1)
+            .collect();
         Err(Error::Status(status.as_u16(), text))
     } else if bytes.is_empty() {
         Ok(Value::Null)
@@ -141,26 +155,24 @@ async fn json_or_error(resp: reqwest::Response) -> Result<Value, Error> {
     }
 }
 
-/// 把通用 JSON 回包转成播放要用的强类型；`what` 写进错误信息，方便定位是哪个接口变了形状。
+/// Generic JSON → typed value; `what` goes into the error to show which endpoint changed shape.
 fn decode<T: DeserializeOwned>(what: &str, v: Value) -> Result<T, Error> {
     serde_json::from_value(v).map_err(|e| Error::Other(format!("{what} 回包格式不符：{e}")))
 }
 
-/// 服务器名称（`/System/Info/Public`，无需登录），添加服务器时顺便校验地址可达。
+/// Server name (`/System/Info/Public`, no sign-in needed); adding a server uses it to check the address.
 pub async fn server_name(http: &Client, base: &str) -> Result<String, Error> {
     const PATH: &str = "/System/Info/Public";
-    let t0 = Instant::now();
-    let r = finish(
+    let v = request(
         "GET",
         PATH,
-        t0,
-        crate::status::send(|| http.get(format!("{base}{PATH}"))).await,
+        status::send(|| http.get(format!("{base}{PATH}"))),
     )
-    .await;
-    Ok(r?["ServerName"].as_str().unwrap_or("Emby").to_owned())
+    .await?;
+    Ok(v["ServerName"].as_str().unwrap_or("Emby").to_owned())
 }
 
-/// 用户名密码换 token，返回 `(user_id, token)`。
+/// User name + password → `(user_id, token)`.
 pub async fn login(
     http: &Client,
     base: &str,
@@ -169,15 +181,13 @@ pub async fn login(
     password: &str,
 ) -> Result<(String, String), Error> {
     const PATH: &str = "/Users/AuthenticateByName";
-    let t0 = Instant::now();
-    // 登录重发最多多建一个会话，无害
-    let sent = crate::status::send_readonly(|| {
+    // A resend creates at most one extra session: harmless
+    let sent = status::send_readonly(|| {
         http.post(format!("{base}{PATH}"))
             .header("X-Emby-Authorization", auth_header(device_id, "", ""))
             .json(&serde_json::json!({ "Username": user, "Pw": password }))
-    })
-    .await;
-    let v = match finish("POST", PATH, t0, sent).await {
+    });
+    let v = match request("POST", PATH, sent).await {
         Err(Error::Unauthorized) => return Err(Error::Other("用户名或密码错误".into())),
         r => r?,
     };
@@ -189,7 +199,7 @@ pub async fn login(
     }
 }
 
-/// 已登录的某个服务器。
+/// A signed-in server.
 #[derive(Clone)]
 pub struct Emby {
     http: Client,
@@ -197,7 +207,7 @@ pub struct Emby {
     auth: String,
     token: String,
     pub user_id: String,
-    /// 上游标识（见 [`crate::config::server_tag`]），缓存文件名、弹幕匹配记录按它区分服务器。
+    /// Upstream tag ([`crate::config::server_tag`]): cache file names and danmaku picks are keyed by it.
     pub tag: String,
 }
 
@@ -213,8 +223,8 @@ impl Emby {
         }
     }
 
-    /// 通用请求。`path` 是 `/emby` 之后的部分，必须以 `/` 开头；查询参数单独传（键值对列表）。
-    /// 暂时性失败（502 / 503 / 429 等、连不上）按 [`crate::status`] 的规则重试；失败和慢请求写日志（[`finish`]）。
+    /// Generic request. `path` is the part after `/emby` and starts with `/`; the query is passed separately.
+    /// Transient failures are retried per [`status`].
     pub async fn call<Q: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -222,13 +232,11 @@ impl Emby {
         query: &Q,
         body: Option<&Value>,
     ) -> Result<Value, Error> {
-        check_path(path)?;
-        let t0 = Instant::now();
-        let url = format!("{}{path}", self.base);
-        let sent = crate::status::send(|| {
+        let url = api_url(&self.base, path)?;
+        let sent = status::send(|| {
             let rb = self
                 .http
-                .request(method.clone(), &url)
+                .request(method.clone(), url.clone())
                 .header("X-Emby-Authorization", &self.auth)
                 .header("X-Emby-Token", &self.token)
                 .query(query);
@@ -236,9 +244,8 @@ impl Emby {
                 Some(b) => rb.json(b),
                 None => rb,
             }
-        })
-        .await;
-        finish(method.as_str(), path, t0, sent).await
+        });
+        request(method.as_str(), path, sent).await
     }
 
     async fn get<T: DeserializeOwned>(
@@ -254,7 +261,7 @@ impl Emby {
             .await
     }
 
-    /// 某季的全部单集（服务端已按集号排好）。
+    /// All episodes of a season, already in episode order.
     pub async fn episodes(&self, series_id: &str, season_id: &str) -> Result<Vec<Item>, Error> {
         let r: Items = self
             .get(
@@ -265,7 +272,7 @@ impl Emby {
         Ok(r.items)
     }
 
-    /// `source`：用户在详情页选的版本（同一部片有 1080p、4K 等多个文件时）；不给就用服务器排的第一个。
+    /// `source`: the version picked on the detail page (1080p, 4K, …); `None` = the server's first.
     pub async fn playback_info(
         &self,
         id: &str,
@@ -276,7 +283,7 @@ impl Emby {
             ("StartTimeTicks", "0"),
             ("IsPlayback", "true"),
             ("AutoOpenLiveStream", "false"),
-            ("MaxStreamingBitrate", "400000000"),
+            ("MaxStreamingBitrate", MAX_BITRATE),
         ];
         if let Some(s) = source {
             q.push(("MediaSourceId", s));
@@ -296,7 +303,7 @@ impl Emby {
         Ok(info)
     }
 
-    /// 直链：优先用 PlaybackInfo 给的 `DirectStreamUrl`（反向代理可能改写它），没有再按标准格式拼。
+    /// Direct URL: PlaybackInfo's `DirectStreamUrl` (a reverse proxy may rewrite it), else the standard form.
     pub fn stream_url(&self, item_id: &str, src: &MediaSource) -> String {
         let url = match src.direct_stream_url.as_deref().filter(|u| !u.is_empty()) {
             Some(u) => self.abs(u),
@@ -310,7 +317,7 @@ impl Emby {
         strip_key(url)
     }
 
-    /// 外挂字幕地址。`DeliveryUrl` 在实测中常为 null，按标准格式拼。
+    /// External subtitle URL. `DeliveryUrl` is usually null in practice, so the standard form is built.
     pub fn subtitle_url(&self, item_id: &str, src: &MediaSource, st: &MediaStream) -> String {
         let url = match st.delivery_url.as_deref().filter(|u| !u.is_empty()) {
             Some(u) => self.abs(u),
@@ -335,7 +342,8 @@ impl Emby {
         }
     }
 
-    /// 没有缓存代理时播放失败才调用（有代理时状态码由代理记下）：取直链第一个字节，拿到最终 HTTP 状态码（会跟随 302），用于给用户说清原因。
+    /// Only when playback failed without the cache proxy (the proxy records its own status): fetch the first byte
+    /// of the direct URL, following redirects, to tell the user why.
     pub async fn probe(&self, url: &str) -> Option<u16> {
         let r = self
             .http
@@ -348,7 +356,7 @@ impl Emby {
         Some(r.status().as_u16())
     }
 
-    /// 缓存代理向上游要数据时用：token 只发给 API 根地址同源的主机。
+    /// For the cache proxy: the token goes only to hosts with the API root's origin.
     pub fn stream_auth(&self) -> crate::stream::Auth {
         crate::stream::Auth {
             token: self.token.clone(),
@@ -356,15 +364,15 @@ impl Emby {
         }
     }
 
-    /// 没有缓存代理时给 mpv 的请求头：token 走请求头而不是 URL（见 [`strip_key`]）。
+    /// mpv's header when there is no cache proxy: the token travels in a header, not the URL (see [`strip_key`]).
     pub fn token_header(&self) -> String {
         format!("X-Emby-Token: {}", self.token)
     }
 }
 
-/// 去掉服务端直链里自带的 api_key：token 由缓存代理加在请求头上（没有代理时由 mpv 的请求头带，[`Emby::token_header`]），
-/// 不进 URL，就不会出现在 mpv 的播放列表、统计页（`i`）和日志里，截图、录屏也不会泄露。
-/// 没有代理时的代价：直链 302 到别的主机时，mpv 也会把这个请求头带过去（代理只发给同源）。
+/// Drops the server's own `api_key` from direct URLs: the token is added as a header by the cache proxy (or mpv
+/// without it, [`Emby::token_header`]) and so never shows in mpv's playlist, stats page (`i`), logs or screenshots.
+/// Without the proxy, mpv also sends that header when the URL redirects to another host (the proxy does not).
 fn strip_key(url: String) -> String {
     let Ok(mut u) = reqwest::Url::parse(&url) else {
         return url;
@@ -390,19 +398,24 @@ pub fn subtitle_ext(codec: Option<&str>) -> String {
     }
 }
 
-/// 前端传来的路径只能是本服务器 API 下的相对路径。
-fn check_path(path: &str) -> Result<(), Error> {
-    if !path.starts_with('/')
-        || path.contains("://")
-        || path.contains("..")
-        || path.contains(['?', '#'])
+/// `base` + a path from the UI, which must stay under the API root with no query or fragment.
+/// Checked after parsing: the parser turns `%2e%2e`, `\` and dots split by tab / newline into `..` and `/`.
+fn api_url(base: &str, path: &str) -> Result<reqwest::Url, Error> {
+    let bad = || Error::Other(format!("非法路径：{path}"));
+    let root = reqwest::Url::parse(base).map_err(|_| bad())?;
+    let url = reqwest::Url::parse(&format!("{base}{path}")).map_err(|_| bad())?;
+    let under = format!("{}/", root.path().trim_end_matches('/'));
+    if url.origin() != root.origin()
+        || !url.path().starts_with(&under)
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        return Err(Error::Other(format!("非法路径：{path}")));
+        return Err(bad());
     }
-    Ok(())
+    Ok(url)
 }
 
-// ---- 播放用到的字段（以 testdata/ 里的真实回包为准，缺字段一律取默认值） ----
+// ---- Fields playback uses (per the real replies in testdata/; missing fields default) ----
 
 #[derive(Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "PascalCase", default)]
@@ -423,7 +436,7 @@ pub struct Item {
     pub index_number: Option<i32>,
     pub parent_index_number: Option<i32>,
     pub run_time_ticks: Option<i64>,
-    /// 电影的年份，弹幕按「片名 (年份)」匹配。
+    /// Movie year; danmaku matches on "title (year)".
     pub production_year: Option<i32>,
     pub user_data: UserData,
 }
@@ -444,8 +457,8 @@ pub struct PlaybackInfo {
 }
 
 impl PlaybackInfo {
-    /// 把选中的版本挪到第一个（播放只用第一个）。标准做法是服务器按 `MediaSourceId` 只回那一个，
-    /// 但有的服务器不理会这个参数、照样回全部版本。没找到返回 false。
+    /// Moves the chosen version first (playback uses the first). Servers should return only that one for
+    /// `MediaSourceId`, but some ignore it and return all. Returns false if it is not there.
     fn prefer(&mut self, source: &str) -> bool {
         let i = self.media_sources.iter().position(|m| m.id == source);
         if let Some(i) = i {
@@ -540,7 +553,7 @@ pub(crate) mod tests {
         assert!(u.starts_with("https://h.example/emby/videos/"), "{u}");
         assert!(
             !u.contains("api_key"),
-            "服务端直链自带的 api_key 要去掉：{u}"
+            "the server's own api_key must be stripped: {u}"
         );
 
         let bare = MediaSource {
@@ -585,28 +598,42 @@ pub(crate) mod tests {
         };
         assert!(pi.prefer("2160"));
         assert_eq!(pi.media_sources[0].id, "2160");
-        assert!(!pi.prefer("gone")); // 不认识的 id：保持原样
+        assert!(!pi.prefer("gone")); // unknown id: unchanged
         assert_eq!(pi.media_sources[0].id, "2160");
     }
 
     #[test]
     fn path_guard() {
-        assert!(check_path("/Users/x/Views").is_ok());
-        for bad in ["Users", "/a/../b", "https://evil/x", "/a?b=1", "/a#x"] {
-            assert!(check_path(bad).is_err(), "{bad}");
+        let base = "https://h.example:443/emby";
+        for ok in ["/Users/x/Views", "/Persons/Tom%20Hanks", "/a/../b"] {
+            assert!(api_url(base, ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "Users",
+            "/../x",
+            "https://evil/x",
+            "@evil/x",
+            "/a?b=1",
+            "/a#x",
+            "/%2e%2e/x",
+            "/..\\x",
+            "/.\t./x",
+            "/.\n./x",
+        ] {
+            assert!(api_url(base, bad).is_err(), "{bad:?}");
         }
     }
 
-    /// 连不上、超时要分开说；5xx 不展示 HTML 回包。
+    /// Unreachable and timeout are worded apart; HTML bodies of 5xx are not shown.
     #[tokio::test]
     async fn network_errors_are_classified() {
         let http = http_client().unwrap();
-        // 端口 1 没人监听：连接被拒
+        // Nothing listens on port 1: connection refused
         let e = server_name(&http, "http://127.0.0.1:1/emby")
             .await
             .unwrap_err();
         assert!(e.to_string().starts_with("连不上服务器（"), "{e}");
-        // 收下连接但不回话：超时
+        // Accepts but never answers: timeout
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let slow = Client::builder()
             .no_proxy()
@@ -624,6 +651,60 @@ pub(crate) mod tests {
             Error::Status(404, "x".into()).to_string(),
             "服务器上找不到（404）：x"
         );
+    }
+
+    /// `call` turns each kind of reply into the right result.
+    #[tokio::test]
+    async fn call_maps_replies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head.split(' ').nth(1).unwrap_or_default();
+                let long = format!("\n{}", "x".repeat(300));
+                let (status, body) = match path {
+                    "/emby/unauth" => ("401 Unauthorized", ""),
+                    "/emby/empty" => ("204 No Content", ""),
+                    "/emby/html" => ("200 OK", "<html>"),
+                    "/emby/denied" => ("403 Forbidden", "Access denied"),
+                    "/emby/long" => ("400 Bad Request", long.as_str()),
+                    _ => ("200 OK", r#"{"a":1}"#),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            }
+        });
+        let server = Server {
+            id: "s".into(),
+            name: String::new(),
+            url: "http://127.0.0.1".into(),
+            port,
+            user: "u".into(),
+            user_id: "uid".into(),
+            token: "tok".into(),
+        };
+        let c = Emby::new(http_client().unwrap(), &server, "dev");
+        let call = |p: &'static str| c.call(Method::GET, p, NO_QUERY, None);
+        assert_eq!(call("/ok").await.unwrap()["a"], 1);
+        assert_eq!(call("/empty").await.unwrap(), Value::Null);
+        assert!(matches!(call("/unauth").await, Err(Error::Unauthorized)));
+        assert!(
+            matches!(call("/html").await, Err(Error::Other(ref m)) if m.starts_with("回包不是 JSON"))
+        );
+        assert!(matches!(
+            call("/denied").await,
+            Err(Error::Status(403, ref d)) if d == "Access denied"
+        ));
+        // A long body is never shown cut off, even after leading whitespace
+        let e = call("/long").await.unwrap_err().to_string();
+        assert_eq!(e, "请求被服务器拒绝（400）");
     }
 
     #[test]

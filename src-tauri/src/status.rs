@@ -1,18 +1,20 @@
-//! 对外 HTTP 回包的统一处理：Emby API、图片、视频 / 字幕缓存代理、弹幕接口共用同一套状态码分类、重试和文案。
+//! One way to handle HTTP replies from outside: Emby API, images, the video / subtitle cache proxy and the danmaku
+//! API share the same status classes, retries and wording.
 //!
-//! | 类别 | 状态码 | 重试 | 说明 |
+//! | Class | Codes | Retry | Meaning |
 //! |---|---|---|---|
-//! | [`Class::Auth`] | 401 | 否 | 凭据失效：Emby 清 token、引导重新登录；弹幕提示检查接口地址 |
-//! | [`Class::Denied`] | 403 | 否 | 拒绝访问 |
-//! | [`Class::Missing`] | 404、410 | 否 | 不存在 |
-//! | [`Class::Busy`] | 408、425、429、502、503、504、520–524 | 是（408、504 除外） | 上游、反代、中继（含 Cloudflare 回源失败）临时不可用或限流 |
-//! | [`Class::Failed`] | 其余 5xx | 否 | 服务器自身出错，马上重试多半还是一样 |
-//! | [`Class::Rejected`] | 其余 4xx | 否 | 请求本身不被接受 |
+//! | [`Class::Auth`] | 401 | no | credentials gone: Emby clears the token and asks to sign in; danmaku asks to check the API URL |
+//! | [`Class::Denied`] | 403 | no | access denied |
+//! | [`Class::Missing`] | 404, 410 | no | not there |
+//! | [`Class::Busy`] | 408, 425, 429, 502, 503, 504, 520–524 | yes (not 408, 504) | upstream, reverse proxy or relay (incl. Cloudflare origin errors) briefly down or rate limiting |
+//! | [`Class::Failed`] | other 5xx | no | the server itself failed; an immediate retry likely fails the same way |
+//! | [`Class::Rejected`] | other 4xx | no | the request itself is refused |
 //!
-//! 重试：最多 [`RETRIES`] 次，等 0.5 秒、1.5 秒；回包带 `Retry-After`（秒）就按它，最多等 5 秒。
-//! 连不上（请求没发出去）也重试；超时、408、504 不重试（已经等过一整个超时，再试只会更久）。
-//! 非幂等请求（POST）只在连不上和 429 时重试：其余情况服务器可能已经处理过，重发会重复执行；只读的 POST 用 [`send_readonly`]。
-//! 视频缓存代理另有自己的重试（`stream.rs`：5xx 一律当暂时性错误，按块一直重试）。
+//! Retries: at most [`RETRIES`], waiting 0.5 s then 1.5 s, or the reply's `Retry-After` (seconds), capped at 5 s.
+//! Unreachable (nothing sent) is retried too; timeouts, 408 and 504 are not (a whole timeout has already passed).
+//! Non-idempotent requests (POST) retry only when unreachable or on 429: otherwise the server may already have
+//! acted on them. Read-only POSTs use [`send_readonly`].
+//! The video cache proxy has its own retries (`stream.rs`: any 5xx is transient, chunks retry indefinitely).
 
 use std::time::Duration;
 
@@ -39,12 +41,14 @@ pub fn classify(code: u16) -> Class {
     }
 }
 
-/// 第一次之外最多再试几次。
+/// Retries after the first attempt.
 pub const RETRIES: usize = 2;
 const BACKOFF_MS: [u64; RETRIES] = [500, 1500];
 const MAX_WAIT: Duration = Duration::from_secs(5);
+/// Longest reply body (chars) [`describe`] shows; Emby's 4xx bodies are usually one short sentence.
+pub const DETAIL_MAX: usize = 120;
 
-/// 第 `attempt` 次重试（从 0 起）前等多久。
+/// Wait before retry number `attempt` (from 0).
 pub fn backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
     retry_after.map_or_else(
         || Duration::from_millis(BACKOFF_MS[attempt.min(RETRIES - 1)]),
@@ -52,7 +56,7 @@ pub fn backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
     )
 }
 
-/// `Retry-After` 的秒数写法（HTTP 日期写法很少见，不认）。
+/// `Retry-After` in seconds (the rare HTTP-date form is ignored).
 pub fn retry_after(h: &reqwest::header::HeaderMap) -> Option<Duration> {
     h.get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -63,12 +67,12 @@ pub fn retry_after(h: &reqwest::header::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// 回了这个状态码值不值得重试（规则见模块说明）。
+/// Whether this status code is worth a retry (rules in the module docs).
 pub fn retry_code(code: u16, idempotent: bool) -> bool {
     classify(code) == Class::Busy && !matches!(code, 408 | 504) && (idempotent || code == 429)
 }
 
-/// 这次结果值不值得重试；值得的话返回服务器要求等的时间（没要求为 None）。
+/// Whether this result is worth a retry; if so, the wait the server asked for (`None` = no request).
 pub fn retry_wait(
     r: &reqwest::Result<reqwest::Response>,
     idempotent: bool,
@@ -81,15 +85,15 @@ pub fn retry_wait(
     }
 }
 
-/// 发请求，暂时性失败按上面的规则重试（是否幂等按请求方法判断）。`build` 每次新建请求（RequestBuilder 发出去就没了）。
-/// 返回最后一次的结果和重试了几次。
+/// Sends, retrying transient failures per the rules above (idempotency from the method). `build` makes a fresh
+/// request each time (a sent RequestBuilder is gone). Returns the last result and the number of retries.
 pub async fn send(
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> (reqwest::Result<reqwest::Response>, usize) {
     send_as(build, false).await
 }
 
-/// 同 [`send`]，但请求是只读的、重发无副作用（用 POST 传参的查询、登录）：按幂等请求重试。
+/// Like [`send`] for a read-only request that is safe to resend (a POST query, login): retried as idempotent.
 pub async fn send_readonly(
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> (reqwest::Result<reqwest::Response>, usize) {
@@ -119,7 +123,7 @@ async fn send_as(
     }
 }
 
-/// 给人看的说明。`detail` 是回包正文：只有简短的纯文本才附上（HTML 错误页、JSON 不展示）。
+/// Readable text for users. `detail` is the reply body: shown only when it is short plain text (not HTML or JSON).
 pub fn describe(code: u16, detail: &str) -> String {
     let what = match classify(code) {
         Class::Ok => "成功",
@@ -132,7 +136,7 @@ pub fn describe(code: u16, detail: &str) -> String {
         Class::Rejected => "请求被服务器拒绝",
     };
     let d = detail.trim();
-    let plain = !d.is_empty() && d.chars().count() <= 120 && !d.starts_with(['<', '{', '[']);
+    let plain = !d.is_empty() && d.chars().count() <= DETAIL_MAX && !d.starts_with(['<', '{', '[']);
     if plain {
         format!("{what}（{code}）：{d}")
     } else {
@@ -154,10 +158,10 @@ mod tests {
             assert_eq!(classify(c), Class::Busy, "{c}");
         }
         assert!(retry_code(503, true) && retry_code(429, false));
-        assert!(!retry_code(503, false), "POST 遇到 503 不重发");
+        assert!(!retry_code(503, false), "POST is not resent on 503");
         assert!(
             !retry_code(504, true) && !retry_code(408, true),
-            "超时类不重试"
+            "timeouts are not retried"
         );
         assert_eq!(classify(500), Class::Failed);
         assert_eq!(classify(418), Class::Rejected);
@@ -175,7 +179,7 @@ mod tests {
         assert_eq!(backoff(0, Some(Duration::from_secs(60))), MAX_WAIT);
     }
 
-    /// 前两次 503（第一次带 Retry-After: 0）、第三次 200：重试两次后成功；一直 404 不重试；POST 遇到 502 不重发。
+    /// 503 (with Retry-After: 0), 502, then 200: succeeds after two retries; 404 is not retried; POST is not resent on 502.
     #[tokio::test]
     async fn retries_only_transient() {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -212,7 +216,7 @@ mod tests {
         assert_eq!(
             (r.unwrap().status().as_u16(), n),
             (502, 2),
-            "只读的 POST 照常重试"
+            "read-only POST is retried"
         );
     }
 }

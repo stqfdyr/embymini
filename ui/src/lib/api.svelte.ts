@@ -94,7 +94,11 @@ export function loader<T>(fn: () => Promise<T>, key?: () => string) {
     let fromSnap = false
     if (k && untrack(() => s.data) === undefined) {
       const snap = readSnap<T>(k)
-      if (snap !== undefined) ((s.data = snap), (fromSnap = true), pageSnap())
+      if (snap !== undefined) {
+        s.data = snap
+        fromSnap = true
+        pageSnap()
+      }
     }
     fn().then(
       (d) => {

@@ -395,7 +395,8 @@ fn check_path(path: &str) -> Result<(), Error> {
     if !path.starts_with('/')
         || path.contains("://")
         || path.contains("..")
-        || path.contains(['?', '#'])
+        // `%2e%2e` and `\` become `..` / `/` when the URL is parsed
+        || path.contains(['?', '#', '%', '\\'])
     {
         return Err(Error::Other(format!("非法路径：{path}")));
     }
@@ -592,7 +593,15 @@ pub(crate) mod tests {
     #[test]
     fn path_guard() {
         assert!(check_path("/Users/x/Views").is_ok());
-        for bad in ["Users", "/a/../b", "https://evil/x", "/a?b=1", "/a#x"] {
+        for bad in [
+            "Users",
+            "/a/../b",
+            "https://evil/x",
+            "/a?b=1",
+            "/a#x",
+            "/%2e%2e/x",
+            "/a\\..\\b",
+        ] {
             assert!(check_path(bad).is_err(), "{bad}");
         }
     }

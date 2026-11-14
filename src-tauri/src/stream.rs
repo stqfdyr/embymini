@@ -1639,9 +1639,17 @@ mod tests {
                     let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
                 }
-                if let (true, Some(to)) = (path.starts_with("/redir"), &redirect) {
+                if let (true, Some(to)) = (
+                    path.starts_with("/redir") || path.starts_with("/hop"),
+                    &redirect,
+                ) {
+                    let target = if path.starts_with("/hop") {
+                        "once"
+                    } else {
+                        "f"
+                    };
                     let r = format!(
-                        "HTTP/1.1 302 Found\r\nlocation: {to}/f\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        "HTTP/1.1 302 Found\r\nlocation: {to}/{target}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                     );
                     let _ = s.write_all(r.as_bytes()).await;
                     return;
@@ -1656,6 +1664,11 @@ mod tests {
                     let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
                 }
+                // Second request: 403 (a redirect target that expired)
+                if path.starts_with("/once") && flaky.fetch_add(1, Ordering::SeqCst) == 1 {
+                    let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    return;
+                }
                 // Every request after the first: 403 (a signed URL that expired)
                 if path.starts_with("/expire") && flaky.fetch_add(1, Ordering::SeqCst) >= 1 {
                     let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
@@ -1666,12 +1679,19 @@ mod tests {
                     return;
                 }
                 let n = data.len() as u64;
+                // Upstreams ignoring Range: the whole file as 200, or as 206 starting at 0
+                let ignore = path.starts_with("/norange") || path.starts_with("/badrange");
                 let (a, b) = match parse_range(&range).and_then(|r| resolve(Some(r), n)) {
-                    Some(x) => x,
-                    None => (0, n - 1),
+                    Some(x) if !ignore => x,
+                    _ => (0, n - 1),
+                };
+                let line = if path.starts_with("/norange") {
+                    "200 OK"
+                } else {
+                    "206 Partial Content"
                 };
                 let h = format!(
-                    "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes {a}-{b}/{n}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {line}\r\ncontent-range: bytes {a}-{b}/{n}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     b - a + 1
                 );
                 if s.write_all(h.as_bytes()).await.is_err() {
@@ -1981,7 +2001,7 @@ mod tests {
         assert_eq!(
             get(&sub_b, None, false).await.0,
             404,
-            "retain 掉的视频，字幕登记一起清掉"
+            "a retained-away video takes its subtitles along"
         );
         assert!(
             until(
@@ -2098,6 +2118,81 @@ mod tests {
         // 4 cuts: about 4 s with a 1 s retry each, 15 s (1+2+4+8) if the backoff keeps doubling
         assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/drops").len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An upstream ignoring Range is refused (502) instead of caching misplaced data; from offset 0 a 200 is fine.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upstream_ignoring_range_is_refused() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("norange");
+        let s = Stream::start(&dir, false).unwrap();
+        let at = 2 * BLOCK;
+        for p in ["norange", "badrange"] {
+            let url = s.video(
+                &format!("srv_24_{p}"),
+                &format!("{}/{p}", u.base),
+                &auth(&u),
+            );
+            let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+            assert_eq!(st, 502, "{p}");
+        }
+        let url = s.video("srv_24_ok", &format!("{}/norange", u.base), &auth(&u));
+        let (st, body) = get(&url, Some("bytes=0-99"), false).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[..100]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A redirect target is reused for later requests; once it fails, the original URL is asked again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redirect_target_is_reused_and_refreshed() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("hop");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_25_a", &format!("{}/hop", u.base), &auth(&u));
+        let (st, _) = get(&url, Some("bytes=0-9"), true).await;
+        assert_eq!(st, 206);
+        // Straight to the remembered target, which now answers 403: back to /hop, which redirects anew
+        let at = 2 * BLOCK;
+        let (st, body) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[at as usize..at as usize + 10]);
+        assert_eq!(reqs(&u, "/hop").len(), 2);
+        assert_eq!(reqs(&u, "/once").len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Over the cap, a claim evicts this file's blocks away from the reader.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capacity_evicts_blocks_away_from_reader() {
+        let u = upstream((40 * BLOCK) as usize).await;
+        let dir = tmp("evict");
+        let s = Stream::start(&dir, false).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await; // startup computes the cap from the disk; let it finish first
+        s.cap.store(8 * BLOCK, Ordering::Relaxed);
+        let url = s.video("srv_26_a", &format!("{}/f", u.base), &auth(&u));
+        let f = lock(&s.files).get("srv_26_a").unwrap().clone();
+        let done = || -> Vec<usize> {
+            let st = f.st();
+            (0..st.done.len()).filter(|&b| st.done[b]).collect()
+        };
+        let _ = get(&url, Some("bytes=0-9"), false).await;
+        // Everything near the reader is kept, so the window ahead is written over the cap
+        assert!(
+            until(|| done().len() == AHEAD as usize + 1, 5).await,
+            "{:?}",
+            done()
+        );
+        let at = 30 * BLOCK;
+        let _ = get(&url, Some(&format!("bytes={at}-{}", at + 9)), false).await;
+        assert!(
+            until(|| done() == (30..40).collect::<Vec<_>>(), 10).await,
+            "{:?}",
+            done()
+        );
+        assert_eq!(s.total.load(Ordering::Relaxed), 10 * BLOCK);
+        drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -153,6 +153,7 @@ mod tests {
     fn classes_and_text() {
         assert_eq!(classify(204), Class::Ok);
         assert_eq!(classify(401), Class::Auth);
+        assert_eq!(classify(403), Class::Denied);
         assert_eq!(classify(410), Class::Missing);
         for c in [408, 425, 429, 502, 503, 504, 522] {
             assert_eq!(classify(c), Class::Busy, "{c}");
@@ -174,6 +175,19 @@ mod tests {
             "请求被服务器拒绝（400）：Value cannot be null."
         );
         assert_eq!(describe(404, "{\"a\":1}"), "服务器上找不到（404）");
+        assert_eq!(
+            describe(429, ""),
+            "请求太频繁，服务器限流了，稍后再试（429）"
+        );
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, " 2 ".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(2)));
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), None, "HTTP-date form is ignored");
         assert_eq!(backoff(0, None), Duration::from_millis(500));
         assert_eq!(backoff(5, None), Duration::from_millis(1500));
         assert_eq!(backoff(0, Some(Duration::from_secs(60))), MAX_WAIT);

@@ -93,8 +93,12 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
         h.state::<App>().shutdown(Duration::from_secs(3));
     })
     .await;
+    // 进程马上被安装器结束，不走 RunEvent::Exit：先撤掉运行标记，否则下次启动会记成异常退出
+    let root = app.path.parent().unwrap_or(std::path::Path::new("."));
+    crate::set_running(root, false);
     // Windows 上启动安装器后直接退出进程，不会返回
     if let Err(e) = u.install(bytes) {
+        crate::set_running(root, true);
         // 安装器没起来，程序照常用：撤销退出标记，否则之后点播放都会被当成「正在退出」而放弃
         app.quit.send_replace(false);
         return Err(fail(e));

@@ -45,9 +45,8 @@ impl Serialize for Error {
     }
 }
 
-/// 网络层错误按连不上 / 超时 / 证书分类，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
+/// 网络错误 → 给人看的错误：超时、证书、连不上分开说，括号里附整条错误链（reqwest 顶层只有一句 error sending request）。
 /// 只取 source 链，不取顶层：顶层带完整 URL（含查询参数，如搜索词）。
-/// 网络错误 → 给人看的错误（超时、TLS、连不上分开说）。
 pub(crate) fn net(e: &reqwest::Error) -> Error {
     let mut chain = Vec::new();
     let mut src = std::error::Error::source(e);

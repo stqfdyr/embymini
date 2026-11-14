@@ -17,11 +17,39 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 use tokio::sync::{mpsc, watch};
+
+/// 从点关闭（或开始退出）算起的时刻；关闭各阶段耗时写日志，查「关闭时卡一下」卡在哪一段。
+static CLOSE_T0: OnceLock<Instant> = OnceLock::new();
+
+/// 开始计时（重复调用以第一次为准）。
+fn exit_start() {
+    CLOSE_T0.get_or_init(Instant::now);
+}
+
+/// 记一个关闭阶段；还没开始关闭时（例如平时关掉 mpv）什么都不做。
+pub(crate) fn exit_mark(phase: &str) {
+    if let Some(t0) = CLOSE_T0.get() {
+        log::info!("关闭耗时 {phase}：{} ms", t0.elapsed().as_millis());
+    }
+}
+
+/// 运行标记（数据目录下的 `running`，内容是版本号）：启动时写、正常退出（含自动更新）时删。
+/// 启动时它还在 = 上次崩溃、被结束进程或关机时被杀。
+const RUNNING: &str = "running";
+
+pub(crate) fn set_running(root: &std::path::Path, on: bool) {
+    let f = root.join(RUNNING);
+    let _ = if on {
+        std::fs::write(f, emby::VERSION)
+    } else {
+        std::fs::remove_file(f)
+    };
+}
 
 struct App {
     path: PathBuf,
@@ -117,6 +145,7 @@ impl App {
     /// 续播点就丢了。所以先叫停起播中的 `play` 并等它们返回（否则可能刚起播完又登记一个播放器），
     /// 再让正在播的 mpv 退出、等回传 Stopped。总共最多等 `wait`。
     fn shutdown(&self, wait: Duration) {
+        exit_start();
         self.begin_shutdown();
         tauri::async_runtime::block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
@@ -132,6 +161,7 @@ impl App {
                 }
             }
         });
+        exit_mark("shutdown_done");
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, Error> {
@@ -648,6 +678,7 @@ fn main() {
     }));
     let ctx = tauri::generate_context!();
     let root = config::data_root(&ctx.config().identifier);
+    let exit_root = root.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(w) = app.get_webview_window("main") {
@@ -707,10 +738,17 @@ fn main() {
             let path = root.join("config.json");
             let cfg = config::load(&path);
             config::save(&path, &cfg)?; // 首次启动把生成的 device_id 落盘
-            // shortcut: 旧版本诊断数据留下的暂存与标记，删一次即可；用户大多升过几版后去掉这几行
-            for f in ["telemetry", "last-exit.json", "running.json"] {
-                remove_path(&root.join(f));
+            if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
+                log::warn!("上次没有正常退出（版本 {v}）");
             }
+            set_running(&root, true);
+            // shortcut: 旧版本诊断数据留下的暂存与标记（暂存最多约 20 MB），用户大多升过几版后去掉
+            let old = root.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                for f in ["telemetry", "last-exit.json", "running.json"] {
+                    remove_path(&old.join(f));
+                }
+            });
             let mpv_dir = app
                 .path()
                 .resource_dir()
@@ -780,12 +818,26 @@ fn main() {
                 event: tauri::WindowEvent::CloseRequested { .. },
                 ..
             } if label == "main" => {
+                exit_start();
+                exit_mark("close_requested");
                 if let Some(w) = handle.get_webview_window("main") {
                     let _ = w.hide();
                 }
+                exit_mark("hidden");
                 handle.state::<App>().begin_shutdown();
+                exit_mark("mpv_quit_sent");
             }
-            tauri::RunEvent::Exit => handle.state::<App>().shutdown(Duration::from_secs(3)),
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } => exit_mark("window_destroyed"),
+            tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
+            tauri::RunEvent::Exit => {
+                exit_start();
+                exit_mark("exit");
+                handle.state::<App>().shutdown(Duration::from_secs(3));
+                set_running(&exit_root, false);
+            }
             _ => {}
         });
 }

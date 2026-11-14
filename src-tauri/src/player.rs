@@ -651,6 +651,7 @@ impl Session {
             st.stop(i); // mpv 被直接关掉、没来得及发 end-file 时补发
         }
         let status = child.wait().await;
+        crate::exit_mark("mpv_exited");
         if let Some(s) = &st.stream {
             let names: Vec<String> = st
                 .queue
@@ -691,6 +692,7 @@ impl Session {
         } = st;
         drop(reports);
         let _ = reporter.await;
+        crate::exit_mark("reported");
         log::info!("播放结束");
         let _ = events.send(Event::Ended { volume });
     }

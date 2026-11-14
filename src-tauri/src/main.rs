@@ -165,13 +165,37 @@ impl App {
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, Error> {
-        let mut c = self.cfg();
-        let out = f(&mut c);
-        config::save(&self.path, &c).map_err(|e| Error::Other(format!("保存配置失败：{e}")))?;
-        Ok(out)
+        config::update(&self.path, &mut self.cfg(), f)
+            .map_err(|e| Error::Other(format!("保存配置失败：{e}")))
     }
 
-    /// 当前服务器的 id 和客户端。
+    /// A copy of the saved server `id`.
+    fn server(&self, id: &str) -> Result<Server, Error> {
+        let c = self.cfg();
+        c.servers
+            .iter()
+            .find(|s| s.id == id)
+            .cloned()
+            .ok_or_else(no_server)
+    }
+
+    /// Replaces the saved server with the same id (fails if it was removed meanwhile).
+    fn put_server(&self, s: Server) -> Result<ServerView, Error> {
+        let view = s.view();
+        self.update(|c| c.servers.iter_mut().find(|t| t.id == s.id).map(|t| *t = s))?
+            .ok_or_else(no_server)?;
+        Ok(view)
+    }
+
+    /// Logs `s.user` in at `s`'s address and stores the new user id and token in `s` (not saved).
+    async fn login(&self, s: &mut Server, password: &str) -> Result<(), Error> {
+        let device_id = self.cfg().device_id.clone();
+        (s.user_id, s.token) =
+            emby::login(&self.http, &s.api_base(), &device_id, &s.user, password).await?;
+        Ok(())
+    }
+
+    /// Id and client of the active server.
     fn active(&self) -> Result<(String, Emby), Error> {
         let c = self.cfg();
         let s = c
@@ -216,11 +240,11 @@ struct ConfigView {
     servers: Vec<ServerView>,
     mpv_path: Option<String>,
     preload_percent: u8,
-    /// 个人 mpv 配置文件的路径，设置页里显示给用户。
+    /// Path of the personal mpv.conf, shown on the settings page.
     user_mpv_conf: String,
     update_proxy: Option<String>,
     cache_whole: bool,
-    /// 弹幕接口地址（可能带令牌，只给本机界面看）和屏蔽词。
+    /// Danmaku API address (may carry a token; only this machine's UI sees it) and blocked words.
     danmaku_api: String,
     danmaku_words: Vec<String>,
     version: &'static str,
@@ -243,6 +267,10 @@ fn config_get(app: State<'_, App>) -> ConfigView {
     }
 }
 
+fn no_server() -> Error {
+    Error::Other("服务器不存在".into())
+}
+
 #[tauri::command]
 async fn server_add(
     app: State<'_, App>,
@@ -261,10 +289,8 @@ async fn server_add(
         user_id: String::new(),
         token: String::new(),
     };
-    let base = s.api_base();
-    let device_id = app.cfg().device_id.clone();
-    s.name = emby::server_name(&app.http, &base).await?;
-    (s.user_id, s.token) = emby::login(&app.http, &base, &device_id, &s.user, &password).await?;
+    s.name = emby::server_name(&app.http, &s.api_base()).await?;
+    app.login(&mut s, &password).await?;
     let view = s.view();
     app.update(|c| {
         c.active = Some(s.id.clone());
@@ -273,10 +299,10 @@ async fn server_add(
     Ok(view)
 }
 
-/// 编辑服务器（id 不变，是当前服务器的话仍是当前）：改地址、端口、用户名，或者重新登录。
-/// 先用新地址连一次服务器（顺带更新服务器名），连不上就不保存。
-/// 只改地址时（换域名、换端口、换反代）沿用原来的 token，不用输密码；
-/// 改了用户名、填了密码或者原来就没登录时，用这里的用户名和密码重新登录。
+/// Edits a server (same id; stays active if it was): address, port, user, or a fresh login.
+/// Connects to the new address first (refreshing the server name) and saves nothing if that fails.
+/// An address-only change (new domain, port, reverse proxy) keeps the token, no password needed;
+/// a changed user, a typed password or a missing token logs in again with the given credentials.
 #[tauri::command]
 async fn server_edit(
     app: State<'_, App>,
@@ -287,56 +313,26 @@ async fn server_edit(
     password: String,
 ) -> Result<ServerView, Error> {
     let (url, port) = config::normalize(&url, port).map_err(Error::Other)?;
-    let (mut s, device_id) = {
-        let c = app.cfg();
-        let s = c.servers.iter().find(|s| s.id == id).cloned();
-        (
-            s.ok_or_else(|| Error::Other("服务器不存在".into()))?,
-            c.device_id.clone(),
-        )
-    };
+    let mut s = app.server(&id)?;
     let relogin = !password.is_empty() || user != s.user || s.token.is_empty();
     (s.url, s.port, s.user) = (url, port, user);
-    let base = s.api_base();
-    s.name = emby::server_name(&app.http, &base).await?;
+    s.name = emby::server_name(&app.http, &s.api_base()).await?;
     if relogin {
-        (s.user_id, s.token) =
-            emby::login(&app.http, &base, &device_id, &s.user, &password).await?;
+        app.login(&mut s, &password).await?;
     }
-    let view = s.view();
-    app.update(|c| {
-        let t = c.servers.iter_mut().find(|t| t.id == id)?;
-        *t = s;
-        Some(())
-    })?
-    .ok_or_else(|| Error::Other("服务器不存在".into()))?;
-    Ok(view)
+    app.put_server(s)
 }
 
-/// 重新登录（只要密码）：token 失效或者想换一个新 token 时用。
+/// Logs in again with just the password: the token expired or a new one is wanted.
 #[tauri::command]
 async fn server_login(
     app: State<'_, App>,
     id: String,
     password: String,
 ) -> Result<ServerView, Error> {
-    let (base, user, device_id) = {
-        let c = app.cfg();
-        let s = c
-            .servers
-            .iter()
-            .find(|s| s.id == id)
-            .ok_or_else(|| Error::Other("服务器不存在".into()))?;
-        (s.api_base(), s.user.clone(), c.device_id.clone())
-    };
-    let (user_id, token) = emby::login(&app.http, &base, &device_id, &user, &password).await?;
-    app.update(|c| {
-        let s = c.servers.iter_mut().find(|s| s.id == id)?;
-        s.user_id = user_id;
-        s.token = token;
-        Some(s.view())
-    })?
-    .ok_or_else(|| Error::Other("服务器不存在".into()))
+    let mut s = app.server(&id)?;
+    app.login(&mut s, &password).await?;
+    app.put_server(s)
 }
 
 #[tauri::command]

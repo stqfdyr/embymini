@@ -141,8 +141,9 @@ async fn json_or_error(resp: reqwest::Response) -> Result<Value, Error> {
     }
     let bytes = resp.bytes().await.map_err(|e| net(&e))?;
     if !status.is_success() {
-        // One char over the limit is enough for `describe` to see it is too long
+        // Trimmed first (as `describe` does); one char over the limit tells it the body is too long
         let text = String::from_utf8_lossy(&bytes)
+            .trim()
             .chars()
             .take(status::DETAIL_MAX + 1)
             .collect();
@@ -231,12 +232,11 @@ impl Emby {
         query: &Q,
         body: Option<&Value>,
     ) -> Result<Value, Error> {
-        check_path(path)?;
-        let url = format!("{}{path}", self.base);
+        let url = api_url(&self.base, path)?;
         let sent = status::send(|| {
             let rb = self
                 .http
-                .request(method.clone(), &url)
+                .request(method.clone(), url.clone())
                 .header("X-Emby-Authorization", &self.auth)
                 .header("X-Emby-Token", &self.token)
                 .query(query);
@@ -398,17 +398,21 @@ pub fn subtitle_ext(codec: Option<&str>) -> String {
     }
 }
 
-/// Paths from the UI must stay relative paths under this server's API root.
-fn check_path(path: &str) -> Result<(), Error> {
-    if !path.starts_with('/')
-        || path.contains("://")
-        || path.contains("..")
-        // `%2e%2e` and `\` become `..` / `/` when the URL is parsed
-        || path.contains(['?', '#', '%', '\\'])
+/// `base` + a path from the UI, which must stay under the API root with no query or fragment.
+/// Checked after parsing: the parser turns `%2e%2e`, `\` and dots split by tab / newline into `..` and `/`.
+fn api_url(base: &str, path: &str) -> Result<reqwest::Url, Error> {
+    let bad = || Error::Other(format!("非法路径：{path}"));
+    let root = reqwest::Url::parse(base).map_err(|_| bad())?;
+    let url = reqwest::Url::parse(&format!("{base}{path}")).map_err(|_| bad())?;
+    let under = format!("{}/", root.path().trim_end_matches('/'));
+    if url.origin() != root.origin()
+        || !url.path().starts_with(&under)
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        return Err(Error::Other(format!("非法路径：{path}")));
+        return Err(bad());
     }
-    Ok(())
+    Ok(url)
 }
 
 // ---- Fields playback uses (per the real replies in testdata/; missing fields default) ----
@@ -600,17 +604,23 @@ pub(crate) mod tests {
 
     #[test]
     fn path_guard() {
-        assert!(check_path("/Users/x/Views").is_ok());
+        let base = "https://h.example:443/emby";
+        for ok in ["/Users/x/Views", "/Persons/Tom%20Hanks", "/a/../b"] {
+            assert!(api_url(base, ok).is_ok(), "{ok}");
+        }
         for bad in [
             "Users",
-            "/a/../b",
+            "/../x",
             "https://evil/x",
+            "@evil/x",
             "/a?b=1",
             "/a#x",
             "/%2e%2e/x",
-            "/a\\..\\b",
+            "/..\\x",
+            "/.\t./x",
+            "/.\n./x",
         ] {
-            assert!(check_path(bad).is_err(), "{bad}");
+            assert!(api_url(base, bad).is_err(), "{bad:?}");
         }
     }
 
@@ -655,11 +665,13 @@ pub(crate) mod tests {
                 let n = s.read(&mut buf).await.unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..n]).to_string();
                 let path = head.split(' ').nth(1).unwrap_or_default();
+                let long = format!("\n{}", "x".repeat(300));
                 let (status, body) = match path {
                     "/emby/unauth" => ("401 Unauthorized", ""),
                     "/emby/empty" => ("204 No Content", ""),
                     "/emby/html" => ("200 OK", "<html>"),
                     "/emby/denied" => ("403 Forbidden", "Access denied"),
+                    "/emby/long" => ("400 Bad Request", long.as_str()),
                     _ => ("200 OK", r#"{"a":1}"#),
                 };
                 let resp = format!(
@@ -683,11 +695,16 @@ pub(crate) mod tests {
         assert_eq!(call("/ok").await.unwrap()["a"], 1);
         assert_eq!(call("/empty").await.unwrap(), Value::Null);
         assert!(matches!(call("/unauth").await, Err(Error::Unauthorized)));
-        assert!(matches!(call("/html").await, Err(Error::Other(_))));
+        assert!(
+            matches!(call("/html").await, Err(Error::Other(ref m)) if m.starts_with("回包不是 JSON"))
+        );
         assert!(matches!(
             call("/denied").await,
             Err(Error::Status(403, ref d)) if d == "Access denied"
         ));
+        // A long body is never shown cut off, even after leading whitespace
+        let e = call("/long").await.unwrap_err().to_string();
+        assert_eq!(e, "请求被服务器拒绝（400）");
     }
 
     #[test]

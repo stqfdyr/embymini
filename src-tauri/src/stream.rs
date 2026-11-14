@@ -1829,10 +1829,7 @@ mod tests {
         for t in tasks {
             let (a, b, (st, body)) = t.await.unwrap();
             assert_eq!(st, 206);
-            assert!(
-                body == u.data[a as usize..=b as usize],
-                "{a}-{b} 内容不一致"
-            );
+            assert!(body == u.data[a as usize..=b as usize], "{a}-{b} differs");
         }
         let (st, body) = get(&url, None, false).await;
         assert_eq!((st, body.len() as u64), (200, n));
@@ -1841,7 +1838,7 @@ mod tests {
         let f = lock(&s.files).get("srv_1_a").unwrap().clone();
         assert!(
             until(|| f.st().done.iter().all(|d| *d), 20).await,
-            "没有整片下完"
+            "whole file not completed"
         );
         assert!(until(|| !f.st().busy(), 5).await);
         let before = reqs(&u, "/f").len();
@@ -1968,7 +1965,7 @@ mod tests {
             .collect();
         assert!(
             !moved.is_empty() && moved.iter().all(|r| !r.2),
-            "跳到别的主机不能带 token：{moved:?}"
+            "no token for another host: {moved:?}"
         );
         let _ = &u.other;
 
@@ -2048,7 +2045,7 @@ mod tests {
         );
         assert!(
             until(|| u.active.load(Ordering::SeqCst) == 0, 3).await,
-            "写满前方后还挂着上游连接"
+            "upstream connection kept after the window was full"
         );
         assert!(
             f.st().main.is_some(),
@@ -2388,7 +2385,7 @@ mod tests {
         s.retain(&[]);
         let (_, body) = tokio::time::timeout(Duration::from_secs(5), reading)
             .await
-            .expect("retain 后读的连接没断")
+            .expect("reader not dropped after retain")
             .unwrap();
         assert!(body.len() < u.data.len());
         assert!(until(|| u.active.load(Ordering::SeqCst) == 0, 3).await);
@@ -2404,14 +2401,14 @@ mod tests {
         let _ = get(&url, Some("bytes=0-99"), false).await;
         assert!(
             u.active.load(Ordering::SeqCst) > 0,
-            "整片模式应在后台接着下"
+            "whole-file mode should keep downloading"
         );
         let first = dir.join("video/srv_14_a/0");
         assert!(until(|| first.exists(), 10).await);
         s.idle(&["srv_14_a".into()]);
         assert!(
             until(|| u.active.load(Ordering::SeqCst) == 0, 3).await,
-            "播放结束后还在下"
+            "still downloading after playback ended"
         );
         assert!(first.exists(), "the cache must stay");
         let _ = std::fs::remove_dir_all(dir);

@@ -1,10 +1,8 @@
 //! 检查更新与自动安装（官方 updater 插件；签名用编进程序的公钥校验）。
 
+use crate::App;
 use crate::emby::Error;
-use crate::lifecycle::{running_clear, running_write};
-use crate::{App, telemetry};
 use serde::Serialize;
-use serde_json::{Map, Value, json};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
@@ -47,15 +45,7 @@ pub(crate) async fn update_check(
     handle: AppHandle,
     app: State<'_, App>,
 ) -> Result<Option<UpdateInfo>, Error> {
-    let t0 = std::time::Instant::now();
-    let proxy = app.cfg().update_proxy.is_some();
-    let r = updater(&handle, &app)?.check().await;
-    update_rec("check", proxy, t0, r.as_ref().err(), |m| {
-        if let Ok(u) = &r {
-            m.insert("found".into(), json!(u.as_ref().map(|u| u.version.clone())));
-        }
-    });
-    let u = r.map_err(|e| {
+    let u = updater(&handle, &app)?.check().await.map_err(|e| {
         log::warn!("检查更新失败：{e}");
         Error::Other(format!("检查更新失败：{e}"))
     })?;
@@ -79,10 +69,8 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
         .map_err(fail)?
         .ok_or_else(|| Error::Other("已是最新版本".into()))?;
     log::info!("下载新版本 {}", u.version);
-    let proxy = app.cfg().update_proxy.is_some();
-    let t0 = std::time::Instant::now();
     let (mut got, mut shown) = (0u64, u64::MAX);
-    let r = u
+    let bytes = u
         .download(
             |n, total| {
                 got += n as u64;
@@ -95,65 +83,23 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
             },
             || {},
         )
-        .await;
-    update_rec("download", proxy, t0, r.as_ref().err(), |m| {
-        m.insert("to".into(), json!(u.version));
-        m.insert("mb".into(), json!(got >> 20));
-    });
-    let bytes = r.map_err(fail)?;
+        .await
+        .map_err(fail)?;
     log::info!("启动安装器，程序退出");
-    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先关播放器，再把诊断数据落盘、去掉运行标记（这不是异常退出）。
-    // shutdown 和 flush_now 内部用 block_on，在 async 命令里直接调会 panic，命令永远不返回、界面停在 100%
-    update_rec("install", proxy, std::time::Instant::now(), None, |m| {
-        m.insert("to".into(), json!(u.version));
-    });
+    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先关播放器、回传进度。
+    // shutdown 内部用 block_on，在 async 命令里直接调会 panic，命令永远不返回、界面停在 100%
     let h = handle.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
         h.state::<App>().shutdown(Duration::from_secs(3));
-        telemetry::flush_now(Duration::from_millis(500));
     })
     .await;
-    let root = app
-        .path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .to_owned();
-    running_clear(&root);
     // Windows 上启动安装器后直接退出进程，不会返回
     if let Err(e) = u.install(bytes) {
-        running_write(&root);
         // 安装器没起来，程序照常用：撤销退出标记，否则之后点播放都会被当成「正在退出」而放弃
         app.quit.send_replace(false);
         return Err(fail(e));
     }
     handle.restart()
-}
-
-/// 检查更新各步（check / download / install）记一条 `update`：成败、耗时、错误。
-fn update_rec(
-    step: &str,
-    proxy: bool,
-    t0: std::time::Instant,
-    err: Option<&tauri_plugin_updater::Error>,
-    extra: impl FnOnce(&mut Map<String, Value>),
-) {
-    if !telemetry::enabled() {
-        return;
-    }
-    let mut m = Map::from_iter([
-        ("step".to_owned(), json!(step)),
-        ("ok".to_owned(), json!(err.is_none())),
-        ("ms".to_owned(), json!(t0.elapsed().as_millis() as u64)),
-        ("proxy".to_owned(), json!(proxy)),
-    ]);
-    if let Some(e) = err {
-        m.insert(
-            "err".into(),
-            json!(e.to_string().chars().take(200).collect::<String>()),
-        );
-    }
-    extra(&mut m);
-    telemetry::rec("update", Value::Object(m));
 }
 
 #[cfg(test)]

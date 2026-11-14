@@ -40,8 +40,6 @@ function readJson(req: IncomingMessage): Promise<Record<string, any>> {
 
 export function devBridge(): Plugin {
   let session: Promise<Session> | null = null
-  /** 诊断数据开关只记在内存里；收到的事件打印到 vite 终端，用来核对界面埋点。 */
-  let telOn = false
   return {
     name: 'embymini-dev-bridge',
     apply: 'serve',
@@ -60,8 +58,8 @@ export function devBridge(): Plugin {
           const cmd = (req.url ?? '').replace(/^\//, '')
           if (cmd === 'config_get') {
             return reply(200, {
-              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: true, danmakuApi: '', danmakuWords: [], version: 'dev', telemetryAvailable: true, telemetry: telOn, telemetryName: '',
-              servers: [{ id: 'dev', name: s.name, url: s.url, port: s.port, user: process.env.EMBY_USER, userId: s.userId, base: s.base, tag: 'dev', loggedIn: true }],
+              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: true, danmakuApi: '', danmakuWords: [], version: 'dev',
+              servers: [{ id: 'dev', name: s.name, url: s.url, port: s.port, user: process.env.EMBY_USER, userId: s.userId, base: s.base, loggedIn: true }],
             })
           }
           if (cmd === 'emby') {
@@ -76,15 +74,10 @@ export function devBridge(): Plugin {
             if (!r.ok) return reply(500, { kind: r.status === 401 ? 'unauthorized' : 'status', message: `服务器返回 ${r.status}：${text.slice(0, 200)}` })
             return reply(200, text ? JSON.parse(text) : null)
           }
-          if (cmd === 'telemetry_set') telOn = Boolean(args.on)
           // 缓存都在 Rust 里，浏览器里没有：给一组假数字，看弹窗样式用
           if (cmd === 'cache_info' || cmd === 'cache_clear') {
             const z = args.kind === 'all'
             return reply(200, { video: z ? 0 : 3.2 * 2 ** 30, images: z ? 0 : 446.3 * 2 ** 20, subs: 0, temp: z ? 0 : 483 * 1024, playing: false })
-          }
-          if (cmd === 'tel') {
-            for (const e of args.events ?? []) console.log('[dev-bridge] tel', JSON.stringify(e))
-            return reply(200, null)
           }
           // play / server_* / settings_set / danmaku_set：浏览器里没有 mpv，也不改本地配置，只记一笔（密码、弹幕接口地址里的令牌不打印）
           console.log(`[dev-bridge] ${cmd}`, JSON.stringify(args, (k, v) => (k === 'password' || k === 'api' ? '***' : v)))

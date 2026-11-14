@@ -9,7 +9,6 @@
   import { go } from '../lib/router.svelte'
   import { ask } from '../lib/Dialog.svelte'
   import CacheDialog from '../lib/CacheDialog.svelte'
-  import { gpuName } from '../lib/tel'
 
   const blank = { url: '', port: '', user: '', password: '' }
   let form = $state({ ...blank })
@@ -34,9 +33,6 @@
       dmApi = session.cfg?.danmakuApi ?? '' // 显示后端规范化后的值（去掉了空白和末尾的 /）
       dmWords = (session.cfg?.danmakuWords ?? []).join('\n')
     }, '已保存，下次播放生效')
-  let telOn = $state(session.cfg?.telemetry ?? false)
-  let telName = $state(session.cfg?.telemetryName ?? '')
-  const saveTel = () => run(() => invoke('telemetry_set', { on: telOn, name: telName }), telOn ? '已打开诊断数据' : '已关闭诊断数据')
   let adding = $state(!session.cfg?.servers.length)
 
   async function run(f: () => Promise<unknown>, ok?: string) {
@@ -94,6 +90,18 @@
   const use = (id: string) => run(() => invoke('server_use', { id }).then(() => go('/')))
   const remove = async (id: string, name: string) =>
     (await ask('删除服务器', `删除「${name}」？登录信息会一起删掉。`, '删除', true)) && run(() => invoke('server_remove', { id }))
+  /** 界面用哪块 GPU 渲染（WebGL 报的渲染器名），排查界面卡顿时看是不是落到了核显或软件渲染。 */
+  function gpuName() {
+    try {
+      const gl = document.createElement('canvas').getContext('webgl')
+      const ext = gl?.getExtension('WEBGL_debug_renderer_info')
+      const name = ext ? String(gl!.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : ''
+      if (!name) return '未知（没有 WebGL，可能在用软件渲染）'
+      return /swiftshader|llvmpipe|software|basic render/i.test(name) ? `软件渲染（${name}）` : name.replace(/^ANGLE \((.*)\)$/, '$1')
+    } catch {
+      return '未知'
+    }
+  }
   const gpu = gpuName()
   const savePlayer = () =>
     run(async () => {
@@ -255,22 +263,6 @@
         <div class="sub">只用于检查更新和下载安装包，其它请求都直连</div>
       </div>
     </label>
-    {#if session.cfg?.telemetryAvailable}
-      <label class="row">
-        <span class="label">诊断数据</span>
-        <div class="grow">
-          <div>发送诊断数据</div>
-          <div class="sub">接口、图片、页面、播放的耗时与卡顿，用来改进加载速度和流畅度；不含账号、密码、服务器地址、搜索词和片名</div>
-        </div>
-        <input type="checkbox" bind:checked={telOn} onchange={saveTel} />
-      </label>
-      {#if telOn}
-        <label class="row">
-          <span class="label">上报名称</span>
-          <input class="grow" placeholder="默认用计算机名" bind:value={telName} spellcheck="false" onchange={saveTel} />
-        </label>
-      {/if}
-    {/if}
     <div class="row"><span class="label">界面渲染</span><span class="grow sub selectable">{gpu}</span></div>
     <div class="row"><span class="label">播放器渲染</span><span class="grow sub">mpv 优先使用 NVIDIA 独显（D3D11 + 硬解）；播放时按 i 可查看实际使用的解码方式</span></div>
   </div>

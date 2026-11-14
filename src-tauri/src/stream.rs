@@ -13,9 +13,7 @@
 //!   - 卡住对冲：请求 3 秒没收到正文，在同一位置再开一个，先出数据的留下；最多同时 2 个，之后按 5、8 秒再换。
 //! - 保留：播放器每次换集调 [`Stream::retain`]（当前集 + 已在 mpv 列表里的下一集），其余的停掉并删除；退出不删，下次打开同一部片直接走本地。
 //! - 容量：min(20 GiB, 可用空间 + 现有视频缓存 − 10 GiB)，到了就只缓存前方，读需要的块时删当前文件里最久没读的块。
-//! - 诊断数据：每个文件释放时记一条 `stream`（上游字节、本地命中、对冲、首字节耗时、覆盖率）。
 
-use crate::telemetry;
 use bytes::Bytes;
 use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
@@ -176,26 +174,7 @@ impl St {
     }
 }
 
-/// 一个文件的统计，释放时记一条 `stream`。
-#[derive(Default)]
-struct Stats {
-    /// 上游字节：主任务 / 预览 / 预取下一集。
-    up: [u64; 3],
-    /// 回给 mpv 的字节，和其中读的时候已经在磁盘上的部分。
-    served: u64,
-    hit: u64,
-    /// 请求数：主播放器 / 预览；预览请求全程没等上游的次数。
-    reqs: [u64; 2],
-    thumb_hit: u64,
-    opens: u64,
-    hedges: u64,
-    fails: u64,
-    ttfb_ms: Vec<u64>,
-    wait_ms: u64,
-}
-
 struct File {
-    name: String,
     /// 已被 retain 掉（目录在删）：还连着的读不再安排下载、直接断开。
     gone: AtomicBool,
     dir: PathBuf,
@@ -204,12 +183,11 @@ struct File {
     st: Mutex<St>,
     /// 写进新数据、状态变了就加一，读的一方据此醒来。
     changed: watch::Sender<u64>,
-    stats: Mutex<Stats>,
 }
 
 impl File {
     /// 打开（或新建）一个文件的缓存目录：按 meta.json 的总大小认出完整的块，残缺的、来历不明的删掉。
-    fn open(dir: PathBuf, name: &str, src: Src) -> Self {
+    fn open(dir: PathBuf, src: Src) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         let size = std::fs::read(dir.join("meta.json"))
             .ok()
@@ -235,7 +213,6 @@ impl File {
             }
         }
         Self {
-            name: name.to_owned(),
             gone: AtomicBool::new(false),
             dir,
             key: uuid::Uuid::new_v4().simple().to_string(),
@@ -247,7 +224,6 @@ impl File {
                 ..Default::default()
             }),
             changed: watch::Sender::new(0),
-            stats: Mutex::new(Stats::default()),
         }
     }
 
@@ -342,7 +318,7 @@ pub struct Inner {
     cap: AtomicU64,
     /// 视频缓存的总字节（完成的块）。
     total: AtomicU64,
-    /// 上游下载的总字节（顶栏网速、每分钟诊断数据按它算差）。
+    /// 上游下载的总字节（顶栏网速按它算差）。
     up_bytes: AtomicU64,
     tick: AtomicU64,
     ids: AtomicU64,
@@ -561,7 +537,7 @@ impl Stream {
                     auth: auth.clone(),
                     resolved: None,
                 };
-                let f = Arc::new(File::open(self.video.join(name), name, src));
+                let f = Arc::new(File::open(self.video.join(name), src));
                 lock(&self.keys).insert(f.key.clone(), Key::Video(name.to_owned()));
                 files.insert(name.to_owned(), f.clone());
                 f
@@ -629,7 +605,6 @@ impl Stream {
             f.gone.store(true, Ordering::Relaxed);
             f.stop();
             f.bump();
-            self.report(f);
         }
         let me = self.clone();
         tauri::async_runtime::spawn_blocking(move || me.sweep());
@@ -744,7 +719,7 @@ impl Stream {
         });
     }
 
-    /// 一次播放结束（mpv 退出）：停掉这些文件的下载，缓存留着（下次打开同一部片直接用）；每个文件记一条诊断数据。
+    /// 一次播放结束（mpv 退出）：停掉这些文件的下载，缓存留着（下次打开同一部片直接用）。
     /// 不停的话整片模式会在关掉播放器之后把整部片下完。只停给出的这几个：换片时新的一次播放可能已经开始了。
     pub fn idle(&self, names: &[String]) {
         let files: Vec<_> = {
@@ -753,45 +728,7 @@ impl Stream {
         };
         for f in files {
             f.stop();
-            self.report(&f);
         }
-    }
-
-    /// 程序退出前：每个文件记一条诊断数据。
-    pub fn report_all(&self) {
-        for f in lock(&self.files).values() {
-            self.report(f);
-        }
-    }
-
-    fn report(&self, f: &File) {
-        if !telemetry::enabled() {
-            return;
-        }
-        let s = std::mem::take(&mut *lock(&f.stats));
-        if s.reqs == [0, 0] && s.up == [0; 3] {
-            return;
-        }
-        let mut ttfb = s.ttfb_ms.clone();
-        ttfb.sort_unstable();
-        let (cover, size) = {
-            let st = f.st();
-            let n = st.done.len().max(1);
-            let c = st.done.iter().filter(|d| **d).count();
-            ((c * 100 / n) as u64, st.size.map(|s| s >> 20))
-        };
-        let mut seg = f.name.splitn(3, '_');
-        let kb = |b: u64| b >> 10;
-        telemetry::rec(
-            "stream",
-            json!({
-                "srv": seg.next(), "item": seg.next(),
-                "up_kb": s.up.map(kb), "served_kb": kb(s.served), "hit_kb": kb(s.hit),
-                "reqs": s.reqs, "thumb_hit": s.thumb_hit, "opens": s.opens, "hedges": s.hedges, "fails": s.fails,
-                "ttfb_p50": ttfb.get(ttfb.len() / 2), "ttfb_max": ttfb.last(), "wait_ms": s.wait_ms,
-                "cover": cover, "mb": size, "whole": self.whole.load(Ordering::Relaxed),
-            }),
-        );
     }
 
     async fn handle(&self, req: Request<Incoming>) -> Response<Body> {
@@ -835,7 +772,6 @@ impl Stream {
         head: bool,
         role: Role,
     ) -> Response<Body> {
-        lock(&f.stats).reqs[(role != Role::Main) as usize] += 1;
         let t0 = Instant::now();
         let first = match range {
             Some(Range::From(a, _)) => (a / BLOCK) as usize,
@@ -940,8 +876,6 @@ impl Stream {
         let t0 = Instant::now();
         let mut rx = f.changed.subscribe();
         let mut open: Option<(PathBuf, tokio::fs::File, u64)> = None;
-        let mut waited = Duration::ZERO;
-        let mut all_hit = true;
         while pos <= end {
             let b = (pos / BLOCK) as usize;
             let off = pos % BLOCK;
@@ -969,10 +903,7 @@ impl Stream {
                 Next::Gone => break,
                 Next::Wait(abort) => {
                     abort_all(abort);
-                    all_hit = false;
-                    let w = Instant::now();
                     let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
-                    waited += w.elapsed();
                     if tx.is_closed() {
                         break;
                     }
@@ -1011,23 +942,10 @@ impl Stream {
                 continue;
             }
             *at = off + n;
-            all_hit &= hit;
-            {
-                let mut s = lock(&f.stats);
-                s.served += n;
-                if hit {
-                    s.hit += n;
-                }
-            }
             if tx.send(Bytes::from(buf)).await.is_err() {
                 break; // mpv 断开了（拖动进度会关掉旧连接）
             }
             pos += n;
-        }
-        let mut s = lock(&f.stats);
-        s.wait_ms += waited.as_millis() as u64;
-        if role == Role::Thumb && all_hit {
-            s.thumb_hit += 1;
         }
     }
 
@@ -1074,8 +992,7 @@ impl Stream {
         {
             old.push(st.previews.remove(k).0);
         }
-        let task =
-            tauri::async_runtime::spawn(self.clone().preview_task(f.clone(), b, hi, id, role));
+        let task = tauri::async_runtime::spawn(self.clone().preview_task(f.clone(), b, hi, id));
         st.previews.push((Task { id, task }, b, hi, role));
         old
     }
@@ -1089,9 +1006,9 @@ impl Stream {
         let mut back = 1;
         loop {
             let r = async {
-                let o = self.open(&f, b as u64 * BLOCK, None, Role::Main).await?;
+                let o = self.open(&f, b as u64 * BLOCK, None).await?;
                 let n = f.learn(&self, o.total);
-                self.pump(&f, o, b, n, Some(id), Role::Main).await
+                self.pump(&f, o, b, n, Some(id)).await
             }
             .await;
             match r {
@@ -1133,17 +1050,16 @@ impl Stream {
         }
     }
 
-    async fn preview_task(self, f: Arc<File>, lo: usize, hi: usize, id: u64, role: Role) {
+    async fn preview_task(self, f: Arc<File>, lo: usize, hi: usize, id: u64) {
         let _g = TaskGuard { f: f.clone(), id };
         let end = (hi as u64 + 1) * BLOCK;
         let end = f.st().size.map_or(end, |s| end.min(s)) - 1;
         let r = async {
-            let o = self.open(&f, lo as u64 * BLOCK, Some(end), role).await?;
+            let o = self.open(&f, lo as u64 * BLOCK, Some(end)).await?;
             let n = f.learn(&self, o.total);
-            self.pump(&f, o, lo, (hi + 1).min(n), None, role).await
+            self.pump(&f, o, lo, (hi + 1).min(n), None).await
         }
         .await;
-        let r = r.map(|_| ());
         if let Err(e) = r {
             f.failed(e);
         }
@@ -1169,13 +1085,7 @@ impl Stream {
     }
 
     /// 向上游要 [start, end]（None = 到文件尾），带对冲：3 秒没出数据再开一个，先出数据的留下。
-    async fn open(
-        &self,
-        f: &File,
-        start: u64,
-        end: Option<u64>,
-        role: Role,
-    ) -> Result<Opened, Fail> {
+    async fn open(&self, f: &File, start: u64, end: Option<u64>) -> Result<Opened, Fail> {
         let t0 = Instant::now();
         let mut a: Attempt = Box::pin(self.attempt(&f.src, start, end));
         let mut b: Option<Attempt> = None;
@@ -1195,7 +1105,6 @@ impl Stream {
                     if t0.elapsed() >= OPEN_LIMIT {
                         break Err(Fail::Timeout);
                     }
-                    lock(&f.stats).hedges += 1;
                     if let Some(x) = b.take() {
                         a = x; // 丢掉较早的那个
                     }
@@ -1205,11 +1114,7 @@ impl Stream {
                 }
             }
         };
-        let mut s = lock(&f.stats);
-        s.opens += 1;
         if let Ok(o) = &r {
-            s.ttfb_ms.push(t0.elapsed().as_millis() as u64);
-            s.up[role as usize] += o.first.len() as u64;
             self.up_bytes
                 .fetch_add(o.first.len() as u64, Ordering::Relaxed);
         }
@@ -1323,7 +1228,6 @@ impl Stream {
         from: usize,
         to: usize,
         main: Option<u64>,
-        role: Role,
     ) -> Result<Stop, Fail> {
         let Opened {
             mut resp,
@@ -1353,7 +1257,6 @@ impl Stream {
                         Ok(None) => return Err(Fail::Net("上游提前断开".into())),
                         Err(e) => return Err(Fail::Net(e.without_url().to_string())),
                     };
-                    lock(&f.stats).up[role as usize] += pending.len() as u64;
                     self.up_bytes
                         .fetch_add(pending.len() as u64, Ordering::Relaxed);
                 }
@@ -1466,7 +1369,6 @@ impl File {
             Fail::Net(m) | Fail::Connect(m) => m.clone(),
             Fail::Timeout => format!("{} 秒没有数据", OPEN_LIMIT.as_secs()),
         };
-        lock(&self.stats).fails += 1;
         let back = match e {
             Fail::Status(_) => Duration::from_secs(3),
             Fail::Busy(_, wait) => crate::status::backoff(1, wait).max(Duration::from_secs(1)),

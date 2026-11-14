@@ -5,18 +5,13 @@ mod config;
 mod danmaku;
 mod emby;
 mod images;
-mod lifecycle;
 mod player;
 mod status;
 mod stream;
-mod telemetry;
 mod updater;
 
 use config::{Config, Server, ServerView};
 use emby::{Emby, Error};
-use lifecycle::{
-    START, exit_mark, exit_report, exit_save, exit_start, now_ms, running_check, running_clear,
-};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -122,7 +117,6 @@ impl App {
     /// 续播点就丢了。所以先叫停起播中的 `play` 并等它们返回（否则可能刚起播完又登记一个播放器），
     /// 再让正在播的 mpv 退出、等回传 Stopped。总共最多等 `wait`。
     fn shutdown(&self, wait: Duration) {
-        exit_start();
         self.begin_shutdown();
         tauri::async_runtime::block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
@@ -138,10 +132,6 @@ impl App {
                 }
             }
         });
-        if let Some(s) = &self.stream {
-            s.report_all();
-        }
-        exit_mark("shutdown_done");
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, Error> {
@@ -204,12 +194,6 @@ struct ConfigView {
     danmaku_api: String,
     danmaku_words: Vec<String>,
     version: &'static str,
-    /// 打包时注入了上报地址才有诊断数据开关。
-    telemetry_available: bool,
-    telemetry: bool,
-    telemetry_name: String,
-    /// 进程启动的墙上时间（毫秒），界面据此报启动耗时。
-    start_ms: u64,
 }
 
 #[tauri::command]
@@ -226,10 +210,6 @@ fn config_get(app: State<'_, App>) -> ConfigView {
         danmaku_api: c.danmaku.api.clone(),
         danmaku_words: c.danmaku.words.clone(),
         version: emby::VERSION,
-        telemetry_available: telemetry::AVAILABLE,
-        telemetry: c.telemetry,
-        telemetry_name: tel_name(&c),
-        start_ms: START.get().map_or(0, |(_, ms)| *ms),
     }
 }
 
@@ -260,7 +240,6 @@ async fn server_add(
         c.active = Some(s.id.clone());
         c.servers.push(s);
     })?;
-    record_servers(&app.cfg());
     Ok(view)
 }
 
@@ -301,7 +280,6 @@ async fn server_edit(
         Some(())
     })?
     .ok_or_else(|| Error::Other("服务器不存在".into()))?;
-    record_servers(&app.cfg());
     Ok(view)
 }
 
@@ -521,143 +499,6 @@ async fn cache_clear(handle: AppHandle, kind: String) -> CacheInfo {
     })
 }
 
-fn tel_name(c: &Config) -> String {
-    c.telemetry_name
-        .clone()
-        .filter(|n| !n.trim().is_empty())
-        .unwrap_or_else(emby::device_name)
-}
-
-/// 诊断数据开关和上报名称。打开时补记一条环境信息。
-#[tauri::command]
-fn telemetry_set(app: State<'_, App>, on: bool, name: String) -> Result<(), Error> {
-    let was = telemetry::enabled();
-    app.update(|c| {
-        c.telemetry = on;
-        c.telemetry_name = Some(name.trim().to_owned()).filter(|n| !n.is_empty());
-    })?;
-    telemetry::set_enabled(on);
-    if was && !on {
-        telemetry::purge();
-    }
-    if on && !was {
-        record_env();
-        record_servers(&app.cfg());
-    }
-    Ok(())
-}
-
-/// 界面攒的一批诊断事件（约 5 秒一批）；每条带类别 `k`。
-#[tauri::command]
-fn tel(events: Vec<Value>) {
-    for mut e in events {
-        let k = e
-            .as_object_mut()
-            .and_then(|m| m.remove("k"))
-            .and_then(|k| k.as_str().map(|s| format!("ui_{s}")))
-            .unwrap_or_else(|| "ui".into());
-        telemetry::rec(&k, e);
-    }
-}
-
-/// 上游标识 → 服务器名（不含地址），报表据此显示名字。启动、打开开关、添加 / 编辑服务器时记。
-fn record_servers(c: &Config) {
-    for s in &c.servers {
-        telemetry::rec(
-            "server",
-            serde_json::json!({ "srv": s.view().tag, "name": s.name }),
-        );
-    }
-}
-
-/// 启动（或打开开关）时记一条环境信息：系统、CPU、内存、系统代理。屏幕、界面 GPU、WebView2 版本由界面补。
-fn record_env() {
-    if !telemetry::enabled() {
-        return;
-    }
-    tauri::async_runtime::spawn_blocking(|| {
-        use sysinfo::System;
-        let mut s = System::new();
-        s.refresh_memory();
-        s.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
-        telemetry::rec(
-            "env",
-            serde_json::json!({
-                "os": System::long_os_version(),
-                "kernel": System::kernel_version(),
-                "cpu": s.cpus().first().map(|c| c.brand().trim().to_owned()),
-                "cores": s.cpus().len(),
-                "mem_mb": s.total_memory() / 1024 / 1024,
-                "proxy": system_proxy(),
-            }),
-        );
-    });
-}
-
-/// 系统代理（只记 host:port）：查「网络错误」时要知道用户开没开代理。
-fn system_proxy() -> Option<String> {
-    if !cfg!(windows) {
-        return std::env::var("https_proxy").ok();
-    }
-    let mut cmd = std::process::Command::new("reg");
-    cmd.args([
-        "query",
-        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-    ]);
-    // reg 是控制台程序：不加 CREATE_NO_WINDOW 会闪一下黑框
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x0800_0000);
-    let out = cmd.output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let val = |name: &str| {
-        text.lines()
-            .find(|l| l.split_whitespace().next() == Some(name))
-            .and_then(|l| l.split_whitespace().last().map(str::to_owned))
-    };
-    if val("ProxyEnable").as_deref() != Some("0x1") {
-        return None;
-    }
-    val("ProxyServer")
-}
-
-/// warn / error 日志转给诊断数据。去掉日志插件加的 `[日期][时间][模块][级别]` 前缀，`「…」`里的片名换成省略号。
-fn forward_log(r: &log::Record) {
-    if !telemetry::enabled() {
-        return;
-    }
-    let mut msg = r.args().to_string();
-    while msg.starts_with('[') {
-        match msg.find(']') {
-            Some(i) => msg.drain(..=i),
-            None => break,
-        };
-    }
-    telemetry::rec(
-        "log",
-        serde_json::json!({ "lvl": r.level().as_str(), "msg": scrub(msg.trim()) }),
-    );
-}
-
-/// 去掉日志里夹带的片名（写在「」里）。
-fn scrub(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut depth = 0;
-    for ch in s.chars() {
-        match ch {
-            '「' => {
-                depth += 1;
-                if depth == 1 {
-                    out.push_str("「…」");
-                }
-            }
-            '」' if depth > 0 => depth -= 1,
-            _ if depth == 0 => out.push(ch),
-            _ => {}
-        }
-    }
-    out
-}
-
 /// `emby-img` 协议：界面要的图交给 [`images::Images`]（磁盘缓存 → 上游）。路径里是服务器 id，这里换成那台服务器的 API 根；
 /// 不认识的服务器回 404，不会去别的地址取。
 async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Vec<u8>> {
@@ -675,8 +516,7 @@ async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Ve
     let Some(base) = base else {
         return images::response(Err(404));
     };
-    let srv = config::server_tag(&base);
-    images::response(app.images.get(&req, &base, &srv).await)
+    images::response(app.images.get(&req, &base).await)
 }
 
 /// 通用 Emby 请求（当前服务器）。401 时清掉该服务器的 token，界面据此引导重新登录。
@@ -722,7 +562,6 @@ async fn play(
     from_start: bool,
 ) -> Result<(), Error> {
     let _starting = Starting::enter(&app.starting);
-    telemetry::hold_uploads(); // 起播那几秒不上传诊断数据
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = app.stop_player(); // 换片：旧的 mpv 自己退出、回传，不用等
@@ -801,8 +640,7 @@ async fn play(
 }
 
 fn main() {
-    START.get_or_init(|| (std::time::Instant::now(), now_ms()));
-    // panic 写进日志（error 级，开着诊断数据时也会上报），再交给默认处理
+    // panic 写进日志，再交给默认处理
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error!("程序出错（panic）：{info}");
@@ -810,7 +648,6 @@ fn main() {
     }));
     let ctx = tauri::generate_context!();
     let root = config::data_root(&ctx.config().identifier);
-    let exit_root = root.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(w) = app.get_webview_window("main") {
@@ -832,11 +669,6 @@ fn main() {
                         path: root.join("logs"),
                         file_name: None,
                     }),
-                    Target::new(TargetKind::Dispatch(
-                        tauri_plugin_log::fern::Dispatch::new()
-                            .chain(tauri_plugin_log::fern::Output::call(forward_log)),
-                    ))
-                    .filter(|m| m.level() <= log::Level::Warn),
                 ])
                 .build(),
         )
@@ -875,19 +707,10 @@ fn main() {
             let path = root.join("config.json");
             let cfg = config::load(&path);
             config::save(&path, &cfg)?; // 首次启动把生成的 device_id 落盘
-            telemetry::set_enabled(cfg.telemetry);
-            telemetry::start(
-                root.join("telemetry"),
-                telemetry::Meta {
-                    device: cfg.device_id.clone(),
-                    name: tel_name(&cfg),
-                    version: emby::VERSION,
-                },
-            );
-            record_env();
-            record_servers(&cfg);
-            exit_report(&root);
-            running_check(&root);
+            // shortcut: 旧版本诊断数据留下的暂存与标记，删一次即可；用户大多升过几版后去掉这几行
+            for f in ["telemetry", "last-exit.json", "running.json"] {
+                remove_path(&root.join(f));
+            }
             let mpv_dir = app
                 .path()
                 .resource_dir()
@@ -947,8 +770,6 @@ fn main() {
             play,
             updater::update_check,
             updater::update_install,
-            telemetry_set,
-            tel
         ])
         .build(ctx)
         .unwrap_or_else(|e| panic!("EmbyMini 启动失败：{e}"))
@@ -959,28 +780,12 @@ fn main() {
                 event: tauri::WindowEvent::CloseRequested { .. },
                 ..
             } if label == "main" => {
-                exit_start();
-                exit_mark("close_requested");
                 if let Some(w) = handle.get_webview_window("main") {
                     let _ = w.hide();
                 }
-                exit_mark("hidden");
                 handle.state::<App>().begin_shutdown();
-                exit_mark("mpv_quit_sent");
             }
-            tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::Destroyed,
-                ..
-            } => exit_mark("window_destroyed"),
-            tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
-            tauri::RunEvent::Exit => {
-                exit_start();
-                exit_mark("exit");
-                handle.state::<App>().shutdown(Duration::from_secs(3));
-                exit_save(&exit_root);
-                telemetry::flush_now(Duration::from_millis(500));
-                running_clear(&exit_root);
-            }
+            tauri::RunEvent::Exit => handle.state::<App>().shutdown(Duration::from_secs(3)),
             _ => {}
         });
 }
@@ -988,13 +793,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scrub_hides_titles() {
-        assert_eq!(scrub("无法播放「浴血黑帮」：403"), "无法播放「…」：403");
-        assert_eq!(scrub("a「b「c」d」e"), "a「…」e");
-        assert_eq!(scrub("没有片名"), "没有片名");
-    }
 
     #[test]
     fn clean_path_strips_quotes() {

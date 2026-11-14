@@ -233,8 +233,7 @@ impl Api {
     async fn send(&self, build: impl Fn() -> reqwest::RequestBuilder) -> Result<Value, Fail> {
         // 接口全是查询（match 也只是用 POST 传参），重发无副作用
         let (sent, _) = crate::status::send_readonly(|| build().timeout(TIMEOUT)).await;
-        let net =
-            |e: reqwest::Error| Fail::Busy(format!("弹幕接口：{}", emby::net_classified(&e).1));
+        let net = |e: reqwest::Error| Fail::Busy(format!("弹幕接口：{}", emby::net(&e)));
         let r = sent.map_err(net)?;
         let code = r.status().as_u16();
         let body = r.bytes().await.map_err(net)?;

@@ -1900,14 +1900,23 @@ mod tests {
         .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         // Ahead-only: the first main task stops AHEAD blocks in and, once replaced, writes no more; the new one writes 30..=30 + AHEAD
-        let st = f.st();
-        let done: Vec<usize> = (0..st.done.len()).filter(|&b| st.done[b]).collect();
-        drop(st);
+        let done: Vec<usize> = {
+            let st = f.st();
+            (0..st.done.len()).filter(|&b| st.done[b]).collect()
+        };
         let want: Vec<usize> = (0..=AHEAD as usize)
             .chain([20])
             .chain(30..=30 + AHEAD as usize)
             .collect();
         assert_eq!(done, want);
+        // Seeking back behind the main task starts a new one there instead of waiting for it
+        let at = 25 * BLOCK;
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            get(&url, Some(&format!("bytes={at}-{}", at + 99)), false),
+        )
+        .await;
+        assert_eq!(r.map(|r| r.0).ok(), Some(206), "seek back stalled");
         drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2086,6 +2095,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A failed preview holds off before the next request instead of hammering a flaky upstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preview_failures_back_off() {
+        let u = upstream(BLOCK as usize).await;
+        let dir = tmp("flaky-thumb");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_20_a", &format!("{}/flaky", u.base), &auth(&u));
+        let t0 = Instant::now();
+        let (st, body) = get(&url, Some("bytes=0-99"), true).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[..100]);
+        // Two 502s, each followed by a 1.5 s hold-off (crate::status::backoff)
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(2500) && took < Duration::from_secs(6),
+            "{took:?}"
+        );
+        assert_eq!(reqs(&u, "/flaky").len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Whole-file mode keeps going through cuts with no reader left (the main task retries on its own).
     #[tokio::test(flavor = "multi_thread")]
     async fn whole_mode_survives_cuts_without_reader() {
@@ -2122,6 +2152,10 @@ mod tests {
         assert!(until(|| done() == [0, 8, 9], 5).await, "{:?}", done());
         assert!(until(|| !f.st().busy(), 5).await);
         assert_eq!(done(), [0, 8, 9]);
+        assert_eq!(reqs(&u, "/f").len(), 2, "{:?}", reqs(&u, "/f"));
+        // Prefetching again finds everything cached
+        s.prefetch("srv_19_a");
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(reqs(&u, "/f").len(), 2, "{:?}", reqs(&u, "/f"));
         drop(f);
         let _ = std::fs::remove_dir_all(dir);

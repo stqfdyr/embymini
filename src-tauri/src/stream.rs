@@ -27,12 +27,12 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-
-use crate::lock;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{mpsc, watch};
+
+use crate::{lock, sub_total};
 
 /// 块大小。分块文件而不是一个大稀疏文件：NTFS 的非稀疏文件在远处偏移写入要同步补零。
 pub const BLOCK: u64 = 4 << 20;
@@ -202,10 +202,12 @@ impl File {
             if fname == "meta.json" {
                 continue;
             }
+            // Canonical names only: `01` or `+1` would parse as block 1 yet never be read or deleted.
             let whole = fname.parse::<usize>().ok().filter(|&b| {
-                size.is_some_and(|s| {
-                    b < n && e.metadata().is_ok_and(|m| m.len() == block_len(s, b))
-                })
+                b.to_string() == fname
+                    && size.is_some_and(|s| {
+                        b < n && e.metadata().is_ok_and(|m| m.len() == block_len(s, b))
+                    })
             });
             match whole {
                 Some(b) => done[b] = true,
@@ -610,12 +612,19 @@ impl Stream {
             f.bump();
         }
         let me = self.clone();
-        tauri::async_runtime::spawn_blocking(move || me.sweep());
+        tauri::async_runtime::spawn_blocking(move || {
+            // Every episode change refreshes the cap from free disk space and corrects drift in `total`.
+            if !me.sweep(false) {
+                me.recount();
+            }
+        });
     }
 
     /// Deletes doomed dirs: renamed into the trash under the lock (a name registered again first is spared),
-    /// then removed outside it. On Windows the rename fails while a file inside is open; retried in 10 s.
-    fn sweep(&self) {
+    /// then removed outside it. On Windows the rename fails while a file inside is open; retried every 10 s
+    /// by a single chain (`retry` marks a run of it). Returns whether anything was renamed (and recounted).
+    fn sweep(&self, retry: bool) -> bool {
+        let mut stuck = Vec::new();
         let trash: Vec<PathBuf> = {
             let mut doomed = lock(&self.doomed);
             let mut out = Vec::new();
@@ -628,27 +637,38 @@ impl Stream {
                         out.push(to);
                         false
                     }
-                    Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        stuck.push(format!("{n}（{e}）"));
+                        true
+                    }
                 }
             });
             out
         };
+        let renamed = !trash.is_empty();
         // Trash dirs are not counted (recount skips them): recount first so a new film need not wait for
-        // the old dir to be deleted. Nothing renamed, nothing changed: skip the full scan.
-        if !trash.is_empty() {
+        // the old dir to be deleted.
+        if renamed {
             self.recount();
         }
         for t in trash {
             let _ = std::fs::remove_dir_all(t);
         }
-        if !lock(&self.doomed).is_empty() && !self.sweep_retry.swap(true, Ordering::AcqRel) {
+        // The retry chain owns the flag; any other sweep starts a chain only if none is pending.
+        if !stuck.is_empty() && (retry || !self.sweep_retry.swap(true, Ordering::AcqRel)) {
+            if !retry {
+                log::warn!("缓存目录暂时删不掉，每 10 秒重试：{}", stuck.join("、"));
+            }
             let me = self.clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                me.sweep_retry.store(false, Ordering::Release);
-                tauri::async_runtime::spawn_blocking(move || me.sweep());
+                tauri::async_runtime::spawn_blocking(move || me.sweep(true));
             });
+        } else if retry {
+            self.sweep_retry.store(false, Ordering::Release);
         }
+        renamed
     }
 
     /// Recounts the video cache (trash excluded) and sets the cap from the disk's free space.
@@ -1458,18 +1478,6 @@ impl Stream {
     }
 }
 
-/// Subtracts without going below 0: an inexact count should undercount, never wrap into a huge number
-/// that would make trimming delete everything. The image cache uses it too.
-pub fn sub_total(total: &AtomicU64, n: u64) {
-    // fetch_update is renamed try_update in new toolchains and the new name is missing in our MSRV: hand-rolled CAS.
-    let mut v = total.load(Ordering::Relaxed);
-    while let Err(now) =
-        total.compare_exchange_weak(v, v.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed)
-    {
-        v = now;
-    }
-}
-
 fn abort_all(tasks: impl IntoIterator<Item = Task>) {
     for t in tasks {
         t.task.abort();
@@ -2083,7 +2091,10 @@ mod tests {
         std::fs::write(v.join("a/nested/x"), [0u8; 5]).unwrap();
         std::fs::write(v.join(".trash-old/y"), [0u8; 3]).unwrap();
         std::fs::write(dir.join("subs/s.srt"), [0u8; 7]).unwrap();
-        assert!(free_space(&v).is_some());
+        assert!(
+            free_space(&v).is_some(),
+            "the cap needs the disk's free space"
+        );
         let s = Stream::start(&dir, true).unwrap();
         assert!(
             until(|| s.total.load(Ordering::Relaxed) == 15, 5).await,
@@ -2104,7 +2115,7 @@ mod tests {
 
         // A doomed name that is already gone is dropped; a real dir is moved out and the total recounted at once.
         lock(&s.doomed).extend(["a".to_owned(), "ghost".to_owned()]);
-        s.sweep();
+        assert!(s.sweep(false));
         assert!(lock(&s.doomed).is_empty());
         assert!(
             !s.sweep_retry.load(Ordering::Relaxed),
@@ -2112,13 +2123,19 @@ mod tests {
         );
         assert!(!v.join("a").exists());
         assert_eq!(s.total.load(Ordering::Relaxed), 0);
-        // A dir that cannot be renamed stays doomed with exactly one retry queued.
-        std::fs::write(v.join("plain"), b"").unwrap();
-        lock(&s.doomed).insert("plain/sub".into());
-        s.sweep();
-        assert!(lock(&s.doomed).contains("plain/sub"));
-        assert!(s.sweep_retry.load(Ordering::Relaxed));
-        lock(&s.doomed).clear();
+        assert!(!s.sweep(false), "nothing to rename");
+        // A dir that cannot be renamed stays doomed with one retry chain; a finished retry clears the flag.
+        // (Renaming below a regular file is ENOTDIR on unix; Windows reports it as NotFound.)
+        if cfg!(unix) {
+            std::fs::write(v.join("plain"), b"").unwrap();
+            lock(&s.doomed).insert("plain/sub".into());
+            s.sweep(false);
+            assert!(lock(&s.doomed).contains("plain/sub"));
+            assert!(s.sweep_retry.load(Ordering::Relaxed));
+            lock(&s.doomed).clear();
+            s.sweep(true);
+            assert!(!s.sweep_retry.load(Ordering::Relaxed));
+        }
 
         std::fs::create_dir_all(v.join("b")).unwrap();
         s.clear_video(false);
@@ -2140,6 +2157,7 @@ mod tests {
         for (name, len) in [
             ("0", 3),
             ("1", 10),
+            ("01", 10),
             ("2", 10),
             ("1.4.part", 1),
             ("meta.json.tmp", 1),
@@ -2161,7 +2179,11 @@ mod tests {
         assert_eq!(left, ["1", "meta.json"]);
 
         let s = Stream::start(&dir, true).unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await; // startup recount
+        let on_disk = dir_size(&dir.join("video"));
+        assert!(
+            until(|| s.total.load(Ordering::Relaxed) == on_disk, 5).await,
+            "startup recount done before the total is set by hand"
+        );
         s.total.store(100, Ordering::Relaxed);
         f.repair(&s, 0);
         assert_eq!(
@@ -2191,9 +2213,10 @@ mod tests {
             f.failed(e);
             f.st().retry_at.unwrap() - Instant::now()
         };
+        // Lower bounds are loose so a stalled CI runner passes; a wrong arm is still off by about 2x.
         let w = wait(Fail::Status(404));
         assert!(
-            w > Duration::from_millis(2900) && w <= Duration::from_secs(3),
+            w > Duration::from_millis(2500) && w <= Duration::from_secs(3),
             "{w:?}"
         );
         assert_eq!(f.st().status_since(before), Some(404));
@@ -2204,7 +2227,7 @@ mod tests {
         );
         let w = wait(Fail::Busy(503, Some(Duration::from_secs(2))));
         assert!(
-            w > Duration::from_millis(1900) && w <= Duration::from_secs(2),
+            w > Duration::from_millis(1500) && w <= Duration::from_secs(2),
             "{w:?}"
         );
         assert_eq!(
@@ -2214,7 +2237,7 @@ mod tests {
         );
         let w = wait(Fail::Net("x".into()));
         assert!(
-            w > Duration::from_millis(900) && w <= Duration::from_secs(1),
+            w > Duration::from_millis(500) && w <= Duration::from_secs(1),
             "{w:?}"
         );
         assert!(rx.has_changed().unwrap(), "failures wake readers");

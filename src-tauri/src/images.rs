@@ -258,7 +258,7 @@ impl Images {
                     tokio::task::spawn_blocking(move || trim_dir(&dir, cap)).await
                 {
                     // Saturating: a clear meanwhile may already have recounted below `removed`.
-                    crate::stream::sub_total(&self.total, removed);
+                    crate::sub_total(&self.total, removed);
                 }
                 self.trimming.store(false, Ordering::Release);
             }

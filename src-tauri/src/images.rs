@@ -258,15 +258,7 @@ impl Images {
                     tokio::task::spawn_blocking(move || trim_dir(&dir, cap)).await
                 {
                     // Saturating: a clear meanwhile may already have recounted below `removed`.
-                    let mut t = self.total.load(Ordering::Relaxed);
-                    while let Err(now) = self.total.compare_exchange_weak(
-                        t,
-                        t.saturating_sub(removed),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        t = now;
-                    }
+                    crate::stream::sub_total(&self.total, removed);
                 }
                 self.trimming.store(false, Ordering::Release);
             }

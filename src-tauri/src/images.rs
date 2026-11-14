@@ -16,12 +16,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-use crate::lock;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{OnceCell, Semaphore};
+
+use crate::lock;
 
 pub const SCHEME: &str = "emby-img";
 /// Disk cap. A poster (240–480 px) is 20–60 KB, a backdrop (1600 px) 200–400 KB: room for tens of thousands.
@@ -146,6 +146,8 @@ pub struct Images {
     /// not recorded (otherwise it would stick for another 30 minutes).
     missing: Mutex<(u64, HashMap<String, Instant>)>,
     total: AtomicU64,
+    /// One over-cap trim at a time: parallel ones would list the same files and delete past the 90% mark.
+    trimming: AtomicBool,
 }
 
 impl Images {
@@ -159,17 +161,14 @@ impl Images {
             inflight: Mutex::new(HashMap::new()),
             missing: Mutex::new((0, HashMap::new())),
             total: AtomicU64::new(0),
+            trimming: AtomicBool::new(false),
         })
     }
 
     /// Background job at startup: sum up the existing cache and trim it.
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let total = list(&me.dir).iter().map(|(_, n, _)| n).sum();
-            me.total.store(total, Ordering::Relaxed);
-            me.trim();
-        });
+        tauri::async_runtime::spawn_blocking(move || me.recount());
     }
 
     /// Gets one image: disk cache → upstream. `api_base` is that server's API root (unknown servers get a 404
@@ -226,7 +225,8 @@ impl Images {
             let sent = self.http.get(url).send().await;
             match crate::status::retry_wait(&sent, true) {
                 Some(wait) if n < crate::status::RETRIES => {
-                    drop(slot);
+                    // Hand the connection back too, not only the slot, while waiting.
+                    drop((slot, sent));
                     tokio::time::sleep(crate::status::backoff(n, wait)).await;
                     n += 1;
                     continue;
@@ -250,19 +250,33 @@ impl Images {
         let tmp = path.with_extension("tmp");
         if tokio::fs::write(&tmp, b).await.is_ok() && tokio::fs::rename(&tmp, path).await.is_ok() {
             let total = self.total.fetch_add(b.len() as u64, Ordering::Relaxed) + b.len() as u64;
-            if total > self.cap {
-                // Lists and deletes across the whole directory: off the async workers.
+            if total > self.cap && !self.trimming.swap(true, Ordering::AcqRel) {
+                // Lists and deletes across the whole directory: off the async workers. Subtracts what it
+                // deleted instead of storing its count, which would drop bytes stored meanwhile.
                 let (dir, cap) = (self.dir.clone(), self.cap);
-                if let Ok(t) = tokio::task::spawn_blocking(move || trim_dir(&dir, cap)).await {
-                    self.total.store(t, Ordering::Relaxed);
+                if let Ok((_, removed)) =
+                    tokio::task::spawn_blocking(move || trim_dir(&dir, cap)).await
+                {
+                    // Saturating: a clear meanwhile may already have recounted below `removed`.
+                    let mut t = self.total.load(Ordering::Relaxed);
+                    while let Err(now) = self.total.compare_exchange_weak(
+                        t,
+                        t.saturating_sub(removed),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        t = now;
+                    }
                 }
+                self.trimming.store(false, Ordering::Release);
             }
         }
     }
 
-    fn trim(&self) {
-        self.total
-            .store(trim_dir(&self.dir, self.cap), Ordering::Relaxed);
+    /// Trims and sets the total from what is on disk. Blocking.
+    fn recount(&self) {
+        let (left, _) = trim_dir(&self.dir, self.cap);
+        self.total.store(left, Ordering::Relaxed);
     }
 
     /// Cache manager: bytes used.
@@ -279,15 +293,16 @@ impl Images {
         for (p, ..) in list(&self.dir) {
             let _ = std::fs::remove_file(p);
         }
-        self.trim();
+        self.recount();
     }
 }
 
 /// Over `cap`, deletes the least recently used (mtime, refreshed on hit) down to 90% of the cap (headroom so
-/// not every store trims). Returns the bytes left. Blocking; the subtitle cache uses it too.
-pub fn trim_dir(dir: &Path, cap: u64) -> u64 {
+/// not every store trims). Returns (bytes left, bytes deleted). Blocking; the subtitle cache uses it too.
+pub fn trim_dir(dir: &Path, cap: u64) -> (u64, u64) {
     let mut files = list(dir);
     let mut total: u64 = files.iter().map(|(_, n, _)| n).sum();
+    let mut removed = 0;
     if total > cap {
         files.sort_by_key(|(_, _, t)| *t);
         for (p, n, _) in files {
@@ -296,10 +311,11 @@ pub fn trim_dir(dir: &Path, cap: u64) -> u64 {
             }
             if std::fs::remove_file(&p).is_ok() {
                 total -= n;
+                removed += n;
             }
         }
     }
-    total
+    (total, removed)
 }
 
 /// Files in a cache dir: (path, size, mtime). Half-written temp files (`.tmp`) are skipped.
@@ -317,18 +333,20 @@ fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
 }
 
 /// Reads a cached image and refreshes its mtime, which trimming reads as "last used".
+/// One blocking-pool trip: a grid hits dozens at once, and slow disks or antivirus must not stall async workers.
 async fn cached(path: &Path) -> Option<Vec<u8>> {
-    let b = tokio::fs::read(path).await.ok()?;
     let p = path.to_owned();
-    // A grid hits dozens at once; slow disks and antivirus must not stall the async workers.
-    let _ = tokio::task::spawn_blocking(move || {
-        std::fs::File::options()
+    tokio::task::spawn_blocking(move || {
+        let b = std::fs::read(&p).ok()?;
+        let _ = std::fs::File::options()
             .write(true)
-            .open(p)
-            .and_then(|f| f.set_modified(SystemTime::now()))
+            .open(&p)
+            .and_then(|f| f.set_modified(SystemTime::now()));
+        Some(b)
     })
-    .await;
-    Some(b)
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Response for the custom scheme.
@@ -584,10 +602,18 @@ mod tests {
         let dir = tmpdir("cap");
         let (base, _) = upstream(|_, _| OK).await;
         let img = images(&dir, 10);
-        for i in 1..=3 {
+        let now = SystemTime::now();
+        for i in 1..=3u64 {
             let req = Req::parse(&format!("s/{i}/Primary/0/t/240")).unwrap();
             img.get(&req, &base).await.unwrap();
-            assert_eq!(img.usage(), [4, 8, 8][i - 1], "after image {i}");
+            assert_eq!(img.usage(), [4, 8, 8][i as usize - 1], "after image {i}");
+            if let Ok(f) = std::fs::File::options()
+                .write(true)
+                .open(dir.join(req.file_name()))
+            {
+                // Explicit ages: coarse file-system clocks could otherwise tie them.
+                f.set_modified(now - Duration::from_secs(100 - i)).unwrap();
+            }
         }
         let first = Req::parse("s/1/Primary/0/t/240").unwrap();
         assert!(!dir.join(first.file_name()).exists(), "oldest trimmed");
@@ -642,7 +668,7 @@ mod tests {
                 .set_modified(base + Duration::from_secs(i as u64))
                 .unwrap();
         }
-        img.trim();
+        img.recount();
         // 300 > 250: deleting the oldest leaves 200 ≤ 225 (90%), so it stops.
         assert!(!dir.join("old").exists());
         assert!(
@@ -652,7 +678,7 @@ mod tests {
         assert_eq!(img.total.load(Ordering::Relaxed), 200);
         // Exactly at the cap nothing goes; half-written temp files are not counted.
         std::fs::write(dir.join("x.tmp"), [0u8; 50]).unwrap();
-        assert_eq!(trim_dir(&dir, 200), 200);
+        assert_eq!(trim_dir(&dir, 200), (200, 0));
         assert!(dir.join("mid").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

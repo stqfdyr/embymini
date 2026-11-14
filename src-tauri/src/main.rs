@@ -386,7 +386,13 @@ fn danmaku_set(app: State<'_, App>, api: String, words: Vec<String>) -> Result<(
         .iter()
         .map(|w| w.trim().to_owned())
         .filter(|w| !w.is_empty())
-        .collect();
+        .collect::<Vec<String>>();
+    if let Some(p) = lock(&app.player).as_ref() {
+        let _ = p.ctl.send(player::Ctl::Danmaku {
+            api: danmaku::Api::new(app.http.clone(), &api),
+            words: words.clone(),
+        });
+    }
     app.update(|c| {
         c.danmaku.api = api;
         c.danmaku.words = words;

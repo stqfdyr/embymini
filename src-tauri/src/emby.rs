@@ -220,7 +220,8 @@ pub async fn login(
 ) -> Result<(String, String), Error> {
     const PATH: &str = "/Users/AuthenticateByName";
     let t0 = Instant::now();
-    let sent = crate::status::send(|| {
+    // 登录重发最多多建一个会话，无害
+    let sent = crate::status::send_readonly(|| {
         http.post(format!("{base}{PATH}"))
             .header("X-Emby-Authorization", auth_header(device_id, "", ""))
             .json(&serde_json::json!({ "Username": user, "Pw": password }))

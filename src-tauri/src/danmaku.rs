@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// 缓存在这段时间内直接用（还在播出的剧，弹幕会越来越多）。
@@ -121,7 +122,8 @@ pub fn normalize(input: &str) -> Result<String, String> {
 pub fn key(tag: &str, item: &Item) -> String {
     match (&item.series_id, item.kind.as_str()) {
         (Some(series), "Episode") => {
-            format!("{tag}:{series}:{}", item.parent_index_number.unwrap_or(0))
+            // 没有季号的按第 1 季，和 match_name 一致
+            format!("{tag}:{series}:{}", item.parent_index_number.unwrap_or(1))
         }
         _ => format!("{tag}:{}", item.id),
     }
@@ -229,7 +231,8 @@ impl Api {
 
     /// 发请求（暂时性失败按 [`crate::status`] 重试），按 [`judge`] 定结果。错误里不带 URL：地址里可能有令牌。
     async fn send(&self, build: impl Fn() -> reqwest::RequestBuilder) -> Result<Value, Fail> {
-        let (sent, _) = crate::status::send(|| build().timeout(TIMEOUT)).await;
+        // 接口全是查询（match 也只是用 POST 传参），重发无副作用
+        let (sent, _) = crate::status::send_readonly(|| build().timeout(TIMEOUT)).await;
         let net =
             |e: reqwest::Error| Fail::Busy(format!("弹幕接口：{}", emby::net_classified(&e).1));
         let r = sent.map_err(net)?;
@@ -379,7 +382,7 @@ fn parse_comments(v: &Value) -> Vec<Value> {
 pub struct Ctx {
     /// 没填接口地址时为 None：面板里提示到设置里填。
     pub api: Option<Api>,
-    /// 缓存目录（每集一个 `<episodeId>.json`）。
+    /// 缓存目录（每集一个 `<接口地址哈希>-<episodeId>.json`）。
     pub dir: PathBuf,
     pub cfg: Config,
 }
@@ -392,10 +395,10 @@ pub struct Want {
     pub pick: Option<Pick>,
 }
 
-/// 拉好的一集：缓存文件和给人看的出处。
+/// 拉好的一集：弹幕（缓存文件的原文，JSON 数组）和给人看的出处。
 #[derive(Serialize, Debug, PartialEq)]
 pub struct Loaded {
-    pub path: PathBuf,
+    pub list: String,
     pub title: String,
     pub manual: bool,
     /// 接口暂时取不到，用的是旧缓存。
@@ -414,13 +417,21 @@ pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fai
         None => api.matched(&w.name).await?,
     };
     let Some(ep) = ep else { return Ok(None) };
-    let path = dir.join(format!("{}.json", ep.id));
+    // 集 id 只在同一个接口里唯一：文件名带上接口地址的哈希，换了接口不会读到别家的缓存
+    let path = dir.join(format!(
+        "{}-{}.json",
+        crate::config::server_tag(&api.base),
+        ep.id
+    ));
     let mut stale = false;
+    let mut list = None;
     if !fresh(&path, FRESH) {
         match api.comments(ep.id).await {
-            Ok(list) => {
+            Ok(v) => {
                 prune(dir);
-                write(&path, &Value::Array(list)).map_err(Fail::Other)?;
+                let text = Value::Array(v).to_string();
+                write(&path, &text).map_err(Fail::Other)?;
+                list = Some(text);
             }
             Err(e @ (Fail::Busy(_) | Fail::Other(_))) if path.is_file() => {
                 log::warn!("{e}，先用旧的弹幕缓存");
@@ -429,8 +440,14 @@ pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fai
             Err(e) => return Err(e),
         }
     }
+    let list = match list {
+        Some(l) => l,
+        None => tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| Fail::Other(format!("读弹幕缓存失败：{e}")))?,
+    };
     Ok(Some(Loaded {
-        path,
+        list,
         title: ep.title,
         manual: w.pick.is_some(),
         stale,
@@ -445,14 +462,19 @@ fn fresh(path: &Path, within: Duration) -> bool {
     })
 }
 
-fn write(path: &Path, v: &Value) -> Result<(), String> {
+/// 先写临时文件再改名。同一集可能同时在取（预取下一集还没完就开播了、连点重新加载），临时文件名各不相同。
+fn write(path: &Path, text: &str) -> Result<(), String> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let fail = |e: std::io::Error| format!("写弹幕缓存失败：{e}");
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(fail)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, v.to_string()).map_err(fail)?;
-    std::fs::rename(&tmp, path).map_err(fail)
+    let tmp = path.with_extension(format!("{}.tmp", SEQ.fetch_add(1, Ordering::Relaxed)));
+    let r = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r.map_err(fail)
 }
 
 /// 删掉一周没更新的缓存。
@@ -487,6 +509,10 @@ mod tests {
         let ep = item("Episode", Some("庆余年"), Some(2), Some(3));
         assert_eq!(match_name(&ep), "庆余年 S02E03");
         assert_eq!(key("t", &ep), "t:77:2");
+        assert_eq!(
+            key("t", &item("Episode", Some("某番"), None, Some(7))),
+            "t:77:1"
+        );
         assert_eq!(index(&ep), 2);
         let no_season = item("Episode", Some("某番"), None, Some(7));
         assert_eq!(match_name(&no_season), "某番 S01E07");
@@ -604,6 +630,22 @@ mod tests {
         );
     }
 
+    /// 同一集同时写两份（预取和开播撞上）：各写各的临时文件，都成功。
+    #[test]
+    fn concurrent_writes() {
+        let dir = std::env::temp_dir().join(format!("embymini-dm-w-{}", std::process::id()));
+        let path = dir.join("x-1.json");
+        let ts: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || (0..50).all(|_| write(&path, "[]").is_ok()))
+            })
+            .collect();
+        assert!(ts.into_iter().all(|t| t.join().unwrap()));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "不留临时文件");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// 真接口：环境变量 `DANMU_API` 为接口地址（含令牌）。
     #[tokio::test]
     #[ignore]
@@ -620,7 +662,7 @@ mod tests {
             pick: None,
         };
         let l = load(&api, &dir, &w).await.unwrap().expect("应能匹配");
-        let list: Vec<Value> = serde_json::from_slice(&std::fs::read(&l.path).unwrap()).unwrap();
+        let list: Vec<Value> = serde_json::from_str(&l.list).unwrap();
         println!("{}：{} 条", l.title, list.len());
         assert!(list.len() > 100);
         let found = api.search("沙丘2").await.unwrap();

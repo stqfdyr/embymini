@@ -31,11 +31,13 @@ local offset = 0                                -- 时间偏移（秒，正数 =
 local raw = nil                                 -- 本集弹幕：{ t, mode, color, text, w(字宽，em) }
 local list = {}                                 -- 按设置过滤、合并后的
 local src = { kind = "idle", text = "" }        -- 面板里的状态行：kind = idle / loading / ok / none / error / setup
+local want = nil                                -- 当前集的条目 id（EmbyMini 每集第一条 status 带 start）；对不上的消息是换集前发出的，丢掉
 
 -- 屏幕与时钟 -------------------------------------------------------------------------------------------------
 local W, H = 0, 0
 local fps = 60
 local clock = { pos = 0, wall = 0, rate = 1, run = false }
+local tpos = nil                                -- time-pos（observe 得来，不每帧同步去读）
 
 local function now()
     if clock.run then return clock.pos + (mp.get_time() - clock.wall) * clock.rate end
@@ -43,14 +45,15 @@ local function now()
 end
 
 local function resync()
-    clock.pos = mp.get_property_number("time-pos") or clock.pos
+    tpos = mp.get_property_number("time-pos") or tpos
+    clock.pos = tpos or clock.pos
     clock.wall = mp.get_time()
 end
 
 -- 每帧向 time-pos 校准一点：time-pos 只在视频帧变化时更新（24 帧片源上是锯齿），直接跟着走就又一顿一顿了；
 -- 差太多（拖动、卡顿后）直接对齐
 local function calibrate()
-    local tp = mp.get_property_number("time-pos")
+    local tp = tpos
     if not tp then return end
     local err = tp - now()
     if math.abs(err) > 0.5 then
@@ -70,6 +73,10 @@ local function em_width(s)
         if b < 128 then w = w + 0.55 elseif b < 0xE0 then w = w + 0.6 elseif b < 0xF0 then w = w + 1 else w = w + 1.1 end
     end
     return w
+end
+
+local function bgr(c)
+    return string.format("%02X%02X%02X", c % 256, math.floor(c / 256) % 256, math.floor(c / 65536) % 256)
 end
 
 local function blocked(c)
@@ -112,6 +119,10 @@ local function rebuild()
         end
         -- ASS 转义：花括号会被当成样式块，反斜杠会被当成转义
         item.shown = item.shown:gsub("\\", "＼"):gsub("{", "｛"):gsub("}", "｝")
+        -- 每帧不变的部分（颜色、描边色、文字）先拼好，逐帧只拼位置和字号等样式
+        local c = item.color
+        local dark = (c % 256 + math.floor(c / 256) % 256 + math.floor(c / 65536)) < 120
+        item.tail = string.format("\\1c&H%s&\\3c&H%s&}%s", bgr(c), dark and "FFFFFF" or "000000", item.shown)
     end
 end
 
@@ -176,10 +187,6 @@ end
 local overlay = mp.create_osd_overlay("ass-events")
 overlay.z = -10                                 -- 在控制栏下面
 
-local function bgr(c)
-    return string.format("%02X%02X%02X", c % 256, math.floor(c / 256) % 256, math.floor(c / 65536) % 256)
-end
-
 local function head()
     local f = fs()
     local a = string.format("%02X", math.floor((1 - style.opacity) * 255 + 0.5))
@@ -211,8 +218,6 @@ local function draw(t)
     for _, a in ipairs(active) do
         if t < a.ends then
             keep[#keep + 1] = a
-            local c = a.item.color
-            local dark = (c % 256 + math.floor(c / 256) % 256 + math.floor(c / 65536)) < 120
             local pos
             if a.item.mode == 1 then
                 -- 取整到像素：libass 按亚像素位置缓存位图，取整后每帧都命中缓存，不用重新光栅化
@@ -222,13 +227,14 @@ local function draw(t)
             else
                 pos = string.format("\\an2\\pos(%d,%d)", math.floor(W / 2), math.floor(bottom - (a.row - 1) * rh + 0.5))
             end
-            out[#out + 1] = string.format("{%s%s\\1c&H%s&\\3c&H%s&}%s", pos, h, bgr(c), dark and "FFFFFF" or "000000",
-                a.item.shown)
+            out[#out + 1] = "{" .. pos .. h .. a.item.tail
         end
     end
     active = keep
+    local data = table.concat(out, "\n")
+    if data == "" and overlay.data == "" then return end -- 空着就不重发：每次 update 都会让 mpv 重绘 OSD
     overlay.res_x, overlay.res_y = W, H
-    overlay.data = table.concat(out, "\n")
+    overlay.data = data
     overlay:update()
 end
 
@@ -546,9 +552,10 @@ mp.register_script_message("init", function(json)
     after("rebuild")
 end)
 
--- status {kind, text, toast}：加载中、没匹配上、出错、没填接口
+-- status {kind, text, toast, item, start}：加载中、没匹配上、出错、没填接口。start = 这一集的第一条（记下 item）
 mp.register_script_message("status", function(json)
     local v = utils.parse_json(json) or {}
+    if v.start then want = v.item elseif v.item ~= want then return end
     src = { kind = v.kind or "error", text = v.text or "" }
     if v.kind ~= "loading" then raw = nil; rebuild(); refresh() end
     if v.toast then toast(src.text) end
@@ -556,11 +563,11 @@ mp.register_script_message("status", function(json)
     draw_panel()
 end)
 
--- load {title, manual, stale, list: [[秒, 类型, 颜色, 文字, 字宽(em)], …]}：本集弹幕
+-- load {item, title, manual, stale, list: [[秒, 类型, 颜色, 文字, 字宽(em)], …]}：本集弹幕（item 对不上就丢掉）
 mp.register_script_message("load", function(json)
     local t0 = mp.get_time()
     local v = utils.parse_json(json)
-    if not v then return end
+    if not v or v.item ~= want then return end
     raw = {}
     for _, c in ipairs(v.list or {}) do
         raw[#raw + 1] = { t = c[1], mode = c[2], color = c[3], text = c[4], w = c[5] or em_width(c[4]) }
@@ -586,7 +593,7 @@ mp.register_script_message("panel", open_panel)
 
 -- mpv 状态 ---------------------------------------------------------------------------------------------------
 mp.register_event("start-file", function()
-    raw, list, active, offset = nil, {}, {}, 0
+    raw, list, active, offset, want = nil, {}, {}, 0, nil
     src = { kind = "idle", text = "" }
     publish()
     close_panel()
@@ -605,6 +612,8 @@ mp.observe_property("core-idle", "bool", function(_, idle)
     clock.run = idle == false
     refresh()
 end)
+
+mp.observe_property("time-pos", "number", function(_, v) tpos = v end)
 
 mp.observe_property("speed", "number", function(_, v)
     resync()

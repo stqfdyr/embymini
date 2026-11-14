@@ -92,10 +92,12 @@ struct Src {
 enum Fail {
     /// 上游回的 HTTP 状态码，是定论（分类见 [`crate::status`]）：原样回给 mpv（403、404 时界面能给出原因）。
     Status(u16),
-    /// 上游暂时不可用（502 / 503 / 504 / 429 等，中继和上游不稳时常见）：和网络错误一样重试，
+    /// 上游暂时不可用（5xx、429 等，中继和上游不稳时常见）：和网络错误一样重试，
     /// 带 `Retry-After` 就按它等；一直不好才把这个码回给 mpv。
     Busy(u16, Option<Duration>),
     Net(String),
+    /// 连不上（请求没发出去）：和 `Net` 一样处理，只有字幕据此判断能不能重试。
+    Connect(String),
     Timeout,
 }
 
@@ -103,7 +105,7 @@ impl Fail {
     fn code(&self) -> u16 {
         match self {
             Self::Status(s) | Self::Busy(s, _) => *s,
-            Self::Net(_) => 502,
+            Self::Net(_) | Self::Connect(_) => 502,
             Self::Timeout => 504,
         }
     }
@@ -1240,7 +1242,8 @@ impl Stream {
                 log::warn!("上游没按 Range 回数据（{st}）");
                 return Err(Fail::Status(502));
             }
-            _ if crate::status::classify(st) == crate::status::Class::Busy => {
+            // 播放中断代价大：5xx 一律当暂时性错误（含 500、Cloudflare 52x），和 crate::status 的通用规则不同
+            _ if st >= 500 || crate::status::classify(st) == crate::status::Class::Busy => {
                 return Err(Fail::Busy(st, crate::status::retry_after(resp.headers())));
             }
             _ => return Err(Fail::Status(st)),
@@ -1276,7 +1279,15 @@ impl Stream {
                     }
                     let resp = match rb.send().await {
                         Ok(r) => r,
-                        Err(e) => break 'hops Err(Fail::Net(e.without_url().to_string())),
+                        Err(e) => {
+                            let connect = e.is_connect();
+                            let m = e.without_url().to_string();
+                            break 'hops Err(if connect {
+                                Fail::Connect(m)
+                            } else {
+                                Fail::Net(m)
+                            });
+                        }
                     };
                     let loc = resp
                         .headers()
@@ -1452,7 +1463,7 @@ impl File {
     fn failed(&self, e: Fail) {
         let why = match &e {
             Fail::Status(s) | Fail::Busy(s, _) => format!("HTTP {s}"),
-            Fail::Net(m) => m.clone(),
+            Fail::Net(m) | Fail::Connect(m) => m.clone(),
             Fail::Timeout => format!("{} 秒没有数据", OPEN_LIMIT.as_secs()),
         };
         lock(&self.stats).fails += 1;
@@ -1501,11 +1512,10 @@ impl Stream {
                     let (code, wait) = match self.send(&s.src, None).await {
                         Ok(r) if r.status().is_success() => break r,
                         Ok(r) => (r.status().as_u16(), crate::status::retry_after(r.headers())),
-                        Err(e) => (e.code(), None),
+                        Err(e @ Fail::Connect(_)) => (e.code(), None),
+                        Err(e) => return status(e.code()), // 超时、证书错误等：再试也一样
                     };
-                    if n >= crate::status::RETRIES
-                        || crate::status::classify(code) != crate::status::Class::Busy
-                    {
+                    if n >= crate::status::RETRIES || !crate::status::retry_code(code, true) {
                         return status(code);
                     }
                     tokio::time::sleep(crate::status::backoff(n, wait)).await;

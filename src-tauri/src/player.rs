@@ -99,6 +99,11 @@ fn mpv_args(opts: &Options, ipc: &Path) -> Vec<String> {
 
 pub enum Ctl {
     Quit,
+    /// 设置页改了弹幕接口地址或屏蔽词：正在播放时马上生效（「重新加载」就用新地址）。
+    Danmaku {
+        api: Option<danmaku::Api>,
+        words: Vec<String>,
+    },
     #[cfg(test)]
     Mpv(Value),
 }
@@ -713,6 +718,7 @@ impl Session {
                     None => { ctl_open = false; quit_sent = true; st.send(json!(["quit"])).await; }
                     #[cfg(test)]
                     Some(Ctl::Mpv(cmd)) => { st.send(cmd).await; }
+                    Some(Ctl::Danmaku { api, words }) => st.dm_settings(api, words).await,
                 },
                 Some((i, after, r)) = prepared_rx.recv() => st.on_prepared(i, after, r).await,
                 Some(m) = dm_rx.recv() => st.on_dm_result(m).await,
@@ -1641,6 +1647,10 @@ impl State {
             _ => json!({ "kind": "loading", "text": "正在加载弹幕…" }),
         };
         let go = status["kind"] == "loading";
+        // 每集第一条消息：脚本据此认定当前是哪一集，之后 item 对不上的（换集前发出的晚到结果）丢掉
+        let mut status = status;
+        status["start"] = true.into();
+        status["item"] = self.queue[i].item.id.clone().into();
         self.dm_send("status", status).await;
         if go {
             self.dm_fetch(i, true);
@@ -1655,6 +1665,7 @@ impl State {
         if self.cur != Some(i) {
             return; // 已经换集了
         }
+        let item = self.queue[i].item.id.clone();
         let Some(d) = &mut self.dm else { return };
         // 没匹配上、取不到时提示一次（之后的集只在面板里显示），地址不对时也只提示一次
         let toast = !std::mem::replace(&mut d.told, true);
@@ -1662,22 +1673,11 @@ impl State {
             Ok(Some(l)) => {
                 d.told = !toast; // 成功不算提示过
                 // 弹幕本身经 IPC 发给脚本，不让脚本读文件：Windows 上 mpv 内置 Lua 的 io.open 走 ANSI 代码页，
-                // 数据目录带中文时打不开。缓存文件是我们写的 JSON 数组，原样拼进去
-                let list = match std::fs::read_to_string(&l.path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let text = format!("读弹幕缓存失败：{e}（可在弹幕设置里重试）");
-                        return self
-                            .dm_send(
-                                "status",
-                                json!({ "kind": "error", "text": text, "toast": toast }),
-                            )
-                            .await;
-                    }
-                };
+                // 数据目录带中文时打不开。`l.list` 是缓存文件的原文（JSON 数组），原样拼进去，不再解析一遍
                 let head =
-                    json!({ "title": l.title, "manual": l.manual, "stale": l.stale }).to_string();
-                let body = format!("{},\"list\":{list}}}", &head[..head.len() - 1]);
+                    json!({ "item": item, "title": l.title, "manual": l.manual, "stale": l.stale })
+                        .to_string();
+                let body = format!("{},\"list\":{}}}", &head[..head.len() - 1], l.list);
                 self.send(json!(["script-message-to", "danmaku", "load", body]))
                     .await;
                 return;
@@ -1695,7 +1695,22 @@ impl State {
                 json!({ "kind": "error", "text": format!("{e}（可在弹幕设置里重试）"), "toast": toast })
             }
         };
+        let mut status = status;
+        status["item"] = item.into();
         self.dm_send("status", status).await;
+    }
+
+    /// 设置页改了接口地址或屏蔽词（[`Ctl::Danmaku`]）：换掉本次播放的接口，屏蔽词重新下发给脚本。
+    async fn dm_settings(&mut self, api: Option<danmaku::Api>, words: Vec<String>) {
+        let Some(d) = &mut self.dm else { return };
+        d.ctx.api = api;
+        d.dead = None;
+        let changed = d.ctx.cfg.words != words;
+        d.ctx.cfg.words = words;
+        if changed && d.init {
+            let msg = json!({ "style": d.ctx.cfg.style, "words": d.ctx.cfg.words });
+            self.dm_send("init", msg).await;
+        }
     }
 
     /// 脚本发来的消息：`args[0]` = `embymini-danmaku-<动作>`，后面是参数。
@@ -1727,7 +1742,7 @@ impl State {
                 }
             }
             "reload" => {
-                d.dead = None; // 可能刚在设置里改好了地址
+                d.dead = None; // 可能刚在设置里改好了地址（新地址已由 Ctl::Danmaku 换上）
                 self.dm_load(cur).await;
             }
             "search" | "episodes" => {
@@ -1989,7 +2004,8 @@ mod tests {
     }
 
     /// 弹幕：第一集先下发设置；没填接口时说明原因、不取数；面板改设置、手动匹配会存配置；
-    /// 取到的弹幕整集发给脚本；换集后到的旧结果丢掉；地址不对之后不再请求。
+    /// 取到的弹幕整集发给脚本（带 item，脚本丢掉对不上的）；换集后到的旧结果丢掉；地址不对之后不再请求；
+    /// 设置页改了屏蔽词重新下发。
     #[tokio::test]
     async fn danmaku_messages() {
         let (mut st, mpv, mut ev) = offline_state(2);
@@ -2019,7 +2035,7 @@ mod tests {
         let file = dir.join("1.json");
         std::fs::write(&file, r#"[[1.5,1,16777215,"好",1.0]]"#).unwrap();
         let loaded = danmaku::Loaded {
-            path: file,
+            list: std::fs::read_to_string(&file).unwrap(),
             title: "某剧 第1集".into(),
             manual: true,
             stale: false,
@@ -2029,6 +2045,12 @@ mod tests {
         st.on_dm_result(DmMsg::Loaded(0, Err(DmFail::Setup("地址不对".into()))))
             .await;
         assert!(!st.dm_ready());
+        st.dm_settings(None, vec!["剧透".into()]).await; // 设置页改了屏蔽词：重新下发
+        assert!(
+            st.dm.as_ref().unwrap().dead.is_none(),
+            "改了设置就不再认定地址不对"
+        );
+        let id0 = st.queue[0].item.id.clone();
 
         assert!(
             matches!(ev.try_recv(), Ok(Event::DanmakuStyle { style }) if style.opacity == 1.0 && style.speed == 4)
@@ -2048,9 +2070,20 @@ mod tests {
         let names: Vec<&str> = cmds.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
-            ["init", "status", "status", "status", "load", "status"]
+            [
+                "init", "status", "status", "status", "load", "status", "init"
+            ]
         );
         assert_eq!(cmds[1].1["kind"], "setup"); // 没填接口
+        assert_eq!(
+            (&cmds[1].1["start"], &cmds[1].1["item"]),
+            (&json!(true), &json!(id0))
+        );
+        assert_eq!(
+            cmds[4].1["item"], id0,
+            "脚本按 item 丢掉换集前发出的晚到结果"
+        );
+        assert_eq!(cmds[6].1["words"], json!(["剧透"]));
         assert_eq!(cmds[4].1["list"][0][3], "好");
         assert_eq!(cmds[4].1["manual"], true);
         assert_eq!(

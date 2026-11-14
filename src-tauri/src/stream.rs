@@ -1001,11 +1001,14 @@ impl Stream {
                     Ok(h) => open = Some((path.clone(), h, u64::MAX)),
                     Err(_) => {
                         // The `.part` was just renamed, or the block deleted: look again
+                        open = None;
                         if hit {
                             f.repair(&self, b);
+                            // Still done means the file is there but unreadable (locked, I/O error): don't spin
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        } else {
+                            tokio::task::yield_now().await;
                         }
-                        open = None;
-                        tokio::task::yield_now().await;
                         continue;
                     }
                 }
@@ -1023,6 +1026,7 @@ impl Stream {
                     f.repair(&self, b);
                 }
                 open = None;
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
             *at = off + n;
@@ -1052,8 +1056,7 @@ impl Stream {
         } else if st.status_since(t0).is_some() && !st.busy() {
             Next::Gone // upstream refused since: hang up, mpv's reconnect gets the code
         } else {
-            let (b, hi) = wanted(pos);
-            Next::Wait(self.ensure(f, &mut st, b, hi, role))
+            Next::Wait(self.ensure(f, &mut st, b, wanted(pos).1, role))
         }
     }
 
@@ -1504,10 +1507,12 @@ impl File {
     /// the next write renames over it.
     fn repair(&self, s: &Inner, b: usize) {
         let mut st = self.st();
+        // Checked under `done`: the size may have shrunk since the reader saw the block
+        if !st.done.get(b).copied().unwrap_or(false) {
+            return;
+        }
         let len = block_len(st.size.unwrap_or(0), b);
-        if st.done.get(b).copied().unwrap_or(false)
-            && std::fs::metadata(self.block_path(b)).map(|m| m.len()).ok() != Some(len)
-        {
+        if std::fs::metadata(self.block_path(b)).map(|m| m.len()).ok() != Some(len) {
             st.done[b] = false;
             sub_total(&s.total, len);
         }
@@ -1538,7 +1543,8 @@ impl Stream {
                 let Ok(b) = resp.bytes().await else {
                     return status(502);
                 };
-                let tmp = path.with_extension("tmp");
+                // Unique: the same subtitle can be fetched twice at once (registered under two keys)
+                let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
                 if tokio::fs::write(&tmp, &b).await.is_ok()
                     && tokio::fs::rename(&tmp, &path).await.is_ok()
                 {
@@ -1546,6 +1552,8 @@ impl Stream {
                     tauri::async_runtime::spawn_blocking(move || {
                         crate::images::trim_dir(&dir, SUBS_CAP)
                     });
+                } else {
+                    let _ = tokio::fs::remove_file(&tmp).await;
                 }
                 b
             }

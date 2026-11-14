@@ -730,7 +730,7 @@ impl Stream {
                     if let Some(size) = st.size {
                         let n = blocks(size);
                         let lo = n.saturating_sub(2);
-                        let a = me.ensure(&f, &mut st, lo, n - 1, Role::Prefetch);
+                        let a = me.ensure(&f, &mut st, lo, n.saturating_sub(1), Role::Prefetch);
                         let b = me.ensure(&f, &mut st, 0, 0, Role::Prefetch);
                         drop(st);
                         abort_all(a.into_iter().chain(b));
@@ -1039,6 +1039,14 @@ impl Stream {
                 self.pump(&f, o, b, n, Some(id)).await
             }
             .await;
+            // A block landed: the link works, so the next cut retries after 1 s, not after a grown backoff
+            if f.st()
+                .main
+                .as_ref()
+                .is_some_and(|m| m.t.id == id && m.at != b)
+            {
+                back = 1;
+            }
             match r {
                 Ok(Stop::Ahead(at)) => {
                     // 读的位置往前走到只差半段再接着要：一次请求写 8 块左右，不至于每走一块就开一个请求
@@ -1056,14 +1064,17 @@ impl Stream {
                 Ok(Stop::Hit) => back = 1,
                 Err(e) if e.transient() => {
                     // 网络错误、5xx：自己退避重试（1、2、4…30 秒），整片模式不能断在这里；读的一方要别处会换掉这个任务
-                    f.failed(e);
-                    tokio::time::sleep(Duration::from_secs(back)).await;
+                    let wait = f.failed(e).max(Duration::from_secs(back));
+                    tokio::time::sleep(wait).await;
                     back = (back * 2).min(30);
                     if !mine() {
                         return;
                     }
                 }
-                Err(e) => return f.failed(e),
+                Err(e) => {
+                    f.failed(e);
+                    return;
+                }
             }
             // 碰到已有的块断开了、写到了文件尾、或重试：从读的位置往后找下一个缺块
             match self.next_missing(&f) {
@@ -1114,7 +1125,7 @@ impl Stream {
 
     /// 向上游要 [start, end]（None = 到文件尾），带对冲：3 秒没出数据再开一个，先出数据的留下。
     async fn open(&self, f: &File, start: u64, end: Option<u64>) -> Result<Opened, Fail> {
-        let t0 = Instant::now();
+        let deadline = tokio::time::Instant::now() + OPEN_LIMIT;
         let mut a: Attempt = Box::pin(self.attempt(&f.src, start, end));
         let mut b: Option<Attempt> = None;
         let mut step = 0;
@@ -1129,10 +1140,8 @@ impl Stream {
                     Err(e) if e.transient() => b = None,
                     r => break r,
                 },
+                _ = tokio::time::sleep_until(deadline) => break Err(Fail::Timeout),
                 _ = tokio::time::sleep_until(next) => {
-                    if t0.elapsed() >= OPEN_LIMIT {
-                        break Err(Fail::Timeout);
-                    }
                     if let Some(x) = b.take() {
                         a = x; // 丢掉较早的那个
                     }
@@ -1392,7 +1401,8 @@ impl File {
         n
     }
 
-    fn failed(&self, e: Fail) {
+    /// Records a failure; returns how long readers hold off (the main task waits at least as long).
+    fn failed(&self, e: Fail) -> Duration {
         let why = match &e {
             Fail::Status(s) | Fail::Busy(s, _) => format!("HTTP {s}"),
             Fail::Net(m) | Fail::Connect(m) => m.clone(),
@@ -1413,6 +1423,7 @@ impl File {
         st.fail = Some((e, now));
         drop(st);
         self.bump();
+        back
     }
 
     /// A block marked done but missing on disk (deleted from outside) goes back to not done.
@@ -1619,6 +1630,11 @@ mod tests {
                     let _ = s.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
                 }
+                // Second request: 429 with Retry-After (rate-limiting relay)
+                if path.starts_with("/busy") && flaky.fetch_add(1, Ordering::SeqCst) == 1 {
+                    let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    return;
+                }
                 if path.starts_with("/sub") {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello").await;
                     return;
@@ -1653,6 +1669,10 @@ mod tests {
                         && sent > 6 << 20
                         && cuts.fetch_add(1, Ordering::SeqCst) == 0
                     {
+                        return;
+                    }
+                    // Every request: cut after a bit over 2 blocks (a relay that keeps dropping)
+                    if path.starts_with("/drops") && sent > 9 << 20 {
                         return;
                     }
                     if s.write_all(chunk).await.is_err() {
@@ -2002,6 +2022,48 @@ mod tests {
         assert!(body == u.data[..100]);
         assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/flaky").len(), 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Cuts after real progress retry within a second each time: the backoff must not keep growing
+    /// (a reader is waiting on the main task meanwhile).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_cuts_keep_backoff_short() {
+        let u = upstream((10 * BLOCK) as usize).await;
+        let dir = tmp("drops");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_16_a", &format!("{}/drops", u.base), &auth(&u));
+        let t0 = Instant::now();
+        let (st, body) = get(&url, None, false).await;
+        assert_eq!(st, 200);
+        assert!(body == *u.data, "content differs after cuts");
+        // 4 cuts: about 4 s with a 1 s retry each, 15 s (1+2+4+8) if the backoff keeps doubling
+        assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+        assert_eq!(reqs(&u, "/drops").len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The main task honours Retry-After instead of retrying after its own 1 s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn main_task_waits_retry_after() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("busy");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_17_a", &format!("{}/busy", u.base), &auth(&u));
+        // A preview learns the size first, so the main task meets the 429 and keeps going
+        let at = 2 * BLOCK;
+        let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+        assert_eq!(st, 206);
+        let t0 = Instant::now();
+        let (st, body) = get(&url, Some("bytes=0-99"), false).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[..100]);
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_secs(2) && took < Duration::from_secs(4),
+            "{took:?}"
+        );
+        assert_eq!(reqs(&u, "/busy").len(), 3);
         let _ = std::fs::remove_dir_all(dir);
     }
 

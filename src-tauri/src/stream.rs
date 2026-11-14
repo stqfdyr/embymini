@@ -1053,7 +1053,6 @@ impl Stream {
             f.st().main.as_ref().is_some_and(|m| m.t.id == id) && !f.gone.load(Ordering::Relaxed)
         };
         let mut rx = f.changed.subscribe();
-        let mut back = 1;
         loop {
             let r = async {
                 let o = self.open(&f, b as u64 * BLOCK, None).await?;
@@ -1061,14 +1060,6 @@ impl Stream {
                 self.pump(&f, o, b, n, Some(id)).await
             }
             .await;
-            // A block landed: the link works, so the next cut retries after 1 s, not after a grown backoff
-            if f.st()
-                .main
-                .as_ref()
-                .is_some_and(|m| m.t.id == id && m.at != b)
-            {
-                back = 1;
-            }
             match r {
                 Ok(Stop::Ahead(at)) => {
                     // Resume once the reader is within half the window: about 8 blocks per request, not one request per block
@@ -1083,12 +1074,11 @@ impl Stream {
                         let _ = tokio::time::timeout(Duration::from_secs(1), rx.changed()).await;
                     }
                 }
-                Ok(Stop::Hit) => back = 1,
+                Ok(Stop::Hit) => {}
                 Err(e) if e.transient() => {
-                    // Network error / 5xx: back off and retry (1, 2, 4…30 s) so whole-file mode never stalls; a seek replaces this task
-                    let wait = f.failed(e).max(Duration::from_secs(back));
-                    tokio::time::sleep(wait).await;
-                    back = (back * 2).min(30);
+                    // Network error / 5xx: retry after the readers' hold-off (no growing backoff: a reader near this task
+                    // waits for it, so it must not sleep longer than the reader was told); whole-file mode never stalls
+                    tokio::time::sleep(f.failed(e)).await;
                     if !mine() {
                         return;
                     }
@@ -1422,7 +1412,7 @@ impl File {
         n
     }
 
-    /// Records a failure; returns how long readers hold off (the main task waits at least as long).
+    /// Records a failure; returns how long readers hold off (the main task waits exactly as long).
     fn failed(&self, e: Fail) -> Duration {
         let why = match &e {
             Fail::Status(s) | Fail::Busy(s, _) => format!("HTTP {s}"),
@@ -1662,6 +1652,13 @@ mod tests {
                 // Second request: 429 with Retry-After (rate-limiting relay)
                 if path.starts_with("/busy") && flaky.fetch_add(1, Ordering::SeqCst) == 1 {
                     let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    return;
+                }
+                // Requests 2–5: 503 (an outage with no data at all)
+                if path.starts_with("/down")
+                    && (1..=4).contains(&flaky.fetch_add(1, Ordering::SeqCst))
+                {
+                    let _ = s.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
                 }
                 // Second request: 403 (a redirect target that expired)
@@ -2100,8 +2097,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Cuts after real progress retry within a second each time: the backoff must not keep growing
-    /// (a reader is waiting on the main task meanwhile).
+    /// Repeated cuts retry within a second each time: the wait must not keep growing (a reader waits on the main task).
     #[tokio::test(flavor = "multi_thread")]
     async fn repeated_cuts_keep_backoff_short() {
         let u = upstream((10 * BLOCK) as usize).await;
@@ -2337,6 +2333,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(reqs(&u, "/f").len(), 2, "{:?}", reqs(&u, "/f"));
         drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An outage without any progress does not stretch the main task's retries either: once upstream is back,
+    /// a waiting reader gets data within the hold-off it was told (1.5 s for a 503).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn outage_retries_keep_pace_with_readers() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("down");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_27_a", &format!("{}/down", u.base), &auth(&u));
+        let at = 2 * BLOCK;
+        let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+        assert_eq!(st, 206);
+        let t0 = Instant::now();
+        let (st, body) = get(&url, Some("bytes=0-99"), false).await;
+        assert_eq!(st, 206);
+        assert!(body == u.data[..100]);
+        // 4 × 1.5 s ≈ 6 s; a doubling backoff would take 1.5 + 2 + 4 + 8 ≈ 15.5 s
+        assert!(t0.elapsed() < Duration::from_secs(9), "{:?}", t0.elapsed());
+        assert_eq!(reqs(&u, "/down").len(), 6);
         let _ = std::fs::remove_dir_all(dir);
     }
 

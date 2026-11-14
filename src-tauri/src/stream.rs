@@ -2095,6 +2095,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Dispatch rules: a young main task gets a short task beside it instead of being replaced; previews
+    /// keep at most PREVIEWS slots, cancelling the oldest, and the main player's short tasks take no slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_dispatch_rules() {
+        let u = upstream((60 * BLOCK) as usize).await;
+        let dir = tmp("ensure");
+        let s = Stream::start(&dir, true).unwrap();
+        let _ = s.video("srv_21_a", &format!("{}/slow", u.base), &auth(&u));
+        let f = lock(&s.files).get("srv_21_a").unwrap().clone();
+        f.learn(&s, 60 * BLOCK);
+        let ensure = |b: usize, role: Role| -> Vec<u64> {
+            let mut st = f.st();
+            let old = s.ensure(&f, &mut st, b, b, role);
+            drop(st);
+            let ids = old.iter().map(|t| t.id).collect();
+            abort_all(old);
+            ids
+        };
+        let slots = || -> Vec<(usize, usize, Role)> {
+            let st = f.st();
+            let mut v: Vec<_> = st
+                .previews
+                .iter()
+                .map(|p| (*p.blocks.start(), *p.blocks.end(), p.role))
+                .collect();
+            v.sort_by_key(|p| p.0);
+            v
+        };
+        assert!(ensure(0, Role::Main).is_empty());
+        // Young main task: the far read gets blocks 40–41 on the side, the main task stays at 0
+        assert!(ensure(40, Role::Main).is_empty());
+        assert_eq!(f.st().main.as_ref().map(|m| m.at), Some(0));
+        assert!(ensure(10, Role::Thumb).is_empty());
+        assert!(ensure(20, Role::Prefetch).is_empty());
+        assert_eq!(
+            slots(),
+            [
+                (10, 10, Role::Thumb),
+                (20, 20, Role::Prefetch),
+                (40, 41, Role::Main)
+            ]
+        );
+        // A third preview cancels the oldest preview, never the main player's short task
+        assert_eq!(ensure(30, Role::Thumb).len(), 1);
+        assert_eq!(
+            slots(),
+            [
+                (20, 20, Role::Prefetch),
+                (30, 30, Role::Thumb),
+                (40, 41, Role::Main)
+            ]
+        );
+        // Nothing new for blocks already being fetched
+        assert!(ensure(41, Role::Thumb).is_empty());
+        assert_eq!(slots().len(), 3);
+        f.stop();
+        drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A failed preview holds off before the next request instead of hammering a flaky upstream.
     #[tokio::test(flavor = "multi_thread")]
     async fn preview_failures_back_off() {

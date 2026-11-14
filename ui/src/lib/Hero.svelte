@@ -2,7 +2,6 @@
      整块点击进详情；悬停出左右箭头，箭头和圆点只切换不跳转。切换前预加载下一张背景图。 -->
 <script lang="ts">
   import { ChevronLeft, ChevronRight } from '@lucide/svelte'
-  import { SvelteSet } from 'svelte/reactivity'
   import { img } from './api.svelte'
   import { fade } from './fade'
   import { years } from './fmt'
@@ -15,8 +14,11 @@
   const n = $derived(Math.max(items.length, 1))
   const cur = $derived(items[i % n])
   const bg = (it?: Item) => (it ? img(it.Id, 'Backdrop', it.BackdropImageTags?.[0], 1600) : '')
-  const step = (d: number) => (i = (i + d + n) % n)
-  const badLogo = new SvelteSet<string>()
+  const logo = $derived(img(cur?.Id, 'Logo', cur?.ImageTags?.Logo, 420))
+  // 这一页没取到的 Logo 地址。只记到切走为止：转回来再试一次（上游 404 后端记着，不再打上游；网络出错的恢复后能出图）
+  let badLogo = $state('')
+  const show = (k: number) => ((i = (k + n) % n), (badLogo = ''))
+  const step = (d: number) => show(i + d)
 
   $effect(() => {
     if (items.length < 2 || hold) return
@@ -38,11 +40,14 @@
     {/key}
     <div class="scrim"></div>
     <div class="info">
-      {#if cur.ImageTags?.Logo && !badLogo.has(cur.Id)}
-        <img class="logo" src={img(cur.Id, 'Logo', cur.ImageTags.Logo, 420)} alt={cur.Name} onerror={() => badLogo.add(cur.Id)} />
-      {:else}
-        <div class="title">{cur.Name}</div>
-      {/if}
+      <!-- 换图就换元素：上一张晚到的 error 不会算到这一张头上 -->
+      {#key logo}
+        {#if logo && badLogo !== logo}
+          <img class="logo" src={logo} alt={cur.Name} onerror={() => (badLogo = logo)} />
+        {:else}
+          <div class="title">{cur.Name}</div>
+        {/if}
+      {/key}
       <div class="meta">{[years(cur), ...(cur.Genres ?? []).slice(0, 3)].filter(Boolean).join(' · ')}</div>
       {#if cur.Overview}<p class="ov clamp-2">{cur.Overview}</p>{/if}
     </div>
@@ -51,7 +56,7 @@
       <button class="arrow r" aria-label="下一个" onclick={(e) => (e.stopPropagation(), step(1))}><ChevronRight size={20} /></button>
       <div class="dots">
         {#each items as it, k (it.Id)}
-          <button class:on={k === i % n} aria-label={it.Name} onclick={(e) => (e.stopPropagation(), (i = k))}><i></i></button>
+          <button class:on={k === i % n} aria-label={it.Name} onclick={(e) => (e.stopPropagation(), show(k))}><i></i></button>
         {/each}
       </div>
     {/if}

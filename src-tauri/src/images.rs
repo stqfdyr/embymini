@@ -6,10 +6,10 @@
 //! - 磁盘上限 [`CAP`]，超了按最近使用时间（命中时刷新文件修改时间）删最旧的，删到 90%。
 //! - 同一张图同时被要多次只向上游取一次；同时向上游取最多 [`PARALLEL`] 张，不把中继压垮。
 //! - 回给界面时声明一年不变（immutable），同一次运行里 WebView 自己的内存缓存照样生效。
-//! - 上游回 404 的图记 [`MISS_TTL`]，期间直接回 404 不再向上游要（有的服务器列表里给了 Logo 的 tag，图本身却不存在，
-//!   不记的话首页轮播每转一圈都要取一次）。
+//! - 上游回 404 的图按「API 根 + 文件名」记 [`MISS_TTL`]，期间直接回 404 不再向上游要（有的服务器列表里给了 Logo 的 tag，
+//!   图本身却不存在，不记的话首页轮播每转一圈都要取一次）；改地址后重新取，清理图片缓存时作废。
 //! - 只从已配置的服务器取图（路径里是服务器 id，不是地址），不是通用转发。
-//! - 诊断数据：按上游、图片类型每 30 秒汇总一条 `img`（张数、命中、失败与状态码、排队 / 下载耗时分桶、缩图前后字节）。
+//! - 诊断数据：按上游、图片类型每 30 秒汇总一条 `img`（张数、命中、记着的 404、失败与状态码、排队 / 下载耗时分桶、缩图前后字节）。
 
 use crate::telemetry;
 use serde_json::json;
@@ -175,6 +175,8 @@ struct Stats {
     hit: u64,
     /// 同一张图正被别的请求取，等它的结果（不算一次上游请求）。
     shared: u64,
+    /// 记着的上游 404（[`MISS_TTL`] 内），直接回 404、没问上游。
+    miss: u64,
     fail: u64,
     fail_st: std::collections::BTreeMap<u16, u64>,
     /// 存进缓存 / 给界面的字节（缩图后）。
@@ -191,8 +193,9 @@ pub struct Images {
     http: reqwest::Client,
     slots: Semaphore,
     inflight: Mutex<HashMap<String, Arc<OnceCell<Got>>>>,
-    /// 上游 404 的图（键同磁盘文件名）→ 记下的时刻。
-    missing: Mutex<HashMap<String, Instant>>,
+    /// 上游 404 的图：「API 根 + 空格 + 磁盘文件名」→ 记下的时刻。带上 API 根，改了服务器地址就不沿用旧地址的 404。
+    /// 第一项是清理次数：清理前发出的请求晚到的 404 不再记（否则清理后又被记上 30 分钟）。
+    missing: Mutex<(u64, HashMap<String, Instant>)>,
     total: AtomicU64,
     stats: Mutex<HashMap<(String, String), Stats>>,
 }
@@ -210,7 +213,7 @@ impl Images {
             http,
             slots: Semaphore::new(PARALLEL),
             inflight: Mutex::new(HashMap::new()),
-            missing: Mutex::new(HashMap::new()),
+            missing: Mutex::new((0, HashMap::new())),
             total: AtomicU64::new(0),
             stats: Mutex::new(HashMap::new()),
         })
@@ -236,7 +239,18 @@ impl Images {
 
     /// 取一张图：磁盘缓存 → 上游。`api_base` 是这台服务器的 API 根（找不到服务器时调用方直接回 404）。
     pub async fn get(&self, req: &Req, api_base: &str, srv: &str) -> Got {
-        let path = self.dir.join(req.file_name());
+        let key = req.file_name();
+        let miss_key = format!("{api_base} {key}");
+        let epoch = {
+            let m = lock(&self.missing);
+            if m.1.get(&miss_key).is_some_and(|t| t.elapsed() < MISS_TTL) {
+                drop(m);
+                self.note(srv, &req.kind, |s| s.miss += 1);
+                return Err(404);
+            }
+            m.0
+        };
+        let path = self.dir.join(&key);
         if let Ok(b) = tokio::fs::read(&path).await {
             // 命中：刷新修改时间，淘汰时按它算「最近使用」
             let _ = std::fs::File::options()
@@ -249,20 +263,7 @@ impl Images {
             });
             return Ok(Arc::new(b));
         }
-        if lock(&self.missing)
-            .get(&req.file_name())
-            .is_some_and(|t| t.elapsed() < MISS_TTL)
-        {
-            self.note(srv, &req.kind, |s| {
-                s.fail += 1;
-                *s.fail_st.entry(404).or_default() += 1;
-            });
-            return Err(404);
-        }
-        let cell = lock(&self.inflight)
-            .entry(req.file_name())
-            .or_default()
-            .clone();
+        let cell = lock(&self.inflight).entry(key.clone()).or_default().clone();
         let mut fetched = None; // 只有真正向上游取的那个请求才有
         let got = cell
             .get_or_init(|| async {
@@ -293,11 +294,13 @@ impl Images {
             })
             .await
             .clone();
-        lock(&self.inflight).remove(&req.file_name());
+        lock(&self.inflight).remove(&key);
         if got == Err(404) {
             let mut m = lock(&self.missing);
-            m.retain(|_, t| t.elapsed() < MISS_TTL);
-            m.insert(req.file_name(), Instant::now());
+            if m.0 == epoch {
+                m.1.retain(|_, t| t.elapsed() < MISS_TTL);
+                m.1.insert(miss_key, Instant::now());
+            }
         }
         self.note(srv, &req.kind, |s| match (&got, &fetched) {
             (Err(st), _) => {
@@ -356,7 +359,10 @@ impl Images {
     }
 
     pub fn clear(&self) {
-        lock(&self.missing).clear();
+        let mut m = lock(&self.missing);
+        m.0 += 1;
+        m.1.clear();
+        drop(m);
         for (p, ..) in list(&self.dir) {
             let _ = std::fs::remove_file(p);
         }
@@ -385,7 +391,7 @@ impl Images {
 /// 一条 `img` 记录：`wait` / `fetch` 是按 [`BOUNDS`] 分桶的张数（只算自己向上游取的），`fail_st` 是失败的状态码计数。
 fn stats_json(srv: &str, kind: &str, s: &Stats) -> serde_json::Value {
     json!({
-        "srv": srv, "kind": kind, "n": s.n, "hit": s.hit, "shared": s.shared, "fail": s.fail,
+        "srv": srv, "kind": kind, "n": s.n, "hit": s.hit, "shared": s.shared, "miss": s.miss, "fail": s.fail,
         "fail_st": s.fail_st.iter().map(|(k, v)| (k.to_string(), *v)).collect::<HashMap<_, _>>(),
         "kb": s.bytes / 1024, "up_kb": s.up_bytes / 1024, "wait": s.wait, "fetch": s.fetch,
     })
@@ -559,7 +565,7 @@ mod tests {
         d
     }
 
-    /// 同一张图并发要 5 次只向上游取 1 次；第二轮从磁盘出；上游 404 原样回给界面。
+    /// 同一张图并发要 5 次只向上游取 1 次；第二轮从磁盘出；上游 404 原样回给界面，并记住（按地址、清理后作废）。
     #[tokio::test]
     async fn fetch_once_then_serve_from_disk() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -616,6 +622,29 @@ mod tests {
         img.clear();
         assert_eq!(img.get(&missing, &base, "x").await, Err(404));
         assert_eq!(hits.load(Ordering::SeqCst), before + 1, "清空缓存后重新取");
+        let other = base.replace("/emby", "/emby2");
+        assert_eq!(img.get(&missing, &other, "x").await, Err(404));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before + 2,
+            "换了地址不沿用旧地址的 404"
+        );
+        // 清理时还在路上的请求，晚到的 404 不记
+        let gone = Req::parse("s/404/Logo/0/t/240").unwrap();
+        let t = {
+            let (img, base) = (img.clone(), base.clone());
+            tokio::spawn(async move { img.get(&gone, &base, "x").await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        img.clear();
+        assert_eq!(t.await.unwrap(), Err(404));
+        let gone = Req::parse("s/404/Logo/0/t/240").unwrap();
+        assert_eq!(img.get(&gone, &base, "x").await, Err(404));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before + 4,
+            "清理前发出的请求不把 404 记回去"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

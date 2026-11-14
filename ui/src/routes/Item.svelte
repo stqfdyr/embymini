@@ -65,7 +65,9 @@
   const item = $derived(q.data?.item ?? known(id))
   let pickedSeason = $state<string>()
   let expanded = $state(false)
-  let badLogo = $state<string>() // Logo 取不到（服务器给了 tag、图却 404）的条目 id，改显示片名
+  const logo = $derived(img(item?.Id, 'Logo', item?.ImageTags?.Logo, 400))
+  // Logo 没取到时的条目对象，改显示片名。刷新或换条目后是新对象，会再试一次（上游 404 后端记着，不再打上游）
+  let badLogo = $state.raw<Item>()
   restoreScrollWhen(() => q.data)
 
   // 单集行单独加载。换季才换内容（先用这一季的本地快照，没有就清空）；同一季重新取数时先保留旧列表
@@ -141,11 +143,13 @@
       {#if bd}<img class="backdrop" src={bd} alt="" fetchpriority="high" use:fade /><div class="scrim"></div>{/if}
       <div class="top-inner">
         <div class="left">
-          {#if item.ImageTags?.Logo && badLogo !== item.Id}
-            <img class="logo" src={img(item.Id, 'Logo', item.ImageTags.Logo, 400)} alt={item.Name} onerror={() => (badLogo = item?.Id)} />
-          {:else}
-            <h1>{item.Name}</h1>
-          {/if}
+          {#key logo}
+            {#if logo && badLogo !== item}
+              <img class="logo" src={logo} alt={item.Name} onerror={() => (badLogo = item)} />
+            {:else}
+              <h1>{item.Name}</h1>
+            {/if}
+          {/key}
           <div class="actions">
             <button class="round" title="从头播放" disabled={!t} onclick={() => t && play(t.Id, true, pickedSource)}><RotateCcw size={18} /></button>
             <button class="round" class:on={item.UserData?.Played} title={item.UserData?.Played ? '标记为未看' : '标记为已看'} onclick={() => toggle('played', item)}><Check size={18} /></button>

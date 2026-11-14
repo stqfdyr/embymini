@@ -1425,9 +1425,11 @@ impl File {
         }
         if let Some(old) = st.size {
             log::info!("缓存的文件大小变了（{old} → {total}），重新缓存");
-            for (b, _) in st.done.iter().enumerate().filter(|(_, d)| **d) {
-                let _ = std::fs::remove_file(self.block_path(b));
-                sub_total(&s.total, block_len(old, b));
+            for (b, &done) in st.done.iter().enumerate() {
+                if done {
+                    let _ = std::fs::remove_file(self.block_path(b));
+                    sub_total(&s.total, block_len(old, b));
+                }
             }
         }
         let n = blocks(total);

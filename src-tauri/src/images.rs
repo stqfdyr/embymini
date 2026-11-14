@@ -321,20 +321,34 @@ impl Images {
         got
     }
 
-    /// 向上游取原始字节；`wait_ms` 填上等并发名额花了多久。
+    /// 向上游取原始字节；`wait_ms` 填上等并发名额花了多久。失败返回状态码（网络错误算 502），原样回给界面。
     async fn fetch(&self, url: &str, wait_ms: &mut u64) -> Result<Vec<u8>, u16> {
-        let t0 = Instant::now();
-        let _slot = self.slots.acquire().await.map_err(|_| 503u16)?;
-        *wait_ms = t0.elapsed().as_millis() as u64;
-        let resp = self.http.get(url).send().await.map_err(|e| {
-            log::warn!("取图失败：{}", e.without_url());
-            502u16
-        })?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(status.as_u16());
+        // 暂时性失败按 crate::status 的规则重试；等重试时先让出名额，不让几张限流的图堵住整页
+        let mut n = 0;
+        loop {
+            let t0 = Instant::now();
+            let slot = self.slots.acquire().await.map_err(|_| 503u16)?;
+            *wait_ms += t0.elapsed().as_millis() as u64;
+            let sent = self.http.get(url).send().await;
+            match crate::status::retry_wait(&sent, true) {
+                Some(wait) if n < crate::status::RETRIES => {
+                    drop(slot);
+                    tokio::time::sleep(crate::status::backoff(n, wait)).await;
+                    n += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let resp = sent.map_err(|e| {
+                log::warn!("取图失败：{}", e.without_url());
+                502u16
+            })?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(status.as_u16());
+            }
+            return resp.bytes().await.map(|b| b.to_vec()).map_err(|_| 502u16);
         }
-        resp.bytes().await.map(|b| b.to_vec()).map_err(|_| 502u16)
     }
 
     /// 先写临时文件再改名：写到一半断电不会留下半张图被当成命中。

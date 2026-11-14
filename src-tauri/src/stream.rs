@@ -90,19 +90,22 @@ struct Src {
 
 #[derive(Debug)]
 enum Fail {
-    /// 上游回的 HTTP 状态码（4xx 等），是定论：原样回给 mpv（403、404 时界面能给出原因）。
+    /// 上游回的 HTTP 状态码，是定论（分类见 [`crate::status`]）：原样回给 mpv（403、404 时界面能给出原因）。
     Status(u16),
-    /// 上游暂时出错（5xx、429，中继和上游不稳时常见）：和网络错误一样重试，一直不好才把这个码回给 mpv。
-    Busy(u16),
+    /// 上游暂时不可用（5xx、429 等，中继和上游不稳时常见）：和网络错误一样重试，
+    /// 带 `Retry-After` 就按它等；一直不好才把这个码回给 mpv。
+    Busy(u16, Option<Duration>),
     Net(String),
+    /// 连不上（请求没发出去）：和 `Net` 一样处理，只有字幕据此判断能不能重试。
+    Connect(String),
     Timeout,
 }
 
 impl Fail {
     fn code(&self) -> u16 {
         match self {
-            Self::Status(s) | Self::Busy(s) => *s,
-            Self::Net(_) => 502,
+            Self::Status(s) | Self::Busy(s, _) => *s,
+            Self::Net(_) | Self::Connect(_) => 502,
             Self::Timeout => 504,
         }
     }
@@ -587,7 +590,7 @@ impl Stream {
     pub fn fail_status(&self, name: &str) -> Option<u16> {
         let f = lock(&self.files).get(name)?.clone();
         match &f.st().fail {
-            Some((Fail::Status(s) | Fail::Busy(s), _)) => Some(*s),
+            Some((Fail::Status(s) | Fail::Busy(s, _), _)) => Some(*s),
             _ => None,
         }
     }
@@ -1239,7 +1242,10 @@ impl Stream {
                 log::warn!("上游没按 Range 回数据（{st}）");
                 return Err(Fail::Status(502));
             }
-            (429 | 500..=599, _) => return Err(Fail::Busy(st)),
+            // 播放中断代价大：5xx 一律当暂时性错误（含 500、Cloudflare 52x），和 crate::status 的通用规则不同
+            _ if st >= 500 || crate::status::classify(st) == crate::status::Class::Busy => {
+                return Err(Fail::Busy(st, crate::status::retry_after(resp.headers())));
+            }
             _ => return Err(Fail::Status(st)),
         };
         let first = resp
@@ -1273,7 +1279,15 @@ impl Stream {
                     }
                     let resp = match rb.send().await {
                         Ok(r) => r,
-                        Err(e) => break 'hops Err(Fail::Net(e.without_url().to_string())),
+                        Err(e) => {
+                            let connect = e.is_connect();
+                            let m = e.without_url().to_string();
+                            break 'hops Err(if connect {
+                                Fail::Connect(m)
+                            } else {
+                                Fail::Net(m)
+                            });
+                        }
                     };
                     let loc = resp
                         .headers()
@@ -1293,7 +1307,7 @@ impl Stream {
                     return Ok(resp);
                 }
                 Ok(resp) if !fallback => return Ok(resp),
-                Ok(resp) => last = Fail::Busy(resp.status().as_u16()),
+                Ok(resp) => last = Fail::Busy(resp.status().as_u16(), None),
                 Err(e) => last = e,
             }
             lock(src).resolved = None;
@@ -1448,14 +1462,15 @@ impl File {
 
     fn failed(&self, e: Fail) {
         let why = match &e {
-            Fail::Status(s) | Fail::Busy(s) => format!("HTTP {s}"),
-            Fail::Net(m) => m.clone(),
+            Fail::Status(s) | Fail::Busy(s, _) => format!("HTTP {s}"),
+            Fail::Net(m) | Fail::Connect(m) => m.clone(),
             Fail::Timeout => format!("{} 秒没有数据", OPEN_LIMIT.as_secs()),
         };
         lock(&self.stats).fails += 1;
         let back = match e {
-            Fail::Status(_) => 3,
-            _ => 1,
+            Fail::Status(_) => Duration::from_secs(3),
+            Fail::Busy(_, wait) => crate::status::backoff(1, wait).max(Duration::from_secs(1)),
+            _ => Duration::from_secs(1),
         };
         let mut st = self.st();
         // 只记一连串失败里的第一次（成功取到数据时清零）：上游长时间不通时每秒重试，不刷屏
@@ -1463,7 +1478,7 @@ impl File {
             log::warn!("缓存代理向上游取数据失败：{why}");
         }
         let now = Instant::now();
-        st.retry_at = Some(now + Duration::from_secs(back));
+        st.retry_at = Some(now + back);
         st.fail = Some((e, now));
         drop(st);
         self.bump();
@@ -1491,10 +1506,20 @@ impl Stream {
                 Bytes::from(b)
             }
             Err(_) => {
-                let resp = match self.send(&s.src, None).await {
-                    Ok(r) if r.status().is_success() => r,
-                    Ok(r) => return status(r.status().as_u16()),
-                    Err(e) => return status(e.code()),
+                // mpv 只在加载时要一次字幕，取不到这一集就没字幕了：暂时性失败按 crate::status 的规则重试
+                let mut n = 0;
+                let resp = loop {
+                    let (code, wait) = match self.send(&s.src, None).await {
+                        Ok(r) if r.status().is_success() => break r,
+                        Ok(r) => (r.status().as_u16(), crate::status::retry_after(r.headers())),
+                        Err(e @ Fail::Connect(_)) => (e.code(), None),
+                        Err(e) => return status(e.code()), // 超时、证书错误等：再试也一样
+                    };
+                    if n >= crate::status::RETRIES || !crate::status::retry_code(code, true) {
+                        return status(code);
+                    }
+                    tokio::time::sleep(crate::status::backoff(n, wait)).await;
+                    n += 1;
                 };
                 let Ok(b) = resp.bytes().await else {
                     return status(502);

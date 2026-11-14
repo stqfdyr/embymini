@@ -1,9 +1,10 @@
 <!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、边播边缓存、缓存管理、个人 mpv 配置的位置）
+     + 弹幕（接口地址、屏蔽词；显示设置在播放器的弹幕面板里）
      + 关于（版本与检查更新、更新代理、界面用哪块 GPU）。分组列表样式。 -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
-  import { Check, Download, HardDrive, LogIn, Pencil, Plus, RefreshCw, Trash2 } from '@lucide/svelte'
+  import { Check, Download, Eye, EyeOff, HardDrive, LogIn, Pencil, Plus, RefreshCw, Trash2 } from '@lucide/svelte'
   import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
   import { ask } from '../lib/Dialog.svelte'
@@ -22,6 +23,17 @@
   let updateProxy = $state(session.cfg?.updateProxy ?? '')
   let cacheWhole = $state(session.cfg?.cacheWhole ?? true)
   let cacheOpen = $state(false)
+  let dmApi = $state(session.cfg?.danmakuApi ?? '')
+  let dmWords = $state((session.cfg?.danmakuWords ?? []).join('\n'))
+  /** 接口地址里可能带令牌：默认按密码框遮住，免得截图时露出来。 */
+  let dmShow = $state(false)
+  const saveDm = () =>
+    run(async () => {
+      await invoke('danmaku_set', { api: dmApi, words: dmWords.split('\n') })
+      await loadConfig()
+      dmApi = session.cfg?.danmakuApi ?? '' // 显示后端规范化后的值（去掉了空白和末尾的 /）
+      dmWords = (session.cfg?.danmakuWords ?? []).join('\n')
+    }, '已保存，下次播放生效')
   let telOn = $state(session.cfg?.telemetry ?? false)
   let telName = $state(session.cfg?.telemetryName ?? '')
   const saveTel = () => run(() => invoke('telemetry_set', { on: telOn, name: telName }), telOn ? '已打开诊断数据' : '已关闭诊断数据')
@@ -198,6 +210,25 @@
       </div>
     </div>
   </div>
+  <h3>弹幕</h3>
+  <div class="group">
+    <div class="row">
+      <span class="label">弹幕接口</span>
+      <div class="grow">
+        <div class="line">
+          <input class="wide" type={dmShow ? 'text' : 'password'} placeholder="粘贴弹幕接口地址，留空不加载弹幕" bind:value={dmApi} spellcheck="false" autocomplete="off" onchange={saveDm} />
+          <button class="btn icon" title={dmShow ? '隐藏地址' : '显示地址'} onclick={() => (dmShow = !dmShow)}>{#if dmShow}<EyeOff size={15} />{:else}<Eye size={15} />{/if}</button>
+        </div>
+        <div class="sub">支持 <code>/api/v2</code> 格式的弹幕接口，地址里可以带令牌，只保存在本机。播放时按 D 开关弹幕，点控制栏的「弹」也可以；右键「弹」打开弹幕设置（不透明度、显示区域、字号、速度、屏蔽类型、时间偏移、手动匹配）</div>
+      </div>
+    </div>
+    <label class="row">
+      <span class="label">屏蔽词</span>
+      <div class="grow">
+        <textarea rows="3" placeholder="一行一个，含有这些字的弹幕不显示（不分大小写）" bind:value={dmWords} spellcheck="false" onchange={saveDm}></textarea>
+      </div>
+    </label>
+  </div>
   <h3>关于</h3>
   <div class="group">
     <div class="row">
@@ -243,7 +274,7 @@
     <div class="row"><span class="label">界面渲染</span><span class="grow sub selectable">{gpu}</span></div>
     <div class="row"><span class="label">播放器渲染</span><span class="grow sub">mpv 优先使用 NVIDIA 独显（D3D11 + 硬解）；播放时按 i 可查看实际使用的解码方式</span></div>
   </div>
-  <p class="note">播放器快捷键：空格 暂停　←→ 快退 / 快进 5 秒　↑↓ 音量　F 全屏　&lt; &gt; 上一集 / 下一集　F8 选集　Q 退出</p>
+  <p class="note">播放器快捷键：空格 暂停　←→ 快退 / 快进 5 秒　↑↓ 音量　F 全屏　&lt; &gt; 上一集 / 下一集　F8 选集　D 弹幕　Q 退出</p>
 
   {#if msg}<p class="msg" class:err={!msg.ok}>{msg.text}</p>{/if}
 </div>
@@ -280,4 +311,10 @@
   .sub.err { color: var(--danger); }
   .notes { white-space: pre-wrap; max-height: 160px; overflow: auto; margin-top: 6px; }
   input.wide { width: 100%; }
+  .line { display: flex; gap: 8px; align-items: center; }
+  textarea {
+    width: 100%; resize: vertical; border: 0; border-radius: var(--radius-s); padding: 6px 10px; background: var(--fill); font: inherit;
+    color: inherit; box-shadow: inset 0 -1px 0 var(--stroke-strong); transition: box-shadow 0.12s, background 0.12s;
+  }
+  textarea:focus { outline: none; background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
 </style>

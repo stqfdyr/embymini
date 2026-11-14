@@ -11,7 +11,8 @@
 --
 -- Modified for EmbyMini (changes marked "EmbyMini:"): the top bar shows the
 -- window title centered and the network speed next to the window controls;
--- the next button turns green with a bolt once the next episode is queued.
+-- the next button turns green with a bolt once the next episode is queued;
+-- a danmaku button (toggle / settings panel of scripts/danmaku.lua).
 
 local assdraw = require "mp.assdraw"
 local msg = require "mp.msg"
@@ -2414,6 +2415,7 @@ layouts["default"] = function ()
     end
 
     right_side_button("fullscreen", 550, user_opts.fullscreen_button)
+    right_side_button("danmaku", 600) -- EmbyMini: danmaku button
     right_side_button("info", 650, user_opts.info_button)
     right_side_button("ontop", 750, user_opts.ontop_button and not (window_controls_enabled() and user_opts.ontop_in_topbar and state.ontop))
     right_side_button("screenshot", 850, user_opts.screenshot_button)
@@ -3426,6 +3428,16 @@ local function osc_init()
     ne.tooltipF = locale.stats_info
     bind_buttons("info")
 
+    -- EmbyMini: danmaku button: left click toggles, right click opens the settings panel (scripts/danmaku.lua)
+    ne = new_element("danmaku", "button")
+    ne.content = function()
+        local font = package.config:sub(1, 1) == "\\" and "Microsoft YaHei" or "sans-serif"
+        return "{\\fn" .. font .. "\\b1" .. (state.embymini_danmaku == false and "\\1a&HA0&" or "") .. "}弹"
+    end
+    ne.tooltipF = function() return state.embymini_danmaku == false and "弹幕：关（D）· 右键：弹幕设置" or "弹幕：开（D）· 右键：弹幕设置" end
+    ne.eventresponder["mbtn_left_up"] = function() mp.commandv("script-message-to", "danmaku", "toggle") end
+    ne.eventresponder["mbtn_right_up"] = function() mp.commandv("script-message-to", "danmaku", "panel") end
+
     --ontop
     ne = new_element("ontop", "button")
     ne.content = function () return not state.ontop and icons.ontop_on or icons.ontop_off end
@@ -4412,6 +4424,11 @@ mp.register_script_message("osc-visibility", visibility_mode)
 -- EmbyMini: "yes" / "no" from the client, see the playlist_next button
 mp.register_script_message("embymini-next-ready", function(v)
     state.embymini_next_ready = (v == "yes")
+    request_tick()
+end)
+-- EmbyMini: danmaku on / off ("yes" / "no") from scripts/danmaku.lua, see the danmaku button
+mp.register_script_message("embymini-danmaku-on", function(v)
+    state.embymini_danmaku = (v == "yes")
     request_tick()
 end)
 -- EmbyMini: download speed from the client, see the netspeed element

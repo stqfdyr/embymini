@@ -132,6 +132,12 @@ struct Task {
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
+struct Preview {
+    t: Task,
+    blocks: std::ops::RangeInclusive<usize>,
+    role: Role,
+}
+
 struct Main {
     t: Task,
     /// 正在写（或马上要写）的块。
@@ -147,8 +153,8 @@ struct St {
     touched: Vec<u64>,
     writing: HashMap<usize, Part>,
     main: Option<Main>,
-    /// Preview tasks with their block range (inclusive) and role (the main player's short tasks live here too).
-    previews: Vec<(Task, usize, usize, Role)>,
+    /// Preview and prefetch tasks (the main player's short tasks live here too).
+    previews: Vec<Preview>,
     last_read: u64,
     /// Last failure and when it happened; no retry before `retry_at`.
     fail: Option<(Fail, Instant)>,
@@ -159,6 +165,16 @@ struct St {
 impl St {
     fn has(&self, b: usize) -> bool {
         self.done.get(b).copied().unwrap_or(false) || self.writing.contains_key(&b)
+    }
+
+    /// Block of the main player's last read.
+    fn read_block(&self) -> usize {
+        (self.last_read / BLOCK) as usize
+    }
+
+    /// Some preview-type task is fetching block b.
+    fn previewing(&self, b: usize) -> bool {
+        self.previews.iter().any(|p| p.blocks.contains(&b))
     }
 
     fn busy(&self) -> bool {
@@ -251,7 +267,7 @@ impl File {
             .take()
             .map(|m| m.t)
             .into_iter()
-            .chain(st.previews.drain(..).map(|(t, ..)| t))
+            .chain(st.previews.drain(..).map(|p| p.t))
             .collect();
         drop(st);
         abort_all(tasks);
@@ -293,7 +309,7 @@ impl Drop for TaskGuard {
         if st.main.as_ref().is_some_and(|m| m.t.id == self.id) {
             st.main = None;
         }
-        st.previews.retain(|(t, ..)| t.id != self.id);
+        st.previews.retain(|p| p.t.id != self.id);
         drop(st);
         self.f.bump();
     }
@@ -990,7 +1006,7 @@ impl Stream {
             .main
             .as_ref()
             .is_some_and(|m| m.at <= b && b <= m.at + MAIN_NEAR as usize);
-        if near || st.previews.iter().any(|(_, lo, h, _)| *lo <= b && b <= *h) {
+        if near || st.previewing(b) {
             return Vec::new();
         }
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -1014,14 +1030,18 @@ impl Stream {
         };
         let mut old = Vec::new();
         // 预览只关心最新的位置：名额满了取消最早的预览 / 预取（主播放器的短任务不算名额、不取消）
-        let side = |r: &Role| *r != Role::Main;
-        if st.previews.iter().filter(|p| side(&p.3)).count() >= PREVIEWS
-            && let Some(k) = st.previews.iter().position(|p| side(&p.3))
+        let side = |p: &Preview| p.role != Role::Main;
+        if st.previews.iter().filter(|p| side(p)).count() >= PREVIEWS
+            && let Some(k) = st.previews.iter().position(side)
         {
-            old.push(st.previews.remove(k).0);
+            old.push(st.previews.remove(k).t);
         }
         let task = tauri::async_runtime::spawn(self.clone().preview_task(f.clone(), b, hi, id));
-        st.previews.push((Task { id, task }, b, hi, role));
+        st.previews.push(Preview {
+            t: Task { id, task },
+            blocks: b..=hi,
+            role,
+        });
         old
     }
 
@@ -1054,7 +1074,7 @@ impl Stream {
                         if !mine() {
                             return;
                         }
-                        let rb = (f.st().last_read / BLOCK) as usize;
+                        let rb = f.st().read_block();
                         if !self.limited() || at <= rb + AHEAD as usize / 2 {
                             break;
                         }
@@ -1108,9 +1128,8 @@ impl Stream {
     fn next_missing(&self, f: &File) -> Option<usize> {
         let st = f.st();
         let n = st.done.len();
-        let rb = ((st.last_read / BLOCK) as usize).min(n.saturating_sub(1));
-        let free =
-            |b: &usize| !st.has(*b) && !st.previews.iter().any(|(_, lo, hi, _)| lo <= b && b <= hi);
+        let rb = st.read_block().min(n.saturating_sub(1));
+        let free = |b: &usize| !st.has(*b) && !st.previewing(*b);
         if self.limited() {
             return (rb..(rb + AHEAD as usize + 1).min(n)).find(free);
         }
@@ -1275,10 +1294,7 @@ impl Stream {
         let io = |e: std::io::Error| Fail::Net(format!("写缓存失败：{e}"));
         for b in from..to {
             // 只缓存前方：写到读的位置前方 AHEAD 块就放掉连接。挂着不读的话，读超时（10 秒）和中继的发送超时都会把它断掉
-            if main.is_some()
-                && self.limited()
-                && b > (f.st().last_read / BLOCK) as usize + AHEAD as usize
-            {
+            if main.is_some() && self.limited() && b > f.st().read_block() + AHEAD as usize {
                 return Ok(Stop::Ahead(b));
             }
             let Some(mut w) = self.claim(f, b, main, size) else {
@@ -1338,7 +1354,7 @@ impl Stream {
         let cap = self.cap.load(Ordering::Relaxed);
         while self.total.load(Ordering::Relaxed) + len > cap {
             // 读的位置附近的不删
-            let rb = (st.last_read / BLOCK) as usize;
+            let rb = st.read_block();
             let keep = rb.saturating_sub(2)..=rb + AHEAD as usize;
             let Some(victim) = (0..st.done.len())
                 .filter(|&k| st.done[k] && !keep.contains(&k))

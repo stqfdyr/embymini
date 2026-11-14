@@ -1656,6 +1656,11 @@ mod tests {
                     let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
                 }
+                // Every request after the first: 403 (a signed URL that expired)
+                if path.starts_with("/expire") && flaky.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    return;
+                }
                 if path.starts_with("/sub") {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello").await;
                     return;
@@ -2036,7 +2041,8 @@ mod tests {
             false,
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Reading cached blocks wakes nobody: the parked task re-checks once a second
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(done(&f).len(), AHEAD as usize + 1);
         let _ = get(
             &url,
@@ -2092,6 +2098,27 @@ mod tests {
         // 4 cuts: about 4 s with a 1 s retry each, 15 s (1+2+4+8) if the backoff keeps doubling
         assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/drops").len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A 4xx after the size is known ends the main task and reaches mpv instead of being retried forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_mid_playback_reaches_reader() {
+        let u = upstream((3 * BLOCK) as usize).await;
+        let dir = tmp("expire");
+        let s = Stream::start(&dir, false).unwrap();
+        let url = s.video("srv_22_a", &format!("{}/expire", u.base), &auth(&u));
+        let at = 2 * BLOCK;
+        let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
+        assert_eq!(st, 206);
+        // The read in flight ends early; the reconnect gets the 403
+        let first =
+            tokio::time::timeout(Duration::from_secs(5), get(&url, Some("bytes=0-99"), false))
+                .await;
+        assert!(first.is_ok(), "reader hung on a definitive error");
+        let (st, _) = get(&url, Some("bytes=0-99"), false).await;
+        assert_eq!(st, 403);
+        assert_eq!(reqs(&u, "/expire").len(), 2, "a 403 must not be retried");
         let _ = std::fs::remove_dir_all(dir);
     }
 

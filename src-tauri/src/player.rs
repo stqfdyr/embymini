@@ -14,6 +14,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -146,7 +147,7 @@ pub enum Event {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Track {
+enum Track {
     /// 服务端没给，交给 mpv 按 slang / alang 自己选。
     Auto,
     Off,
@@ -156,7 +157,7 @@ pub enum Track {
 
 /// 把 Emby 的默认轨（流的 `Index`）换成 mpv 轨道号：
 /// 内嵌轨按 Index 排序后的序号；外挂字幕在内嵌之后，按 `sub-add` 顺序（同样按 Index 排序）编号。
-pub fn mpv_track(streams: &[MediaStream], kind: &str, default: Option<i32>) -> Track {
+fn mpv_track(streams: &[MediaStream], kind: &str, default: Option<i32>) -> Track {
     let Some(want) = default else {
         return Track::Auto;
     };
@@ -275,13 +276,13 @@ fn episode_label(item: &Item) -> String {
     }
 }
 
+/// The window title: an episode also gets its series name.
 fn title(item: &Item) -> String {
     match (
         &item.series_name,
-        item.parent_index_number,
-        item.index_number,
+        item.parent_index_number.and(item.index_number),
     ) {
-        (Some(series), Some(s), Some(e)) => format!("{series} S{s:02}E{e:02} {}", item.name),
+        (Some(series), Some(_)) => format!("{series} {}", episode_label(item)),
         _ => item.name.clone(),
     }
 }
@@ -298,7 +299,7 @@ fn fail_reason(status: Option<u16>, mpv_error: &str) -> String {
 fn loadfile_opts(title: &str, start: f64) -> String {
     let mut o = format!("force-media-title=%{}%{title}", title.len());
     if start > 0.0 {
-        o.push_str(&format!(",start={start:.3}"));
+        let _ = write!(o, ",start={start:.3}");
     }
     o
 }
@@ -940,98 +941,110 @@ impl State {
         }
     }
 
+    /// One line from mpv's IPC: a command reply, or an event.
     async fn on_message(&mut self, v: Value) {
-        let Some(ev) = v["event"].as_str() else {
-            if let Some(i) = v["request_id"]
-                .as_u64()
-                .and_then(|rid| self.pending.remove(&rid))
-            {
-                match v["data"]["playlist_entry_id"].as_i64() {
-                    Some(id) => self.queue[i].entry_id = Some(id),
-                    None => {
-                        log::warn!("loadfile 失败：{}", v["error"]);
-                        // 没进列表：手动下一集要走 jump，不能 playlist-next
-                        self.queue[i].loaded = false;
-                        self.sync_next_ready().await;
-                    }
-                }
-            }
+        match v["event"].as_str() {
+            None => self.on_reply(&v).await,
+            Some("property-change") => self.on_property(&v),
+            Some("client-message") => self.on_client_message(&v["args"]).await,
+            Some(ev) => self.on_file_event(ev, &v).await,
+        }
+    }
+
+    /// A command reply; only loadfile's matter, for the playlist entry id.
+    async fn on_reply(&mut self, v: &Value) {
+        let Some(i) = v["request_id"]
+            .as_u64()
+            .and_then(|rid| self.pending.remove(&rid))
+        else {
             return;
         };
-        let entry = self.index_of(v["playlist_entry_id"].as_i64());
-        if matches!(ev, "start-file" | "file-loaded" | "end-file") {
-            // 排查切集 / 加载失败时，对着这几行就能还原 mpv 的时间线
-            // file-loaded 不带 playlist_entry_id，用当前集
-            let id = entry
-                .or(self.cur)
-                .map_or("?", |i| self.queue[i].item.id.as_str());
-            log::info!(
-                "mpv {ev}：{id} {}",
-                v["reason"].as_str().unwrap_or_default()
-            );
+        match v["data"]["playlist_entry_id"].as_i64() {
+            Some(id) => self.queue[i].entry_id = Some(id),
+            None => {
+                log::warn!("loadfile 失败：{}", v["error"]);
+                // Not in the playlist: a manual next must go through jump, not playlist-next
+                self.queue[i].loaded = false;
+                self.sync_next_ready().await;
+            }
         }
-        match ev {
-            "start-file" => {
-                if let Some(i) = entry {
-                    // 同一集可能被 mpv 再播一遍（ModernZ 中键开了列表循环）：当作新的一次播放，否则回传全被跳过
-                    (self.queue[i].started, self.queue[i].stopped) = (false, false);
-                    self.cur = Some(i);
-                    self.applied = None;
-                    let labels: Vec<String> =
-                        self.queue.iter().map(|e| episode_label(&e.item)).collect();
-                    self.send(json!([
-                        "script-message-to",
-                        "embymini",
-                        "episodes",
-                        json!(labels).to_string(),
-                        i.to_string()
-                    ]))
-                    .await;
-                    self.pos = self.queue[i].start;
-                    self.dur = 0.0;
-                    self.sync_next_ready().await;
-                    self.keep_cache();
-                }
+    }
+
+    /// start-file / file-loaded / end-file; other events are ignored.
+    async fn on_file_event(&mut self, ev: &str, v: &Value) {
+        if !matches!(ev, "start-file" | "file-loaded" | "end-file") {
+            return;
+        }
+        let entry = self.index_of(v["playlist_entry_id"].as_i64());
+        // These lines rebuild mpv's timeline when chasing a failed switch or load; file-loaded has no entry id
+        let id = entry
+            .or(self.cur)
+            .map_or("?", |i| self.queue[i].item.id.as_str());
+        log::info!(
+            "mpv {ev}：{id} {}",
+            v["reason"].as_str().unwrap_or_default()
+        );
+        match (ev, entry) {
+            ("start-file", Some(i)) => {
+                // mpv may play the same entry again (playlist loop): a new playback, or every report is skipped
+                (self.queue[i].started, self.queue[i].stopped) = (false, false);
+                self.cur = Some(i);
+                self.applied = None;
+                let labels: Vec<String> =
+                    self.queue.iter().map(|e| episode_label(&e.item)).collect();
+                self.send(json!([
+                    "script-message-to",
+                    "embymini",
+                    "episodes",
+                    json!(labels).to_string(),
+                    i.to_string()
+                ]))
+                .await;
+                self.pos = self.queue[i].start;
+                self.dur = 0.0;
+                self.sync_next_ready().await;
+                self.keep_cache();
             }
-            "file-loaded" => {
-                if let Some(i) = self.cur {
-                    // 真正加载出来才算开播；没加载出来的不回传 Playing / Stopped
-                    self.queue[i].started = true;
-                    self.apply_tracks(i).await;
-                    self.report(i, "", json!({}));
-                    self.dm_show(i).await;
-                    let _ = self.events.send(Event::Started {
-                        item_id: self.queue[i].item.id.clone(),
-                    });
-                }
+            ("file-loaded", _) => {
+                let Some(i) = self.cur else { return };
+                // Only a loaded file counts as started; one that never loaded reports neither Playing nor Stopped
+                self.queue[i].started = true;
+                self.apply_tracks(i).await;
+                self.report(i, "", json!({}));
+                self.dm_show(i).await;
+                let _ = self.events.send(Event::Started {
+                    item_id: self.queue[i].item.id.clone(),
+                });
             }
-            "end-file" => {
-                if let Some(i) = entry {
-                    if v["reason"] == "error" {
-                        self.fail(i, v["file_error"].as_str().unwrap_or("未知错误"))
-                            .await;
-                    } else {
-                        self.stop(i);
-                    }
-                }
-            }
-            "property-change" => self.on_property(&v).await,
-            "client-message" if v["args"][0] == NEXT_MSG => self.next().await,
-            "client-message" if v["args"][0].as_str().is_some_and(|a| a.starts_with(DM_MSG)) => {
-                self.on_danmaku(&v["args"]).await
-            }
-            "client-message" if v["args"][0] == PREV_MSG => self.prev().await,
-            "client-message" if v["args"][0] == JUMP_MSG => {
-                let to = v["args"][1].as_str().and_then(|s| s.parse::<usize>().ok());
-                if let Some(i) = to.filter(|&i| i < self.queue.len() && Some(i) != self.cur) {
-                    self.jump(i).await;
+            ("end-file", Some(i)) => {
+                if v["reason"] == "error" {
+                    self.fail(i, v["file_error"].as_str().unwrap_or("未知错误"))
+                        .await;
+                } else {
+                    self.stop(i);
                 }
             }
             _ => {}
         }
     }
 
-    async fn on_property(&mut self, v: &Value) {
+    /// `script-message` from our scripts (episode switching, the danmaku panel).
+    async fn on_client_message(&mut self, args: &Value) {
+        match args[0].as_str().unwrap_or_default() {
+            NEXT_MSG => self.next().await,
+            PREV_MSG => self.prev().await,
+            JUMP_MSG => {
+                let to = args[1].as_str().and_then(|s| s.parse::<usize>().ok());
+                if let Some(i) = to.filter(|&i| i < self.queue.len() && Some(i) != self.cur) {
+                    self.jump(i).await;
+                }
+            }
+            a if a.starts_with(DM_MSG) => self.on_danmaku(args).await,
+            _ => {}
+        }
+    }
+
+    fn on_property(&mut self, v: &Value) {
         match (v["name"].as_str(), &v["data"]) {
             (Some("time-pos"), d) => {
                 if let Some(p) = d.as_f64() {
@@ -1059,7 +1072,7 @@ impl State {
             (Some("current-tracks/sub"), d) if self.tracking() && d.is_object() => {
                 self.pref_sub = Some(Pref::from_track(d));
             }
-            (Some("sid"), d) if self.tracking() && (*d == json!(false) || *d == "no") => {
+            (Some("sid"), d) if self.tracking() && (d.as_bool() == Some(false) || d == "no") => {
                 self.pref_sub = Some(Pref::Off);
             }
             (Some("pause"), d) => {
@@ -1201,8 +1214,8 @@ impl State {
             "CanSeek": true,
             "PlayMethod": "DirectStream",
         });
-        if let (Some(b), Some(x)) = (body.as_object_mut(), extra.as_object()) {
-            b.extend(x.clone());
+        if let (Some(b), Value::Object(x)) = (body.as_object_mut(), extra) {
+            b.extend(x);
         }
         let _ = self
             .reports
@@ -1846,15 +1859,7 @@ mod tests {
                 held.push(sock);
             }
         });
-        let server = crate::config::Server {
-            id: "s".into(),
-            name: String::new(),
-            url: "http://127.0.0.1".into(),
-            port,
-            user: "u".into(),
-            user_id: "uid".into(),
-            token: "tok".into(),
-        };
+        let server = emby::tests::server_at("http://127.0.0.1", port);
         let emby = Emby::new(emby::http_client().unwrap(), &server, "dev");
         let (st, _, _) = offline_state(2);
         let mut queue = st.queue;
@@ -2363,15 +2368,7 @@ mod tests {
                 held.push(sock);
             }
         });
-        let server = crate::config::Server {
-            id: "s".into(),
-            name: String::new(),
-            url: "http://127.0.0.1".into(),
-            port,
-            user: "u".into(),
-            user_id: "uid".into(),
-            token: "tok".into(),
-        };
+        let server = emby::tests::server_at("http://127.0.0.1", port);
         let emby = Emby::new(emby::http_client().unwrap(), &server, "dev");
         let starting = start(emby, "1", None, false, headless(&[]));
         // 1.5 秒后还在起播（上游不回话），这时 mpv 已经起来了；然后放弃

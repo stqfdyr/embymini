@@ -540,8 +540,8 @@ async fn cache_clear(handle: AppHandle, kind: String) -> CacheInfo {
     })
 }
 
-/// `emby-img` 协议：界面要的图交给 [`images::Images`]（磁盘缓存 → 上游）。路径里是服务器 id，这里换成那台服务器的 API 根；
-/// 不认识的服务器回 404，不会去别的地址取。
+/// `emby-img` scheme: hands the image to [`images::Images`] (disk cache → upstream). The path carries a server
+/// id, mapped here to that server's API root; unknown servers get a 404 and nothing is fetched elsewhere.
 async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Vec<u8>> {
     let Some(req) = images::Req::parse(path) else {
         return images::response(Err(400));

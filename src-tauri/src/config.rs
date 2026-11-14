@@ -1,19 +1,20 @@
-//! 本地配置：服务器列表、当前服务器、播放设置。存成一个 JSON 文件（数据目录下的 config.json，见 [`data_root`]）。
+//! Local config: server list, active server, playback settings. One JSON file, `config.json` under [`data_root`].
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
-/// 数据目录里的标记文件。卸载时只有它在，才删 `data\`：防止用户把程序直接装在一个
-/// 本来就有 `data` 文件夹的目录里，卸载时误删别人的东西。改名要同步改 `windows/hooks.nsh`。
+/// Marker file in the data dir. The uninstaller deletes `data\` only when it is present, so installing into a
+/// folder that already had someone else's `data` never wipes it. Renaming it needs `windows/hooks.nsh` too.
 pub const MARKER: &str = ".embymini";
 
-/// 数据根目录：所有数据（配置、日志、界面缓存、mpv 缓存）都放程序旁边的 `data\`，系统盘不留东西。
-/// 安装器默认按当前用户安装、不提权，用户选的安装目录一定可写；
-/// 不可写时（例如手动拷到只读位置）退回 `%LOCALAPPDATA%\<identifier>`。
+/// Data root: everything (config, logs, UI cache, mpv cache) lives in `data\` beside the exe, nothing on the
+/// system drive. The installer is per-user and unelevated, so the chosen folder is writable; if not (e.g.
+/// copied to a read-only place) falls back to `%LOCALAPPDATA%\<identifier>`.
 pub fn data_root(identifier: &str) -> PathBuf {
     let beside_exe = std::env::current_exe()
         .ok()
@@ -25,10 +26,14 @@ pub fn data_root(identifier: &str) -> PathBuf {
     })
 }
 
-/// 能否把 `d` 当数据目录（可写），顺带决定要不要打标记：只有新建的、空的或已经是我们的目录才打，
-/// 本来就有别人东西的 `data` 照用但不打标记，卸载时不删。
+/// Whether `d` is usable (writable) as the data dir. Only a new, empty or already-ours dir gets the marker;
+/// a `data` holding someone else's files (or one we cannot list) is used but never marked, so never uninstalled.
 fn claim(d: &Path) -> bool {
-    let ours = d.join(MARKER).exists() || fs::read_dir(d).map_or(true, |mut r| r.next().is_none());
+    let ours = d.join(MARKER).exists()
+        || fs::read_dir(d).map_or_else(
+            |e| e.kind() == io::ErrorKind::NotFound,
+            |mut r| r.next().is_none(),
+        );
     if fs::create_dir_all(d).is_err() {
         return false;
     }
@@ -41,9 +46,10 @@ fn claim(d: &Path) -> bool {
     ok
 }
 
-/// 旧版本的配置（config.json、mpv.conf）在 `%APPDATA%\<id>`，日志、界面缓存、mpv 缓存在 `%LOCALAPPDATA%\<id>`。
-/// 新位置还没有 config.json 时把那两个文件搬过来（可能跨盘，所以复制），都成功后删掉 `old_dirs`
-/// （包含数据根目录的那个除外）。config.json 最后复制：它出现在新位置就代表搬完了。返回是否搬了。
+/// Old versions kept config (config.json, mpv.conf) in `%APPDATA%\<id>` and logs / caches in `%LOCALAPPDATA%\<id>`.
+/// If the new root has no config.json yet, copy both files over (may cross drives), then delete `old_dirs`
+/// except one containing the root. config.json is copied last: its presence means the move finished.
+/// Returns whether anything was moved.
 pub fn migrate(root: &Path, old_config: &Path, old_dirs: &[PathBuf]) -> io::Result<bool> {
     if root.join("config.json").exists() || !old_config.join("config.json").is_file() {
         return Ok(false);
@@ -61,24 +67,26 @@ pub fn migrate(root: &Path, old_config: &Path, old_dirs: &[PathBuf]) -> io::Resu
     Ok(true)
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+// No `Debug`: it would print server tokens if anyone ever logged a config.
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
-    /// 本机设备 id，所有服务器共用；首次启动生成。
+    /// This machine's device id, shared by all servers; generated on first start.
     pub device_id: String,
     pub active: Option<String>,
     pub servers: Vec<Server>,
-    /// mpv 可执行文件；为空时用资源目录自带的，再退回 PATH。
+    /// mpv executable; empty means the bundled one, then PATH.
     pub mpv_path: Option<String>,
-    /// 当前集播放到这个百分比时预加载下一集。
+    /// Preload the next episode once the current one reaches this percentage.
     pub preload_percent: u8,
-    /// 上次退出播放器时的音量，下次起播沿用。
+    /// Volume when the player last quit; reused on the next start.
     pub volume: Option<f64>,
-    /// 检查更新、下载安装包用的代理（如 `http://127.0.0.1:10808`）；为空时跟随系统代理。其它请求一律不走代理。
+    /// Proxy for update checks and installer downloads only (e.g. `http://127.0.0.1:10808`); empty follows
+    /// the system proxy. Every other request bypasses proxies.
     pub update_proxy: Option<String>,
-    /// 边播边缓存整个视频（默认开）；关掉时缓存代理只缓存播放位置前方一段。
+    /// Cache the whole video while playing (default on); off caches only a window ahead of playback.
     pub cache_whole: bool,
-    /// 弹幕：接口地址、屏蔽词、显示设置、手动匹配。
+    /// Danmaku: API address, blocked words, display settings, manual matches.
     pub danmaku: crate::danmaku::Config,
 }
 
@@ -98,23 +106,23 @@ impl Default for Config {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Server {
     pub id: String,
     pub name: String,
-    /// `scheme://host[/子路径]`，不含端口，见 [`normalize`]。
+    /// `scheme://host[/subpath]` without the port, see [`normalize`].
     pub url: String,
     pub port: u16,
     pub user: String,
     #[serde(default)]
     pub user_id: String,
-    /// 空串表示需要重新登录。只存 token，不存密码。
+    /// Empty means a fresh login is needed. Only the token is stored, never the password.
     #[serde(default)]
     pub token: String,
 }
 
-/// 给前端看的服务器信息（不含 token）。
+/// Server info for the UI; never carries the token.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerView {
@@ -124,13 +132,13 @@ pub struct ServerView {
     pub port: u16,
     pub user: String,
     pub user_id: String,
-    /// API 根，前端用它拼图片地址（图片接口不需要 token）。
+    /// API root; the UI builds image URLs from it (images need no token).
     pub base: String,
     pub logged_in: bool,
 }
 
 impl Server {
-    /// API 根：`scheme://host:port[/子路径]/emby`。
+    /// API root: `scheme://host:port[/subpath]/emby`.
     pub fn api_base(&self) -> String {
         match Url::parse(&self.url) {
             Ok(mut u) => {
@@ -155,8 +163,9 @@ impl Server {
     }
 }
 
-/// 上游标识：API 根地址的 FNV-1a 哈希取 8 位十六进制。视频缓存目录名、弹幕缓存与手动匹配记录靠它区分服务器，
-/// 文件名里不出现地址。算法不能改，否则已有的缓存和手动匹配都对不上。
+/// Upstream tag: FNV-1a of the API root, top 8 hex digits. Video cache dirs, danmaku cache and manual matches
+/// are keyed by it so file names never contain addresses. Never change the algorithm: existing caches and
+/// matches would stop matching.
 pub fn server_tag(api_base: &str) -> String {
     let h = api_base.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
@@ -164,11 +173,11 @@ pub fn server_tag(api_base: &str) -> String {
     format!("{:08x}", h >> 32)
 }
 
-/// 把用户输入的地址和端口规范化成 `(scheme://host[/子路径], 端口)`。
+/// Normalizes the user's address and port into `(scheme://host[/subpath], port)`.
 ///
-/// 接受：裸域名、带协议、地址里带端口、从浏览器复制来的 `…/web/index.html#!/home`、带 `/emby` 后缀的地址。
-/// 端口优先级：端口栏 > 地址里的端口 > 协议默认端口。
-/// 不写协议时按 https；但端口（端口栏或地址里写的）是 80 / 8096（Emby 的 http 默认端口）时按 http。
+/// Accepts bare hosts, schemes, ports inside the address, browser URLs like `…/web/index.html#!/home`,
+/// and a trailing `/emby`. Port precedence: port field > port in the address > scheme default.
+/// Without a scheme it is https, except http when the port is 80 or 8096 (Emby's http default).
 pub fn normalize(input: &str, port: Option<u16>) -> Result<(String, u16), String> {
     let s = input.trim();
     let has_scheme = s.contains("://");
@@ -179,7 +188,7 @@ pub fn normalize(input: &str, port: Option<u16>) -> Result<(String, u16), String
     };
     let mut u = Url::parse(&full).map_err(|_| format!("地址格式不对：{s}"))?;
     if !has_scheme && matches!(port.or(u.port()), Some(80 | 8096)) {
-        // 只换协议：地址里写的端口 Url 会保留
+        // Only the scheme changes; Url keeps a port written in the address.
         u = Url::parse(&format!("http://{s}")).map_err(|_| format!("地址格式不对：{s}"))?;
     }
     if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none_or(str::is_empty) {
@@ -189,7 +198,10 @@ pub fn normalize(input: &str, port: Option<u16>) -> Result<(String, u16), String
         .or(u.port())
         .or(u.port_or_known_default())
         .ok_or_else(|| format!("无法确定端口：{s}"))?;
-    // 子路径只保留到 /web 或 /emby 之前（反代可能把 Emby 挂在子路径下）。
+    if port == 0 {
+        return Err("端口不能是 0".into());
+    }
+    // Keep the subpath only up to /web or /emby (a reverse proxy may mount Emby under a subpath).
     let path: Vec<&str> = u
         .path_segments()
         .map(|it| {
@@ -205,25 +217,64 @@ pub fn normalize(input: &str, port: Option<u16>) -> Result<(String, u16), String
     Ok((u.as_str().trim_end_matches('/').to_owned(), port))
 }
 
-pub fn load(path: &Path) -> Config {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            log::warn!("配置文件损坏，改名为 config.json.bad 后重建：{e}");
-            let _ = fs::rename(path, path.with_extension("json.bad"));
-            Config::default()
-        }),
-        Err(_) => Config::default(),
-    }
+/// Startup saves right after loading, so this must never hand back defaults while the user's file is still
+/// in place. Missing file: defaults. Corrupt file: moved to a new `config.json.bad[.N]` (older backups kept),
+/// then defaults. Unreadable file (e.g. briefly locked by antivirus): retried, then an error that stops startup.
+pub fn load(path: &Path) -> io::Result<Config> {
+    let mut retries = 3;
+    let bytes = loop {
+        match fs::read(path) {
+            Ok(b) => break b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) if retries > 0 => {
+                log::warn!("读取配置失败，稍后重试：{e}");
+                retries -= 1;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    serde_json::from_slice(&bytes).or_else(|e| {
+        let bad = (1..)
+            .map(|n| match n {
+                1 => path.with_extension("json.bad"),
+                n => path.with_extension(format!("json.bad.{n}")),
+            })
+            .find(|p| !p.exists())
+            .expect("unbounded");
+        log::warn!("配置文件损坏，改名为 {} 后重建：{e}", bad.display());
+        fs::rename(path, bad)?;
+        Ok(Config::default())
+    })
 }
 
-/// 先写临时文件再改名，写到一半断电也不会把配置写坏。
+/// Writes a temp file, syncs it and renames it over, so a crash or power cut never leaves a broken config.
 pub fn save(path: &Path, cfg: &Config) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
+    let bytes = serde_json::to_vec_pretty(cfg)?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(cfg)?)?;
+    // The file is closed before the rename (Windows refuses to rename an open file).
+    let written = fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(&bytes)?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     fs::rename(tmp, path)
+}
+
+/// Applies `f` to a copy and saves it; `cfg` changes only once the save succeeded, so memory never
+/// runs ahead of disk (a failed add would otherwise still list the server, and a retry duplicate it).
+pub fn update<T>(path: &Path, cfg: &mut Config, f: impl FnOnce(&mut Config) -> T) -> io::Result<T> {
+    let mut next = cfg.clone();
+    let out = f(&mut next);
+    save(path, &next)?;
+    *cfg = next;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -242,7 +293,7 @@ mod tests {
             ("https://emby.example.com".into(), 443)
         );
         assert_eq!(ok("1.2.3.4", Some(8096)), ("http://1.2.3.4".into(), 8096));
-        // 局域网常见写法：端口写在地址里、不写协议
+        // Common on a LAN: port in the address, no scheme.
         assert_eq!(
             ok("192.168.1.5:8096", None),
             ("http://192.168.1.5".into(), 8096)
@@ -266,16 +317,15 @@ mod tests {
         );
         assert!(normalize("ftp://h.example", None).is_err());
         assert!(normalize("", None).is_err());
+        assert_eq!(normalize("h.example", Some(0)), Err("端口不能是 0".into()));
+        assert_eq!(normalize("h.example:0", None), Err("端口不能是 0".into()));
     }
 
     #[test]
     fn server_tag_is_stable() {
-        // 固定值：改了算法，已有的视频缓存和弹幕手动匹配就对不上
+        // Fixed values: changing the algorithm orphans existing video caches and danmaku matches.
         assert_eq!(server_tag(""), "cbf29ce4");
-        assert_eq!(
-            server_tag("https://h.example/emby"),
-            server_tag("https://h.example/emby")
-        );
+        assert_eq!(server_tag("https://h.example/emby"), "74dce48f");
         assert_ne!(
             server_tag("https://a.example/emby"),
             server_tag("https://b.example/emby")
@@ -305,6 +355,14 @@ mod tests {
             s("http://1.2.3.4/sub", 8096).api_base(),
             "http://1.2.3.4:8096/sub/emby"
         );
+        assert!(!s("https://h.example", 443).view().logged_in);
+        let v = Server {
+            token: "t".into(),
+            ..s("https://h.example", 443)
+        }
+        .view();
+        assert!(v.logged_in);
+        assert_eq!(v.base, "https://h.example/emby");
     }
 
     #[test]
@@ -316,25 +374,67 @@ mod tests {
             ..Default::default()
         };
         save(&path, &c).unwrap();
-        assert_eq!(load(&path).device_id, c.device_id);
-        fs::write(&path, b"{not json").unwrap();
-        assert_eq!(load(&path).preload_percent, 80);
-        assert!(path.with_extension("json.bad").exists());
+        assert_eq!(load(&path).unwrap().device_id, c.device_id);
+        assert!(!path.with_extension("json.tmp").exists());
+        // A second corruption keeps the first backup.
+        for (i, junk) in [&b"{not json"[..], b"nope"].into_iter().enumerate() {
+            fs::write(&path, junk).unwrap();
+            assert_eq!(load(&path).unwrap().preload_percent, 80);
+            let bad = ["json.bad", "json.bad.2"][i];
+            assert_eq!(fs::read(path.with_extension(bad)).unwrap(), junk);
+        }
+        assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 只给新建 / 空的 / 本来就是我们的目录打卸载标记；别人的 data 照用但不打。
+    #[test]
+    fn unreadable_config_stops_startup() {
+        let dir = std::env::temp_dir().join(format!("embymini-unread-{}", std::process::id()));
+        let path = dir.join("config.json");
+        // A directory in its place: reading fails with something other than NotFound.
+        fs::create_dir_all(&path).unwrap();
+        assert!(load(&path).is_err());
+        assert!(path.is_dir(), "left in place");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn update_keeps_memory_when_save_fails() {
+        let dir = std::env::temp_dir().join(format!("embymini-upd-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file"), b"").unwrap();
+        let mut c = Config::default();
+        // Parent is a regular file, so the save fails.
+        let bad = dir.join("file").join("config.json");
+        assert!(update(&bad, &mut c, |c| c.preload_percent = 60).is_err());
+        assert_eq!(c.preload_percent, 80);
+        let good = dir.join("config.json");
+        let out = update(&good, &mut c, |c| {
+            c.preload_percent = 60;
+            7
+        });
+        assert_eq!(out.unwrap(), 7);
+        assert_eq!(c.preload_percent, 60);
+        assert_eq!(load(&good).unwrap().preload_percent, 60);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Only new, empty or already-ours dirs get the uninstall marker; someone else's `data` is used unmarked.
     #[test]
     fn claim_marks_only_our_dirs() {
         let t = std::env::temp_dir().join(format!("embymini-claim-{}", std::process::id()));
         let (fresh, foreign) = (t.join("fresh"), t.join("foreign"));
         assert!(claim(&fresh) && fresh.join(MARKER).exists());
-        assert!(claim(&fresh), "第二次启动照常可用");
+        assert!(claim(&fresh), "second start still usable");
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("别人的文件"), b"x").unwrap();
         assert!(claim(&foreign));
         assert!(!foreign.join(MARKER).exists());
-        assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1, "探测文件要删掉");
+        assert_eq!(
+            fs::read_dir(&foreign).unwrap().count(),
+            1,
+            "probe file removed"
+        );
         fs::remove_dir_all(t).unwrap();
     }
 
@@ -351,12 +451,12 @@ mod tests {
         assert_eq!(fs::read(root.join("mpv.conf")).unwrap(), b"volume=50");
         assert!(root.join("config.json").is_file());
         assert!(!old_cfg.exists() && !old_local.exists());
-        // 新位置已有配置：什么都不做
+        // New location already has a config: do nothing.
         fs::create_dir_all(&old_cfg).unwrap();
         fs::write(old_cfg.join("config.json"), b"{}").unwrap();
         assert!(!migrate(&root, &old_cfg, &old).unwrap());
         assert!(old_cfg.exists());
-        // 退回旧的 LOCALAPPDATA 目录当数据根时，不能把它自己删了
+        // When the old LOCALAPPDATA dir is the fallback root, it must not delete itself.
         let root2 = old_local.join("data");
         fs::create_dir_all(&old_local).unwrap();
         assert!(migrate(&root2, &old_cfg, &[old_cfg.clone(), old_local.clone()]).unwrap());

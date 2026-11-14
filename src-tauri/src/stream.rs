@@ -32,6 +32,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{mpsc, watch};
 
+use crate::{lock, sub_total};
+
 /// 块大小。分块文件而不是一个大稀疏文件：NTFS 的非稀疏文件在远处偏移写入要同步补零。
 pub const BLOCK: u64 = 4 << 20;
 /// 只缓存前方时，写到主播放器读的位置前方这么多块（64 MiB，等于 mpv 自己的一段预读）。
@@ -44,17 +46,15 @@ const HEDGE: [u64; 3] = [3, 5, 8];
 /// 一直拿不到数据就放弃（回 504），读的一方会再来。
 const OPEN_LIMIT: Duration = Duration::from_secs(30);
 const READ_CHUNK: u64 = 256 << 10;
+/// Video cache cap when the disk has room.
 const MAX_CAP: u64 = 20 << 30;
-/// 磁盘至少留这么多可用空间。
+/// Free space always left on the disk.
 const RESERVE: u64 = 10 << 30;
-/// 容量下限：盘快满时也要放得下前方这一段，否则什么都写不进去。
+/// Cap floor: even a nearly full disk must hold the window ahead, or nothing could be written at all.
 const MIN_CAP: u64 = 2 * AHEAD * BLOCK;
+/// Subtitle cache cap.
 const SUBS_CAP: u64 = 200 << 20;
 const ROLE: &str = "x-embymini-role";
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 fn blocks(size: u64) -> usize {
     size.div_ceil(BLOCK) as usize
@@ -143,14 +143,14 @@ struct Main {
 struct St {
     size: Option<u64>,
     done: Vec<bool>,
-    /// 每块最近一次读写的时刻（全局计数），到容量上限时删最久没用的。
+    /// Last read / write of each block (global tick); at the cap the least recently used go first.
     touched: Vec<u64>,
     writing: HashMap<usize, Part>,
     main: Option<Main>,
-    /// 预览任务、它要的块区间（闭区间）和角色（主播放器的短任务也在这里）。
+    /// Preview tasks with their block range (inclusive) and role (the main player's short tasks live here too).
     previews: Vec<(Task, usize, usize, Role)>,
     last_read: u64,
-    /// 最近一次失败和它的时刻；在这之后的某个时刻前不再重试。
+    /// Last failure and when it happened; no retry before `retry_at`.
     fail: Option<(Fail, Instant)>,
     retry_at: Option<Instant>,
     seq: u64,
@@ -165,7 +165,7 @@ impl St {
         self.main.is_some() || !self.previews.is_empty()
     }
 
-    /// 在 `since` 之后发生的上游 HTTP 错误（读的一方据此回错误码，而不是一直等）。
+    /// Upstream HTTP error seen after `since` (readers answer with it instead of waiting forever).
     fn status_since(&self, since: Instant) -> Option<u16> {
         match &self.fail {
             Some((Fail::Status(s), at)) if *at >= since => Some(*s),
@@ -175,18 +175,19 @@ impl St {
 }
 
 struct File {
-    /// 已被 retain 掉（目录在删）：还连着的读不再安排下载、直接断开。
+    /// Dropped by retain (directory being deleted): connected readers stop scheduling downloads and disconnect.
     gone: AtomicBool,
     dir: PathBuf,
     key: String,
     src: Mutex<Src>,
     st: Mutex<St>,
-    /// 写进新数据、状态变了就加一，读的一方据此醒来。
+    /// Bumped on new data or state changes; readers wake on it.
     changed: watch::Sender<u64>,
 }
 
 impl File {
-    /// 打开（或新建）一个文件的缓存目录：按 meta.json 的总大小认出完整的块，残缺的、来历不明的删掉。
+    /// Opens (or creates) a file's cache dir: blocks whose size matches meta.json count as done; partial
+    /// and unknown files are deleted.
     fn open(dir: PathBuf, src: Src) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         let size = std::fs::read(dir.join("meta.json"))
@@ -201,13 +202,16 @@ impl File {
             if fname == "meta.json" {
                 continue;
             }
-            let ok = match (fname.parse::<usize>(), size) {
-                (Ok(b), Some(s)) if b < n => e.metadata().is_ok_and(|m| m.len() == block_len(s, b)),
-                _ => false,
-            };
-            match fname.parse::<usize>() {
-                Ok(b) if ok => done[b] = true,
-                _ => {
+            // Canonical names only: `01` or `+1` would parse as block 1 yet never be read or deleted.
+            let whole = fname.parse::<usize>().ok().filter(|&b| {
+                b.to_string() == fname
+                    && size.is_some_and(|s| {
+                        b < n && e.metadata().is_ok_and(|m| m.len() == block_len(s, b))
+                    })
+            });
+            match whole {
+                Some(b) => done[b] = true,
+                None => {
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -239,7 +243,7 @@ impl File {
         self.dir.join(b.to_string())
     }
 
-    /// 停掉这个文件的全部下载任务（缓存留着）。
+    /// Stops all of this file's downloads (the cache stays).
     fn stop(&self) {
         let mut st = self.st();
         let tasks: Vec<_> = st
@@ -250,13 +254,11 @@ impl File {
             .chain(st.previews.drain(..).map(|(t, ..)| t))
             .collect();
         drop(st);
-        for t in tasks {
-            t.task.abort();
-        }
+        abort_all(tasks);
     }
 }
 
-/// 正在写的一块：没写完就被丢掉（任务取消、出错）时删掉 `.part`、撤销登记。
+/// A block being written: dropped unfinished (task cancelled, error) it deletes its `.part` and unregisters.
 struct Writing {
     f: Arc<File>,
     b: usize,
@@ -279,7 +281,7 @@ impl Drop for Writing {
     }
 }
 
-/// 下载任务结束（含被取消）时把自己从文件状态里撤掉。
+/// Removes a download task from its file's state when it ends (including cancellation).
 struct TaskGuard {
     f: Arc<File>,
     id: u64,
@@ -303,7 +305,7 @@ enum Key {
 }
 
 struct SubSrc {
-    /// 缓存里的文件名。
+    /// File name in the cache.
     file: String,
     src: Mutex<Src>,
 }
@@ -326,6 +328,8 @@ pub struct Inner {
     keys: Mutex<HashMap<String, Key>>,
     /// 等着删的目录：先改名进回收目录再慢慢删；改名前又被登记（又要播它）就不删了。
     doomed: Mutex<HashSet<String>>,
+    /// A delayed sweep retry is queued: one is enough, however many retains happen meanwhile.
+    sweep_retry: AtomicBool,
 }
 
 /// 本地缓存代理的句柄（可随意克隆）。
@@ -466,6 +470,7 @@ impl Stream {
             files: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
             doomed: Mutex::new(HashSet::new()),
+            sweep_retry: AtomicBool::new(false),
         }));
         let _ = std::fs::create_dir_all(&me.video);
         let _ = std::fs::create_dir_all(&me.subs);
@@ -571,7 +576,7 @@ impl Stream {
         }
     }
 
-    /// 只留下这些文件的缓存（当前集、已就绪的下一集），其余的停掉下载、删除目录。
+    /// Keeps only these files' caches (current episode, queued next one); stops and deletes the rest.
     pub fn retain(&self, keep: &[String]) {
         let mut gone = Vec::new();
         {
@@ -587,7 +592,7 @@ impl Stream {
             });
             keys.retain(|_, k| match k {
                 Key::Video(n) => keep.contains(n),
-                // 字幕的缓存名以视频的缓存名开头；mpv 在 sub-add 时就整个读完了，之后不会再来要
+                // Subtitle cache names start with the video's; mpv reads them whole at sub-add and never again.
                 Key::Sub(sub) => keep.iter().any(|n| sub.file.starts_with(n.as_str())),
             });
             for e in std::fs::read_dir(&self.video)
@@ -607,12 +612,19 @@ impl Stream {
             f.bump();
         }
         let me = self.clone();
-        tauri::async_runtime::spawn_blocking(move || me.sweep());
+        tauri::async_runtime::spawn_blocking(move || {
+            // Every episode change refreshes the cap from free disk space and corrects drift in `total`.
+            if !me.sweep(false) {
+                me.recount();
+            }
+        });
     }
 
-    /// 删掉等着删的目录：在锁里改名进回收目录（改名前又被登记的就不删），锁外再慢慢删。
-    /// Windows 上目录里还有文件开着时改名会失败，留到下次。
-    fn sweep(&self) {
+    /// Deletes doomed dirs: renamed into the trash under the lock (a name registered again first is spared),
+    /// then removed outside it. On Windows the rename fails while a file inside is open; retried every 10 s
+    /// by a single chain (`retry` marks a run of it). Returns whether anything was renamed (and recounted).
+    fn sweep(&self, retry: bool) -> bool {
+        let mut stuck = Vec::new();
         let trash: Vec<PathBuf> = {
             let mut doomed = lock(&self.doomed);
             let mut out = Vec::new();
@@ -625,26 +637,41 @@ impl Stream {
                         out.push(to);
                         false
                     }
-                    Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => {
+                        stuck.push(format!("{n}（{e}）"));
+                        true
+                    }
                 }
             });
             out
         };
-        // 改了名就不算进总量（recount 跳过回收目录）：先重算，新片不用等旧目录删完才有空间
-        self.recount();
+        let renamed = !trash.is_empty();
+        // Trash dirs are not counted (recount skips them): recount first so a new film need not wait for
+        // the old dir to be deleted.
+        if renamed {
+            self.recount();
+        }
         for t in trash {
             let _ = std::fs::remove_dir_all(t);
         }
-        if !lock(&self.doomed).is_empty() {
+        // The retry chain owns the flag; any other sweep starts a chain only if none is pending.
+        if !stuck.is_empty() && (retry || !self.sweep_retry.swap(true, Ordering::AcqRel)) {
+            if !retry {
+                log::warn!("缓存目录暂时删不掉，每 10 秒重试：{}", stuck.join("、"));
+            }
             let me = self.clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                tauri::async_runtime::spawn_blocking(move || me.sweep());
+                tauri::async_runtime::spawn_blocking(move || me.sweep(true));
             });
+        } else if retry {
+            self.sweep_retry.store(false, Ordering::Release);
         }
+        renamed
     }
 
-    /// 重新统计视频缓存总量（不算回收目录），顺带按磁盘可用空间定容量上限。
+    /// Recounts the video cache (trash excluded) and sets the cap from the disk's free space.
     fn recount(&self) {
         let total = self.video_size();
         self.total.store(total, Ordering::Relaxed);
@@ -656,7 +683,7 @@ impl Stream {
         }
     }
 
-    /// 视频缓存的字节（不算正在删的回收目录）。
+    /// Bytes in the video cache, excluding trash dirs being deleted.
     fn video_size(&self) -> u64 {
         std::fs::read_dir(&self.video)
             .into_iter()
@@ -667,12 +694,13 @@ impl Stream {
             .sum()
     }
 
-    /// 视频缓存、字幕缓存各占多少字节。
+    /// Bytes used by the video and subtitle caches.
     pub fn usage(&self) -> (u64, u64) {
         (self.video_size(), dir_size(&self.subs))
     }
 
-    /// 清理视频缓存；`playing`（在播或正在起播）时保留已登记的文件——换集时 retain 过，登记着的就是这次播放的当前集和下一集。
+    /// Clears the video cache. While `playing` (or starting) registered files stay: retain ran at the episode
+    /// change, so they are exactly this playback's current and next episode.
     pub fn clear_video(&self, playing: bool) {
         let keep: Vec<String> = if playing {
             lock(&self.files).keys().cloned().collect()
@@ -1332,7 +1360,8 @@ impl Stream {
 }
 
 impl File {
-    /// 上游告诉了总大小：第一次就记下（写 meta.json）；和缓存里记的不一样（文件换了）就把旧块全删掉。返回块数。
+    /// Upstream told the total size: recorded the first time (meta.json); if it differs from the cached one
+    /// (file replaced) all old blocks go. Returns the block count.
     fn learn(&self, s: &Inner, total: u64) -> usize {
         let mut st = self.st();
         st.fail = None;
@@ -1353,7 +1382,7 @@ impl File {
         st.size = Some(total);
         st.done = vec![false; n];
         st.touched = vec![0; n];
-        // 先写临时文件再改名：写到一半断电，meta 坏了会把整个目录的块都当成来历不明删掉
+        // Temp file + rename: a torn meta.json would make every block in the dir look unknown and get deleted.
         let tmp = self.dir.join("meta.json.tmp");
         if std::fs::write(&tmp, json!({ "size": total }).to_string()).is_ok() {
             let _ = std::fs::rename(&tmp, self.dir.join("meta.json"));
@@ -1375,7 +1404,7 @@ impl File {
             _ => Duration::from_secs(1),
         };
         let mut st = self.st();
-        // 只记一连串失败里的第一次（成功取到数据时清零）：上游长时间不通时每秒重试，不刷屏
+        // Log only the first of a run of failures (reset on success): a long outage retries every second.
         if st.fail.is_none() {
             log::warn!("缓存代理向上游取数据失败：{why}");
         }
@@ -1386,7 +1415,7 @@ impl File {
         self.bump();
     }
 
-    /// 记着有、读却读不到的块（被外部删了）：改回没有。
+    /// A block marked done but missing on disk (deleted from outside) goes back to not done.
     fn repair(&self, s: &Inner, b: usize) {
         let mut st = self.st();
         if st.done.get(b).copied().unwrap_or(false) && !self.block_path(b).is_file() {
@@ -1449,24 +1478,13 @@ impl Stream {
     }
 }
 
-/// 记账往下减时不越过 0：统计有误差时宁可少算，绕回成天文数字会让淘汰把缓存删光。
-fn sub_total(total: &AtomicU64, n: u64) {
-    // fetch_update 在新版里改名 try_update，旧版没有新名字：手写比较交换
-    let mut v = total.load(Ordering::Relaxed);
-    while let Err(now) =
-        total.compare_exchange_weak(v, v.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed)
-    {
-        v = now;
-    }
-}
-
 fn abort_all(tasks: impl IntoIterator<Item = Task>) {
     for t in tasks {
         t.task.abort();
     }
 }
 
-/// 目录（含子目录）里文件的总字节。
+/// Total bytes of the files in `dir`, recursively.
 pub fn dir_size(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
         .into_iter()
@@ -1479,7 +1497,7 @@ pub fn dir_size(dir: &Path) -> u64 {
         .sum()
 }
 
-/// `dir` 所在磁盘的可用空间。
+/// Free space on the disk holding `dir`.
 fn free_space(dir: &Path) -> Option<u64> {
     let dir = dunce::canonicalize(dir).ok()?;
     let disks = sysinfo::Disks::new_with_refreshed_list();
@@ -2047,6 +2065,183 @@ mod tests {
         assert!(body == u.data[..=3 * BLOCK as usize]);
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(reqs(&u, "/f").len() <= 2, "{:?}", reqs(&u, "/f"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn src() -> Src {
+        Src {
+            url: "http://127.0.0.1:9/f".into(),
+            auth: Auth {
+                token: String::new(),
+                origin: String::new(),
+            },
+            resolved: None,
+        }
+    }
+
+    /// Startup recount (trash excluded, subdirs included), per-cache usage, clearing, and a synchronous sweep.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn storage_accounting() {
+        let dir = tmp("account");
+        let v = dir.join("video");
+        std::fs::create_dir_all(v.join("a/nested")).unwrap();
+        std::fs::create_dir_all(v.join(".trash-old")).unwrap();
+        std::fs::create_dir_all(dir.join("subs")).unwrap();
+        std::fs::write(v.join("a/0"), [0u8; 10]).unwrap();
+        std::fs::write(v.join("a/nested/x"), [0u8; 5]).unwrap();
+        std::fs::write(v.join(".trash-old/y"), [0u8; 3]).unwrap();
+        std::fs::write(dir.join("subs/s.srt"), [0u8; 7]).unwrap();
+        assert!(
+            free_space(&v).is_some(),
+            "the cap needs the disk's free space"
+        );
+        let s = Stream::start(&dir, true).unwrap();
+        assert!(
+            until(|| s.total.load(Ordering::Relaxed) == 15, 5).await,
+            "startup recount"
+        );
+        assert!(
+            until(|| !v.join(".trash-old").exists(), 5).await,
+            "old trash removed"
+        );
+        let cap = s.cap.load(Ordering::Relaxed);
+        assert!((MIN_CAP..=MAX_CAP).contains(&cap));
+        std::fs::create_dir_all(v.join(".trash-new")).unwrap();
+        std::fs::write(v.join(".trash-new/z"), [0u8; 100]).unwrap();
+        assert_eq!(s.usage(), (15, 7), "trash dirs not counted");
+        s.clear_subs();
+        assert_eq!(s.usage(), (15, 0));
+        assert!(dir.join("subs").is_dir(), "subs dir recreated");
+
+        // A doomed name that is already gone is dropped; a real dir is moved out and the total recounted at once.
+        lock(&s.doomed).extend(["a".to_owned(), "ghost".to_owned()]);
+        assert!(s.sweep(false));
+        assert!(lock(&s.doomed).is_empty());
+        assert!(
+            !s.sweep_retry.load(Ordering::Relaxed),
+            "nothing left: no retry queued"
+        );
+        assert!(!v.join("a").exists());
+        assert_eq!(s.total.load(Ordering::Relaxed), 0);
+        assert!(!s.sweep(false), "nothing to rename");
+        // A dir that cannot be renamed stays doomed with one retry chain; a finished retry clears the flag.
+        // (Renaming below a regular file is ENOTDIR on unix; Windows reports it as NotFound.)
+        if cfg!(unix) {
+            std::fs::write(v.join("plain"), b"").unwrap();
+            lock(&s.doomed).insert("plain/sub".into());
+            s.sweep(false);
+            assert!(lock(&s.doomed).contains("plain/sub"));
+            assert!(s.sweep_retry.load(Ordering::Relaxed));
+            lock(&s.doomed).clear();
+            s.sweep(true);
+            assert!(!s.sweep_retry.load(Ordering::Relaxed));
+        }
+
+        std::fs::create_dir_all(v.join("b")).unwrap();
+        s.clear_video(false);
+        assert!(
+            until(|| !v.join("b").exists(), 5).await,
+            "clear_video deletes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Opening keeps only blocks whose size matches meta.json; repair un-marks a block deleted from outside.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_keeps_valid_blocks_and_repairs() {
+        let dir = tmp("open");
+        let d = dir.join("video/r");
+        std::fs::create_dir_all(&d).unwrap();
+        let size = BLOCK + 10;
+        std::fs::write(d.join("meta.json"), format!(r#"{{"size":{size}}}"#)).unwrap();
+        for (name, len) in [
+            ("0", 3),
+            ("1", 10),
+            ("01", 10),
+            ("2", 10),
+            ("1.4.part", 1),
+            ("meta.json.tmp", 1),
+            ("junk", 1),
+        ] {
+            std::fs::write(d.join(name), vec![0u8; len]).unwrap();
+        }
+        let f = File::open(d.clone(), src());
+        assert_eq!(
+            f.st().done,
+            [false, true],
+            "short block 0 and out-of-range 2 dropped"
+        );
+        let mut left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["1", "meta.json"]);
+
+        let s = Stream::start(&dir, true).unwrap();
+        let on_disk = dir_size(&dir.join("video"));
+        assert!(
+            until(|| s.total.load(Ordering::Relaxed) == on_disk, 5).await,
+            "startup recount done before the total is set by hand"
+        );
+        s.total.store(100, Ordering::Relaxed);
+        f.repair(&s, 0);
+        assert_eq!(
+            s.total.load(Ordering::Relaxed),
+            100,
+            "a block never done is left alone"
+        );
+        f.repair(&s, 1);
+        assert!(f.st().done[1], "present block stays");
+        std::fs::remove_file(d.join("1")).unwrap();
+        f.repair(&s, 1);
+        assert!(!f.st().done[1]);
+        assert_eq!(s.total.load(Ordering::Relaxed), 90);
+        sub_total(&s.total, 1000);
+        assert_eq!(s.total.load(Ordering::Relaxed), 0, "saturates at 0");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Failure backoff per kind, `status_since` only reports newer errors, and `bump` wakes readers.
+    #[test]
+    fn failure_backoff_and_wakeups() {
+        let dir = tmp("fail");
+        let f = File::open(dir.join("x"), src());
+        let rx = f.changed.subscribe();
+        let before = Instant::now();
+        let wait = |e: Fail| {
+            f.failed(e);
+            f.st().retry_at.unwrap() - Instant::now()
+        };
+        // Lower bounds are loose so a stalled CI runner passes; a wrong arm is still off by about 2x.
+        let w = wait(Fail::Status(404));
+        assert!(
+            w > Duration::from_millis(2500) && w <= Duration::from_secs(3),
+            "{w:?}"
+        );
+        assert_eq!(f.st().status_since(before), Some(404));
+        assert_eq!(
+            f.st().status_since(Instant::now()),
+            None,
+            "older errors are not reported"
+        );
+        let w = wait(Fail::Busy(503, Some(Duration::from_secs(2))));
+        assert!(
+            w > Duration::from_millis(1500) && w <= Duration::from_secs(2),
+            "{w:?}"
+        );
+        assert_eq!(
+            f.st().status_since(before),
+            None,
+            "busy is not a final status"
+        );
+        let w = wait(Fail::Net("x".into()));
+        assert!(
+            w > Duration::from_millis(500) && w <= Duration::from_secs(1),
+            "{w:?}"
+        );
+        assert!(rx.has_changed().unwrap(), "failures wake readers");
+        assert!(!f.st().busy());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

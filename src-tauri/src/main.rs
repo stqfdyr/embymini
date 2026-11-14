@@ -108,6 +108,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Subtracts without going below 0: an inexact count should undercount, never wrap into a huge number
+/// that would make trimming delete everything. Shared by the video and image caches.
+fn sub_total(total: &AtomicU64, n: u64) {
+    // fetch_update is renamed try_update in new toolchains and the new name is missing in our MSRV: hand-rolled CAS.
+    let mut v = total.load(Ordering::Relaxed);
+    while let Err(now) =
+        total.compare_exchange_weak(v, v.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed)
+    {
+        v = now;
+    }
+}
+
 impl App {
     fn cfg(&self) -> MutexGuard<'_, Config> {
         lock(&self.cfg)

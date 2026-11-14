@@ -1,31 +1,38 @@
-//! 海报、背景图的本地缓存（原生客户端的做法，同 Nuke / Kingfisher / Coil 一类图片库）：
-//! 界面用 `emby-img` 协议要图 → 先查磁盘缓存 → 没有再向上游要服务端缩好的尺寸，存下来再给界面。
+//! Local cache for posters and backdrops, the way native image libraries (Nuke / Kingfisher / Coil) do it:
+//! the UI asks via the `emby-img` scheme → disk cache → otherwise the server-resized size from upstream,
+//! stored before it is handed back.
 //!
-//! - 上游给的图比要的宽很多时（有的服务器不理会 maxWidth，一律给原图）先缩到要的宽度再存（[`downsample`]，主流图片库的下采样）。
-//! - 键 = 服务器 + 条目 + 图片类型 + 序号 + tag + 宽度。tag 变了就是新图，所以缓存的图永远不用重新验证。
-//! - 磁盘上限 [`CAP`]，超了按最近使用时间（命中时刷新文件修改时间）删最旧的，删到 90%。
-//! - 同一张图同时被要多次只向上游取一次；同时向上游取最多 [`PARALLEL`] 张，不把中继压垮。
-//! - 回给界面时声明一年不变（immutable），同一次运行里 WebView 自己的内存缓存照样生效。
-//! - 上游回 404 的图按「API 根 + 文件名」记 [`MISS_TTL`]，期间直接回 404 不再向上游要（有的服务器列表里给了 Logo 的 tag，
-//!   图本身却不存在，不记的话首页轮播每转一圈都要取一次）；改地址后重新取，清理图片缓存时作废。
-//! - 只从已配置的服务器取图（路径里是服务器 id，不是地址），不是通用转发。
+//! - Upstream images much wider than asked (some servers ignore maxWidth) are downsampled before storing
+//!   ([`downsample`]).
+//! - Key = server + item + image type + index + tag + width. A new tag is a new image, so cached files never
+//!   need revalidation.
+//! - Disk cap [`CAP`]: above it the least recently used (file mtime, refreshed on hit) go first, down to 90%.
+//! - Concurrent requests for one image fetch it once; at most [`PARALLEL`] upstream fetches at a time.
+//! - Responses are marked immutable for a year, so the WebView's memory cache works within a run.
+//! - Upstream 404s are remembered by "API root + file name" for [`MISS_TTL`] and answered 404 directly (some
+//!   servers list a Logo tag whose image does not exist; the home carousel would refetch it every turn).
+//!   A changed address fetches again; clearing the image cache forgets them.
+//! - Images come only from configured servers (the path holds a server id, not an address); not a generic proxy.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use crate::lock;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{OnceCell, Semaphore};
 
 pub const SCHEME: &str = "emby-img";
-/// 磁盘缓存上限。海报（240–480 px）一张 20–60 KB，背景图（1600 px）一张 200–400 KB，1 GB 够存几万张。
+/// Disk cap. A poster (240–480 px) is 20–60 KB, a backdrop (1600 px) 200–400 KB: room for tens of thousands.
 pub const CAP: u64 = 1024 * 1024 * 1024;
+/// Upstream fetches at a time: enough to fill a poster grid without swamping a relay.
 const PARALLEL: usize = 8;
-/// 上游 404 的图多久内不再取。
+/// How long an upstream 404 is answered without asking again.
 const MISS_TTL: Duration = Duration::from_secs(30 * 60);
 
-/// 界面要的一张图：路径 `<服务器 id>/<条目 id>/<类型>/<序号>/<tag>/<宽度>`。
-#[derive(Debug, PartialEq)]
+/// One image the UI asks for: path `<server id>/<item id>/<type>/<index>/<tag>/<width>`.
+#[derive(Debug, PartialEq, Clone)]
 pub struct Req {
     pub server: String,
     pub item: String,
@@ -36,7 +43,8 @@ pub struct Req {
 }
 
 impl Req {
-    /// 解析请求路径（WebView 可能把 `/` 编码成 `%2F`）。每段只允许字母、数字和 `-`，杜绝路径穿越和拼出别的地址。
+    /// Parses the request path (the WebView may encode `/` as `%2F`). Segments allow only ASCII letters, digits
+    /// and `-`, so no traversal and no way to build another address.
     pub fn parse(path: &str) -> Option<Self> {
         let path = path
             .trim_start_matches('/')
@@ -79,36 +87,17 @@ impl Req {
     }
 }
 
-/// 按文件头判断图片格式（Emby 海报是 JPEG，Logo 是带透明的 PNG）。
-pub fn content_type(b: &[u8]) -> &'static str {
-    match b {
-        [0x89, b'P', b'N', b'G', ..] => "image/png",
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'E',
-            b'B',
-            b'P',
-            ..,
-        ] => "image/webp",
-        [b'G', b'I', b'F', ..] => "image/gif",
-        _ => "image/jpeg",
-    }
+/// MIME type from the file header (Emby posters are JPEG, logos PNG with alpha); unknown falls back to JPEG.
+fn content_type(b: &[u8]) -> &'static str {
+    image::guess_format(b).map_or("image/jpeg", |f| f.to_mime_type())
 }
 
-/// 比要的宽这么多倍以上才缩（服务器已按 maxWidth 缩好的图原样存，不重新编码）。
+/// Only images this many times wider than asked get resized (server-resized ones are stored as is, not re-encoded).
 const RESIZE_OVER: f64 = 1.2;
 
-/// 上游给的图明显比要的宽时缩到要的宽度（等比），带透明的存 PNG、其余存 JPEG（质量 90）：
-/// 小卡片不用解码整张原图（省内存、滚动不卡），磁盘缓存也存得下更多。
-/// 认不出格式、解码失败、缩完反而更大时原样返回。
+/// Shrinks an image clearly wider than asked to that width (keeping aspect); alpha stays PNG, the rest JPEG q90.
+/// Small cards then never decode a full original (less memory, smooth scrolling) and the cache holds more.
+/// Unknown format, decode failure, or a bigger result returns the input unchanged.
 pub fn downsample(bytes: Vec<u8>, width: u32) -> Vec<u8> {
     use image::{ImageFormat, imageops::FilterType};
     let Ok(fmt) = image::guess_format(&bytes) else {
@@ -143,7 +132,7 @@ pub fn downsample(bytes: Vec<u8>, width: u32) -> Vec<u8> {
     }
 }
 
-/// 一次取图的结果：图片字节，或者给界面的 HTTP 状态码。
+/// Result of one image request: the bytes, or the HTTP status for the UI.
 type Got = Result<Arc<Vec<u8>>, u16>;
 
 pub struct Images {
@@ -152,14 +141,11 @@ pub struct Images {
     http: reqwest::Client,
     slots: Semaphore,
     inflight: Mutex<HashMap<String, Arc<OnceCell<Got>>>>,
-    /// 上游 404 的图：「API 根 + 空格 + 磁盘文件名」→ 记下的时刻。带上 API 根，改了服务器地址就不沿用旧地址的 404。
-    /// 第一项是清理次数：清理前发出的请求晚到的 404 不再记（否则清理后又被记上 30 分钟）。
+    /// Upstream 404s: "API root + space + file name" → when seen. The API root means a changed server address
+    /// does not inherit the old 404s. First field counts clears: a 404 from a request sent before a clear is
+    /// not recorded (otherwise it would stick for another 30 minutes).
     missing: Mutex<(u64, HashMap<String, Instant>)>,
     total: AtomicU64,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Images {
@@ -176,7 +162,7 @@ impl Images {
         })
     }
 
-    /// 后台任务：统计现有缓存大小（启动时）。
+    /// Background job at startup: sum up the existing cache and trim it.
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
         tauri::async_runtime::spawn_blocking(move || {
@@ -186,7 +172,8 @@ impl Images {
         });
     }
 
-    /// 取一张图：磁盘缓存 → 上游。`api_base` 是这台服务器的 API 根（找不到服务器时调用方直接回 404）。
+    /// Gets one image: disk cache → upstream. `api_base` is that server's API root (unknown servers get a 404
+    /// from the caller).
     pub async fn get(&self, req: &Req, api_base: &str) -> Got {
         let key = req.file_name();
         let miss_key = format!("{api_base} {key}");
@@ -198,12 +185,7 @@ impl Images {
             m.0
         };
         let path = self.dir.join(&key);
-        if let Ok(b) = tokio::fs::read(&path).await {
-            // 命中：刷新修改时间，淘汰时按它算「最近使用」
-            let _ = std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_modified(SystemTime::now()));
+        if let Some(b) = cached(&path).await {
             return Ok(Arc::new(b));
         }
         let cell = lock(&self.inflight).entry(key.clone()).or_default().clone();
@@ -211,7 +193,7 @@ impl Images {
             .get_or_init(|| async {
                 let width = req.width;
                 let b = self.fetch(&req.upstream(api_base)).await?;
-                // 解码、缩放是 CPU 活，不占异步线程
+                // Decoding and resizing are CPU work: keep them off the async workers.
                 let r = tokio::task::spawn_blocking(move || downsample(b, width))
                     .await
                     .map(Arc::new)
@@ -234,9 +216,10 @@ impl Images {
         got
     }
 
-    /// 向上游取原始字节。失败返回状态码（网络错误算 502），原样回给界面。
+    /// Fetches the raw bytes. Failures return a status (network errors count as 502) passed on to the UI.
     async fn fetch(&self, url: &str) -> Result<Vec<u8>, u16> {
-        // 暂时性失败按 crate::status 的规则重试；等重试时先让出名额，不让几张限流的图堵住整页
+        // Transient failures retry per crate::status; the slot is released while waiting, so a few
+        // rate-limited images do not block the whole page.
         let mut n = 0;
         loop {
             let slot = self.slots.acquire().await.map_err(|_| 503u16)?;
@@ -262,13 +245,17 @@ impl Images {
         }
     }
 
-    /// 先写临时文件再改名：写到一半断电不会留下半张图被当成命中。
+    /// Writes a temp file and renames it, so a crash mid-write never leaves half an image that counts as a hit.
     async fn store(&self, path: &Path, b: &[u8]) {
         let tmp = path.with_extension("tmp");
         if tokio::fs::write(&tmp, b).await.is_ok() && tokio::fs::rename(&tmp, path).await.is_ok() {
             let total = self.total.fetch_add(b.len() as u64, Ordering::Relaxed) + b.len() as u64;
             if total > self.cap {
-                self.trim();
+                // Lists and deletes across the whole directory: off the async workers.
+                let (dir, cap) = (self.dir.clone(), self.cap);
+                if let Ok(t) = tokio::task::spawn_blocking(move || trim_dir(&dir, cap)).await {
+                    self.total.store(t, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -278,11 +265,12 @@ impl Images {
             .store(trim_dir(&self.dir, self.cap), Ordering::Relaxed);
     }
 
-    /// 缓存管理：占用字节、清空。
+    /// Cache manager: bytes used.
     pub fn usage(&self) -> u64 {
         self.total.load(Ordering::Relaxed)
     }
 
+    /// Cache manager: delete everything and forget the 404s. Blocking.
     pub fn clear(&self) {
         let mut m = lock(&self.missing);
         m.0 += 1;
@@ -295,8 +283,8 @@ impl Images {
     }
 }
 
-/// 目录超过 `cap` 时按最近使用时间（修改时间，命中时刷新）删最旧的，删到上限的 90%（留出余量，不至于每存一个就删一次）。
-/// 返回剩下的总字节。字幕缓存也用它。
+/// Over `cap`, deletes the least recently used (mtime, refreshed on hit) down to 90% of the cap (headroom so
+/// not every store trims). Returns the bytes left. Blocking; the subtitle cache uses it too.
 pub fn trim_dir(dir: &Path, cap: u64) -> u64 {
     let mut files = list(dir);
     let mut total: u64 = files.iter().map(|(_, n, _)| n).sum();
@@ -314,7 +302,7 @@ pub fn trim_dir(dir: &Path, cap: u64) -> u64 {
     total
 }
 
-/// 缓存目录里的文件：(路径, 大小, 修改时间)。写到一半的临时文件（`.tmp`）不算。
+/// Files in a cache dir: (path, size, mtime). Half-written temp files (`.tmp`) are skipped.
 fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
     std::fs::read_dir(dir)
         .into_iter()
@@ -328,7 +316,22 @@ fn list(dir: &Path) -> Vec<(PathBuf, u64, SystemTime)> {
         .collect()
 }
 
-/// 自定义协议的响应。
+/// Reads a cached image and refreshes its mtime, which trimming reads as "last used".
+async fn cached(path: &Path) -> Option<Vec<u8>> {
+    let b = tokio::fs::read(path).await.ok()?;
+    let p = path.to_owned();
+    // A grid hits dozens at once; slow disks and antivirus must not stall the async workers.
+    let _ = tokio::task::spawn_blocking(move || {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .and_then(|f| f.set_modified(SystemTime::now()))
+    })
+    .await;
+    Some(b)
+}
+
+/// Response for the custom scheme.
 pub fn response(got: Got) -> tauri::http::Response<Vec<u8>> {
     let b = tauri::http::Response::builder();
     match got {
@@ -366,11 +369,11 @@ mod tests {
             "https://h/emby/Items/1354593/Images/Primary/0?tag=abc123&maxWidth=240&quality=90"
         );
         for bad in [
-            "s/i/Primary/0/t",           // 少一段
-            "s/../Primary/0/t/240",      // 穿越
-            "s/i/Primary/0/t%3Fx=1/240", // 带查询
-            "s/i/Primary/x/t/240",       // 序号不是数字
-            "s/i/Primary/0/t/99999",     // 宽度离谱
+            "s/i/Primary/0/t",           // a segment short
+            "s/../Primary/0/t/240",      // traversal
+            "s/i/Primary/0/t%3Fx=1/240", // smuggled query
+            "s/i/Primary/x/t/240",       // index not a number
+            "s/i/Primary/0/t/99999",     // absurd width
             "s/i/Pri.mary/0/t/240",
         ] {
             assert!(Req::parse(bad).is_none(), "{bad}");
@@ -383,11 +386,11 @@ mod tests {
         c.into_inner()
     }
 
-    /// 服务器给原图时：缩到要的宽度、保持比例；带透明的仍是 PNG；本来就够小的、认不出的原样返回。
+    /// Originals shrink to the asked width keeping aspect; alpha stays PNG; fitting or unknown input is unchanged.
     #[test]
     fn downsample_big_images_only() {
         use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage, RgbaImage};
-        // 有纹理的原图（纯色图压缩得太好，缩完不一定更小）
+        // Textured source (a flat image compresses so well the resized one may not be smaller).
         let poster = DynamicImage::ImageRgb8(RgbImage::from_fn(1000, 1500, |x, y| {
             image::Rgb([(x * 7) as u8, (y * 13) as u8, ((x ^ y) * 3) as u8])
         }));
@@ -407,13 +410,13 @@ mod tests {
             image::Rgba([(x % 255) as u8, (y % 255) as u8, 0, (x % 2 * 255) as u8])
         }));
         let small = downsample(encode(logo, ImageFormat::Png), 480);
-        assert_eq!(content_type(&small), "image/png", "带透明的要保留 PNG");
+        assert_eq!(content_type(&small), "image/png", "alpha keeps PNG");
         assert_eq!(
             image::load_from_memory(&small).unwrap().dimensions(),
             (480, 160)
         );
 
-        // 已经是要的尺寸（服务器缩好的）：原样，不重新编码
+        // Already the asked size (server-resized): unchanged, not re-encoded.
         let fit = encode(
             DynamicImage::ImageRgb8(RgbImage::new(260, 390)),
             ImageFormat::Jpeg,
@@ -424,9 +427,11 @@ mod tests {
 
     #[test]
     fn sniff_types() {
-        assert_eq!(content_type(b"\x89PNG\r\n"), "image/png");
-        assert_eq!(content_type(b"RIFF1234WEBPVP8"), "image/webp");
+        assert_eq!(content_type(b"\x89PNG\r\n\x1a\n"), "image/png");
+        assert_eq!(content_type(b"RIFF1234WEBPVP8 "), "image/webp");
+        assert_eq!(content_type(b"GIF89a"), "image/gif");
         assert_eq!(content_type(b"\xff\xd8\xff"), "image/jpeg");
+        assert_eq!(content_type(b"????"), "image/jpeg");
     }
 
     fn tmpdir(name: &str) -> PathBuf {
@@ -435,7 +440,8 @@ mod tests {
         d
     }
 
-    /// 同一张图并发要 5 次只向上游取 1 次；第二轮从磁盘出；上游 404 原样回给界面，并记住（按地址、清理后作废）。
+    /// Five concurrent asks fetch once; the next comes from disk and refreshes its mtime; an upstream 404 is
+    /// passed on and remembered (per address, forgotten on clear).
     #[tokio::test]
     async fn fetch_once_then_serve_from_disk() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -451,11 +457,11 @@ mod tests {
                     let n = s.read(&mut buf).await.unwrap();
                     let head = String::from_utf8_lossy(&buf[..n]).to_string();
                     h.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(100)).await; // 让并发请求叠在一起
+                    tokio::time::sleep(Duration::from_millis(100)).await; // let the concurrent asks overlap
                     let resp: &[u8] = if head.contains("/Items/404/") {
                         b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                     } else {
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\n\x89PNG"
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nJPEG"
                     };
                     s.write_all(resp).await.unwrap();
                 });
@@ -471,32 +477,56 @@ mod tests {
         let all = futures_join(&img, &req, &base).await;
         assert!(
             all.iter()
-                .all(|r| r.as_ref().unwrap().as_slice() == b"\x89PNG")
+                .all(|r| r.as_ref().unwrap().as_slice() == b"JPEG")
         );
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "并发的同一张图只取一次");
-        assert_eq!(img.get(&req, &base).await.unwrap().as_slice(), b"\x89PNG");
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "第二次从磁盘出");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "concurrent asks fetch once");
+        let file = dir.join(req.file_name());
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(img.get(&req, &base).await.unwrap().as_slice(), b"JPEG");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "second ask served from disk"
+        );
+        let touched = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(
+            touched > old + Duration::from_secs(60),
+            "hit refreshes mtime"
+        );
         let missing = Req::parse("s/404/Primary/0/t/240").unwrap();
         assert_eq!(img.get(&missing, &base).await, Err(404));
-        assert!(!dir.join(missing.file_name()).exists(), "失败的不落盘");
+        assert!(
+            !dir.join(missing.file_name()).exists(),
+            "failures are not stored"
+        );
         let before = hits.load(Ordering::SeqCst);
         assert_eq!(img.get(&missing, &base).await, Err(404));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before,
-            "404 记住了，不再向上游要"
+            "404 remembered, upstream not asked"
         );
         img.clear();
         assert_eq!(img.get(&missing, &base).await, Err(404));
-        assert_eq!(hits.load(Ordering::SeqCst), before + 1, "清空缓存后重新取");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            before + 1,
+            "asked again after a clear"
+        );
         let other = base.replace("/emby", "/emby2");
         assert_eq!(img.get(&missing, &other).await, Err(404));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 2,
-            "换了地址不沿用旧地址的 404"
+            "another address does not inherit the 404"
         );
-        // 清理时还在路上的请求，晚到的 404 不记
+        // A request in flight during a clear: its late 404 is not recorded.
         let gone = Req::parse("s/404/Logo/0/t/240").unwrap();
         let t = {
             let (img, base) = (img.clone(), base.clone());
@@ -510,7 +540,7 @@ mod tests {
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 4,
-            "清理前发出的请求不把 404 记回去"
+            "a request sent before the clear does not record its 404"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -519,12 +549,7 @@ mod tests {
         let mut v = Vec::new();
         let tasks: Vec<_> = (0..5)
             .map(|_| {
-                let (img, base) = (img.clone(), base.to_owned());
-                let req = Req::parse(&format!(
-                    "{}/{}/{}/{}/{}/{}",
-                    req.server, req.item, req.kind, req.index, req.tag, req.width
-                ))
-                .unwrap();
+                let (img, base, req) = (img.clone(), base.to_owned(), req.clone());
                 tokio::spawn(async move { img.get(&req, &base).await })
             })
             .collect();
@@ -534,7 +559,7 @@ mod tests {
         v
     }
 
-    /// 超过上限删最近最少用的，删到 90%。
+    /// Over the cap the least recently used go, down to 90%.
     #[test]
     fn trim_removes_least_recently_used() {
         let dir = tmpdir("trim");
@@ -552,11 +577,11 @@ mod tests {
                 .unwrap();
         }
         img.trim();
-        // 300 > 250：删最旧的 old 后 200 ≤ 225（90%）就停
+        // 300 > 250: deleting the oldest leaves 200 ≤ 225 (90%), so it stops.
         assert!(!dir.join("old").exists());
         assert!(
             dir.join("mid").exists() && dir.join("new").exists(),
-            "最近用过的留着"
+            "recently used kept"
         );
         assert_eq!(img.total.load(Ordering::Relaxed), 200);
         std::fs::remove_dir_all(dir).unwrap();

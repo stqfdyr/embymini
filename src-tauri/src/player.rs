@@ -286,6 +286,14 @@ fn title(item: &Item) -> String {
     }
 }
 
+/// Why an entry failed to load: the upstream status when there is one, else mpv's own error.
+fn fail_reason(status: Option<u16>, mpv_error: &str) -> String {
+    match status {
+        Some(s) if !(200..300).contains(&s) => crate::status::describe(s, ""),
+        _ => format!("mpv 无法打开（{mpv_error}）"),
+    }
+}
+
 /// `loadfile` 的选项串。标题用 mpv 的 `%字节数%` 写法，里面有逗号、等号也不会被拆开。
 fn loadfile_opts(title: &str, start: f64) -> String {
     let mut o = format!("force-media-title=%{}%{title}", title.len());
@@ -1161,16 +1169,16 @@ impl State {
             (Some(r), None) => self.emby.probe(&r.url).await,
             (None, _) => None,
         };
-        let why = match status {
-            Some(403) => {
-                "服务器拒绝访问文件（403），上游可能正在迁移这一集，换一集或稍后再试".to_owned()
-            }
-            Some(404) => "服务器上找不到文件（404）".to_owned(),
-            Some(s) if !(200..300).contains(&s) => format!("拉流返回 HTTP {s}"),
-            _ => format!("mpv 无法打开（{mpv_error}）"),
-        };
-        let e = &self.queue[i];
-        let message = format!("无法播放「{}」：{why}", title(&e.item));
+        self.stop(i); // reports Stopped if it had started
+        let e = &mut self.queue[i];
+        // Its play session is spent either way: going back fetches a fresh PlaybackInfo. `ready` stays,
+        // so the end of the session still stops its download.
+        e.stopped = true;
+        let message = format!(
+            "无法播放「{}」：{}",
+            title(&e.item),
+            fail_reason(status, mpv_error)
+        );
         log::warn!("{message}（条目 {}）", e.item.id);
         let item_id = e.item.id.clone();
         if self.cur == Some(i) {
@@ -1933,6 +1941,65 @@ mod tests {
             .filter(|e| matches!(e, Event::Stopped { .. }))
             .count();
         assert_eq!((started, stopped), (2, 2), "{got:?}");
+    }
+
+    /// An entry that errors out after it started still reports Stopped; going back to a failed entry
+    /// fetches PlaybackInfo afresh instead of reusing the old link and play session.
+    #[tokio::test]
+    async fn failed_entry_stops_and_refetches() {
+        let (mut st, _mpv, mut ev) = offline_state(2);
+        let mut r = ready_for("e0");
+        r.url = "http://127.0.0.1:1/e0".into(); // probe is refused: no status
+        st.queue[0].ready = Some(r);
+        st.queue[0].entry_id = Some(7);
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
+            .await;
+        st.on_message(json!({ "event": "file-loaded" })).await;
+        st.on_message(json!({ "event": "end-file", "playlist_entry_id": 7, "reason": "error", "file_error": "boom" }))
+            .await;
+        let mut got = Vec::new();
+        while let Ok(e) = ev.try_recv() {
+            got.push(e);
+        }
+        assert!(
+            got.iter().any(|e| matches!(e, Event::Stopped { .. })),
+            "{got:?}"
+        );
+        assert!(
+            got.iter().any(|e| matches!(e, Event::Failed { message, .. } if message.contains("mpv 无法打开（boom）"))),
+            "{got:?}"
+        );
+        assert_eq!(st.cur, None);
+        st.jump(0).await;
+        assert_eq!(st.want, Some(0), "a failed entry must be prepared again");
+
+        // Never loaded at all: nothing to report, but its session is spent too
+        let mut r = ready_for("e1");
+        r.url = "http://127.0.0.1:1/e1".into();
+        st.queue[1].ready = Some(r);
+        st.queue[1].entry_id = Some(8);
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 8 }))
+            .await;
+        st.on_message(json!({ "event": "end-file", "playlist_entry_id": 8, "reason": "error", "file_error": "boom" }))
+            .await;
+        assert!(
+            st.queue[1].ready.is_some(),
+            "kept: the session end stops its download"
+        );
+        st.jump(1).await;
+        assert_eq!(st.want, Some(1));
+    }
+
+    #[test]
+    fn failure_reasons() {
+        assert_eq!(fail_reason(Some(403), "x"), "服务器拒绝访问（403）");
+        assert_eq!(fail_reason(Some(404), "x"), "服务器上找不到（404）");
+        assert_eq!(
+            fail_reason(Some(502), "x"),
+            "服务器暂时不可用，稍后再试（502）"
+        );
+        assert_eq!(fail_reason(Some(206), "x"), "mpv 无法打开（x）");
+        assert_eq!(fail_reason(None, "x"), "mpv 无法打开（x）");
     }
 
     #[test]

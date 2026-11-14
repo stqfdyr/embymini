@@ -2045,6 +2045,9 @@ mod tests {
             2,
             "resuming must open exactly one new request"
         );
+        // Turning whole-file caching on resumes the parked main task through to the end
+        s.set_whole(true);
+        assert!(until(|| done(&f).len() == 60, 10).await, "{:?}", done(&f));
         drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2080,6 +2083,47 @@ mod tests {
         // 4 cuts: about 4 s with a 1 s retry each, 15 s (1+2+4+8) if the backoff keeps doubling
         assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/drops").len(), 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Whole-file mode keeps going through cuts with no reader left (the main task retries on its own).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whole_mode_survives_cuts_without_reader() {
+        let u = upstream((10 * BLOCK) as usize).await;
+        let dir = tmp("drops-whole");
+        let s = Stream::start(&dir, true).unwrap();
+        let url = s.video("srv_18_a", &format!("{}/drops", u.base), &auth(&u));
+        let _ = get(&url, Some("bytes=0-99"), false).await;
+        let f = lock(&s.files).get("srv_18_a").unwrap().clone();
+        assert!(
+            until(|| f.st().done.iter().all(|&d| d), 15).await,
+            "{:?}",
+            f.st().done
+        );
+        // Every byte received counts, including the partial blocks lost to the cuts
+        assert!(s.up_bytes() >= 10 * BLOCK, "{}", s.up_bytes());
+        drop(f);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Prefetch takes the first block and the last two, and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prefetch_takes_head_and_tail() {
+        let u = upstream((10 * BLOCK) as usize).await;
+        let dir = tmp("prefetch");
+        let s = Stream::start(&dir, true).unwrap();
+        let _ = s.video("srv_19_a", &format!("{}/f", u.base), &auth(&u));
+        s.prefetch("srv_19_a");
+        let f = lock(&s.files).get("srv_19_a").unwrap().clone();
+        let done = || -> Vec<usize> {
+            let st = f.st();
+            (0..st.done.len()).filter(|&b| st.done[b]).collect()
+        };
+        assert!(until(|| done() == [0, 8, 9], 5).await, "{:?}", done());
+        assert!(until(|| !f.st().busy(), 5).await);
+        assert_eq!(done(), [0, 8, 9]);
+        assert_eq!(reqs(&u, "/f").len(), 2, "{:?}", reqs(&u, "/f"));
+        drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2347,6 +2391,22 @@ mod tests {
             "{w:?}"
         );
         assert!(rx.has_changed().unwrap(), "failures wake readers");
+        // Codes mpv gets, and which failures are retried
+        let all = [
+            Fail::Status(404),
+            Fail::Busy(503, None),
+            Fail::Net(String::new()),
+            Fail::Connect(String::new()),
+            Fail::Timeout,
+        ];
+        assert_eq!(
+            all.iter().map(Fail::code).collect::<Vec<_>>(),
+            [404, 503, 502, 502, 504]
+        );
+        assert_eq!(
+            all.iter().map(Fail::transient).collect::<Vec<_>>(),
+            [false, true, true, true, true]
+        );
         assert!(!f.st().busy());
         let _ = std::fs::remove_dir_all(dir);
     }

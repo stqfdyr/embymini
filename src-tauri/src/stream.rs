@@ -34,16 +34,17 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{lock, sub_total};
 
-/// 块大小。分块文件而不是一个大稀疏文件：NTFS 的非稀疏文件在远处偏移写入要同步补零。
+/// Block size. Block files rather than one big sparse file: NTFS zero-fills synchronously when a non-sparse file is written far ahead.
 pub const BLOCK: u64 = 4 << 20;
-/// 只缓存前方时，写到主播放器读的位置前方这么多块（64 MiB，等于 mpv 自己的一段预读）。
+/// Ahead-only caching writes this many blocks past the main player's read position (64 MiB, about one mpv readahead).
 const AHEAD: u64 = 16;
-/// 主播放器要的块在主任务写入点前方这么多块以内就等它，否则在那里另开主任务（拖动进度）。
+/// A main-player read this close past the main task's write point waits for it; farther away it gets a new main task (a seek).
 const MAIN_NEAR: u64 = 2;
+/// Preview / prefetch tasks per file; a new one cancels the oldest (previews only care about the latest position).
 const PREVIEWS: usize = 2;
-/// 对冲：第一个请求多久没出数据就再开一个，之后每隔多久换掉较早的那个。
+/// Hedging (seconds): with no body yet, start another request; later steps replace the older of the two.
 const HEDGE: [u64; 3] = [3, 5, 8];
-/// 一直拿不到数据就放弃（回 504），读的一方会再来。
+/// Give up when no request yields data (504); the reader will ask again.
 const OPEN_LIMIT: Duration = Duration::from_secs(30);
 const READ_CHUNK: u64 = 256 << 10;
 /// Video cache cap when the disk has room.
@@ -64,7 +65,7 @@ fn block_len(size: u64, b: usize) -> u64 {
     BLOCK.min(size - b as u64 * BLOCK)
 }
 
-/// 谁在读：主播放器、进度条预览，或预取下一集（不经 HTTP，由 [`Stream::prefetch`] 发起）。
+/// Who reads: the main player, the seek-bar preview, or the next-episode prefetch (no HTTP, started by [`Stream::prefetch`]).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Role {
     Main,
@@ -72,7 +73,7 @@ enum Role {
     Prefetch,
 }
 
-/// 向上游要数据时带的鉴权：token 只发给 API 根地址同源的主机。
+/// Credentials for upstream requests: the token only goes to hosts with the API root's origin.
 #[derive(Clone)]
 pub struct Auth {
     pub token: String,
@@ -82,19 +83,19 @@ pub struct Auth {
 struct Src {
     url: String,
     auth: Auth,
-    /// 重定向后的地址，后续 Range 请求直接用；出错时退回原地址。
+    /// Where the last redirect led; later Range requests go straight there and fall back to `url` on failure.
     resolved: Option<String>,
 }
 
 #[derive(Debug)]
 enum Fail {
-    /// 上游回的 HTTP 状态码，是定论（分类见 [`crate::status`]）：原样回给 mpv（403、404 时界面能给出原因）。
+    /// Definitive upstream HTTP status (see [`crate::status`]): passed to mpv as is, so a 403 / 404 can be explained.
     Status(u16),
-    /// 上游暂时不可用（5xx、429 等，中继和上游不稳时常见）：和网络错误一样重试，
-    /// 带 `Retry-After` 就按它等；一直不好才把这个码回给 mpv。
+    /// Upstream temporarily unavailable (5xx, 429…, common with flaky relays): retried like a network error,
+    /// honouring `Retry-After`; mpv only gets the code if it never recovers.
     Busy(u16, Option<Duration>),
     Net(String),
-    /// 连不上（请求没发出去）：和 `Net` 一样处理，只有字幕据此判断能不能重试。
+    /// Could not connect (nothing was sent): handled like `Net`; only subtitles use it to decide on a retry.
     Connect(String),
     Timeout,
 }
@@ -108,17 +109,17 @@ impl Fail {
         }
     }
 
-    /// 重试有没有意义（网络错误、超时、5xx）。
+    /// Worth retrying (network error, timeout, 5xx).
     fn transient(&self) -> bool {
         !matches!(self, Self::Status(_))
     }
 }
 
-/// [`Stream::pump`] 为什么停下。
+/// Why [`Stream::pump`] stopped.
 enum Stop {
-    /// 写到了要的末尾，或碰到已有 / 有人在写的块。
+    /// Reached the requested end, or a block that is done / being written.
     Hit,
-    /// 只缓存前方：写到读的位置前方 [`AHEAD`] 块了，第 b 块先不写（连接已放掉）。
+    /// Ahead-only: [`AHEAD`] blocks past the read position; block b is left for later (connection released).
     Ahead(usize),
 }
 
@@ -140,7 +141,7 @@ struct Preview {
 
 struct Main {
     t: Task,
-    /// 正在写（或马上要写）的块。
+    /// Block being written (or about to be).
     at: usize,
     since: Instant,
 }
@@ -437,7 +438,7 @@ fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
-/// 上游给出数据的一个请求：回包、已经到手的第一段正文、本次请求的起点和文件总大小。
+/// A request that produced data: the response, its first body chunk and the file's total size.
 struct Opened {
     resp: reqwest::Response,
     first: Bytes,
@@ -529,7 +530,7 @@ impl Stream {
     pub fn set_whole(&self, on: bool) {
         self.whole.store(on, Ordering::Relaxed);
         for f in lock(&self.files).values() {
-            f.bump(); // 等着的主任务重新判断要不要往后写
+            f.bump(); // waiting main tasks re-check whether to write further
         }
     }
 
@@ -731,7 +732,7 @@ impl Stream {
         let _ = std::fs::create_dir_all(&self.subs);
     }
 
-    /// 预取下一集：第一块和最后两块（mkv 的索引在文件尾），切过去时打开文件不走网络。
+    /// Prefetches the next episode's first block and last two (mkv keeps its index at the end), so switching opens offline.
     pub fn prefetch(&self, name: &str) {
         let Some(f) = lock(&self.files).get(name).cloned() else {
             return;
@@ -763,8 +764,8 @@ impl Stream {
         });
     }
 
-    /// 一次播放结束（mpv 退出）：停掉这些文件的下载，缓存留着（下次打开同一部片直接用）。
-    /// 不停的话整片模式会在关掉播放器之后把整部片下完。只停给出的这几个：换片时新的一次播放可能已经开始了。
+    /// A playback ended (mpv quit): stops these files' downloads and keeps the cache. Otherwise whole-file mode
+    /// would finish the download after the player closed. Only these: a new playback may already have started.
     pub fn idle(&self, names: &[String]) {
         let files: Vec<_> = {
             let all = lock(&self.files);
@@ -993,7 +994,8 @@ impl Stream {
         }
     }
 
-    /// 读的一方要第 b 块（预览要 [b, hi]）：已有或有人在写就等；否则按角色安排下载。返回要取消的旧任务（锁外取消）。
+    /// A reader needs block b (a preview [b, hi]): wait if it is done or coming; else schedule a download by role.
+    /// Returns superseded tasks for the caller to abort outside the lock.
     fn ensure(&self, f: &Arc<File>, st: &mut St, b: usize, hi: usize, role: Role) -> Vec<Task> {
         if st.has(b)
             || f.gone.load(Ordering::Relaxed)
@@ -1010,7 +1012,7 @@ impl Stream {
             return Vec::new();
         }
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
-        // 主任务刚开不久又有主播放器的读要别处（同时有两个连接在读）：给它两块的短任务，不来回抢主任务
+        // A young main task and a read elsewhere (two connections, e.g. mkv header then index): a two-block short task, no tug of war
         let young = st
             .main
             .as_ref()
@@ -1029,7 +1031,7 @@ impl Stream {
             r => (r, hi),
         };
         let mut old = Vec::new();
-        // 预览只关心最新的位置：名额满了取消最早的预览 / 预取（主播放器的短任务不算名额、不取消）
+        // Previews only care about the latest position: when full, cancel the oldest (the main player's short tasks don't count)
         let side = |p: &Preview| p.role != Role::Main;
         if st.previews.iter().filter(|p| side(p)).count() >= PREVIEWS
             && let Some(k) = st.previews.iter().position(side)
@@ -1069,7 +1071,7 @@ impl Stream {
             }
             match r {
                 Ok(Stop::Ahead(at)) => {
-                    // 读的位置往前走到只差半段再接着要：一次请求写 8 块左右，不至于每走一块就开一个请求
+                    // Resume once the reader is within half the window: about 8 blocks per request, not one request per block
                     loop {
                         if !mine() {
                             return;
@@ -1083,7 +1085,7 @@ impl Stream {
                 }
                 Ok(Stop::Hit) => back = 1,
                 Err(e) if e.transient() => {
-                    // 网络错误、5xx：自己退避重试（1、2、4…30 秒），整片模式不能断在这里；读的一方要别处会换掉这个任务
+                    // Network error / 5xx: back off and retry (1, 2, 4…30 s) so whole-file mode never stalls; a seek replaces this task
                     let wait = f.failed(e).max(Duration::from_secs(back));
                     tokio::time::sleep(wait).await;
                     back = (back * 2).min(30);
@@ -1096,7 +1098,7 @@ impl Stream {
                     return;
                 }
             }
-            // 碰到已有的块断开了、写到了文件尾、或重试：从读的位置往后找下一个缺块
+            // Hit a done block, reached the end, or retrying: continue at the next missing block after the read position
             match self.next_missing(&f) {
                 Some(nb) => {
                     b = nb;
@@ -1124,7 +1126,8 @@ impl Stream {
         }
     }
 
-    /// 主任务的下一个起点：读的位置往后第一个缺块（没人在写、没有预览要它），到尾回绕；只缓存前方时只看前方 [`AHEAD`] 块。
+    /// The main task's next start: the first missing block (nobody writing or previewing it) from the read position,
+    /// wrapping at the end; ahead-only looks just [`AHEAD`] blocks forward.
     fn next_missing(&self, f: &File) -> Option<usize> {
         let st = f.st();
         let n = st.done.len();
@@ -1136,13 +1139,13 @@ impl Stream {
         (rb..n).chain(0..rb).find(free)
     }
 
-    /// 只缓存前方：设置关了整片缓存，或到了容量上限。
+    /// Ahead-only caching: whole-file caching is off in settings, or the cap is reached.
     fn limited(&self) -> bool {
         !self.whole.load(Ordering::Relaxed)
             || self.total.load(Ordering::Relaxed) + AHEAD * BLOCK > self.cap.load(Ordering::Relaxed)
     }
 
-    /// 向上游要 [start, end]（None = 到文件尾），带对冲：3 秒没出数据再开一个，先出数据的留下。
+    /// Requests [start, end] (None = to the end) with hedging: no data in 3 s starts another; the first with data wins.
     async fn open(&self, f: &File, start: u64, end: Option<u64>) -> Result<Opened, Fail> {
         let deadline = tokio::time::Instant::now() + OPEN_LIMIT;
         let mut a: Attempt = Box::pin(self.attempt(&f.src, start, end));
@@ -1162,7 +1165,7 @@ impl Stream {
                 _ = tokio::time::sleep_until(deadline) => break Err(Fail::Timeout),
                 _ = tokio::time::sleep_until(next) => {
                     if let Some(x) = b.take() {
-                        a = x; // 丢掉较早的那个
+                        a = x; // drop the older one
                     }
                     b = Some(Box::pin(self.attempt(&f.src, start, end)));
                     step += 1;
@@ -1177,7 +1180,7 @@ impl Stream {
         r
     }
 
-    /// 一次请求：发出去、跟重定向、确认是要的那段，等到第一段正文。
+    /// One request: send, follow redirects, check it is the asked range, wait for the first body chunk.
     async fn attempt(
         &self,
         src: &Mutex<Src>,
@@ -1199,11 +1202,11 @@ impl Stream {
             (206, Some((a, total))) if a == start => total,
             (200, _) if start == 0 => resp.content_length().ok_or(Fail::Status(502))?,
             (200 | 206, _) => {
-                // ponytail: 不支持 Range 的上游不缓存（Emby 都支持）；要支持就从头读、跳过前面的字节
+                // shortcut: upstreams without Range support are not cached (Emby has it); to support one, read from 0 and skip
                 log::warn!("上游没按 Range 回数据（{st}）");
                 return Err(Fail::Status(502));
             }
-            // 播放中断代价大：5xx 一律当暂时性错误（含 500、Cloudflare 52x），和 crate::status 的通用规则不同
+            // A broken playback costs more than a retry: every 5xx (500, Cloudflare 52x) is transient, unlike crate::status
             _ if st >= 500 || crate::status::classify(st) == crate::status::Class::Busy => {
                 return Err(Fail::Busy(st, crate::status::retry_after(resp.headers())));
             }
@@ -1217,8 +1220,8 @@ impl Stream {
         Ok(Opened { resp, first, total })
     }
 
-    /// 发请求、自己跟重定向（最多 5 次）：token 只发给 API 根地址同源的主机。
-    /// 先用上次重定向到的地址，失败（网络错误或非 2xx）再从原地址来一次。
+    /// Sends a request following redirects itself (at most 5): the token only goes to the API root's origin.
+    /// Tries the last redirect target first; on failure (network error or non-2xx) once more from the original URL.
     async fn send(&self, src: &Mutex<Src>, range: Option<&str>) -> Result<reqwest::Response, Fail> {
         let (orig, resolved, auth) = {
             let s = lock(src);
@@ -1276,7 +1279,8 @@ impl Stream {
         Err(last)
     }
 
-    /// 把回包从第 `from` 块起逐块写到 `to`（不含）为止：每块先登记再写，写完改名；块已有或有人在写就停下。
+    /// Writes the response block by block from `from` up to `to` (exclusive): claim, write, rename;
+    /// stops at a block that is done or being written.
     async fn pump(
         &self,
         f: &Arc<File>,
@@ -1293,7 +1297,7 @@ impl Stream {
         let size = f.st().size.unwrap_or(0);
         let io = |e: std::io::Error| Fail::Net(format!("写缓存失败：{e}"));
         for b in from..to {
-            // 只缓存前方：写到读的位置前方 AHEAD 块就放掉连接。挂着不读的话，读超时（10 秒）和中继的发送超时都会把它断掉
+            // Ahead-only: release the connection AHEAD blocks past the reader; an idle one dies to the 10 s read timeout or the relay's
             if main.is_some() && self.limited() && b > f.st().read_block() + AHEAD as usize {
                 return Ok(Stop::Ahead(b));
             }
@@ -1314,7 +1318,7 @@ impl Stream {
                         .fetch_add(pending.len() as u64, Ordering::Relaxed);
                 }
                 let part = pending.split_to(pending.len().min((len - got) as usize));
-                // ponytail: 同步写，几十 KB 一次落到系统缓存是微秒级；真卡了再改 spawn_blocking
+                // shortcut: sync write of tens of KB into the page cache (microseconds); move to spawn_blocking if it ever shows up
                 file.write_all(&part).map_err(io)?;
                 got += part.len() as u64;
                 if let Some(p) = f.st().writing.get_mut(&b) {
@@ -1337,8 +1341,9 @@ impl Stream {
         Ok(Stop::Hit)
     }
 
-    /// 登记要写第 b 块。块已有、有人在写、主任务已被换掉时返回 None。超容量时先删当前文件里最久没用的块；删不出来也照写
-    /// （读的一方正等着它；拒绝的话任务会立即重开请求、空转）——超出的只是读的位置附近几块，主任务到了上限只写前方一段。
+    /// Claims block b for writing; None if it is done, being written, or this main task was replaced. Over the cap it
+    /// first evicts this file's least recently used blocks; if none can go it writes anyway (a reader waits for it, and
+    /// refusing would make the task reopen at once and spin): the excess is a few blocks near the reader.
     fn claim(&self, f: &Arc<File>, b: usize, main: Option<u64>, size: u64) -> Option<Writing> {
         let mut st = f.st();
         if let Some(id) = main {
@@ -1353,7 +1358,7 @@ impl Stream {
         let len = block_len(size, b);
         let cap = self.cap.load(Ordering::Relaxed);
         while self.total.load(Ordering::Relaxed) + len > cap {
-            // 读的位置附近的不删
+            // never evict around the read position
             let rb = st.read_block();
             let keep = rb.saturating_sub(2)..=rb + AHEAD as usize;
             let Some(victim) = (0..st.done.len())
@@ -1574,13 +1579,13 @@ mod tests {
         ));
     }
 
-    /// 测试用上游：Range 服务器，按路径决定行为；记下每个请求（路径、Range、带没带 token）。
+    /// Test upstream: a Range server whose behaviour depends on the path; logs each request (path, Range, token sent).
     struct Upstream {
         base: String,
         other: String,
         log: Arc<Mutex<Vec<(String, String, bool)>>>,
         data: Arc<Vec<u8>>,
-        /// 正在发正文的连接数。
+        /// Connections currently sending a body.
         active: Arc<AtomicU64>,
     }
 
@@ -1641,7 +1646,7 @@ mod tests {
                     let _ = s.write_all(r.as_bytes()).await;
                     return;
                 }
-                // 前两次 502（中继不稳）
+                // First two requests: 502 (flaky relay)
                 if path.starts_with("/flaky") && flaky.fetch_add(1, Ordering::SeqCst) < 2 {
                     let _ = s.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
@@ -1667,7 +1672,7 @@ mod tests {
                 if s.write_all(h.as_bytes()).await.is_err() {
                     return;
                 }
-                // 第一次请求：发完头不给正文（上游冷读取卡住）
+                // First request: headers but no body (cold read stalls upstream)
                 if path.starts_with("/stall") && stalls.fetch_add(1, Ordering::SeqCst) == 0 {
                     tokio::time::sleep(Duration::from_secs(20)).await;
                     return;
@@ -1676,11 +1681,11 @@ mod tests {
                 let _active = Active(active);
                 let mut sent = 0u64;
                 for chunk in data[a as usize..=b as usize].chunks(64 << 10) {
-                    // 慢速上游：约 1.3 MB/s
+                    // Slow upstream: about 1.3 MB/s
                     if path.starts_with("/slow") {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
-                    // 第一次请求：发了 6 MiB 就断开（中途断线）
+                    // First request: cut after 6 MiB (mid-stream drop)
                     if path.starts_with("/cut")
                         && sent > 6 << 20
                         && cuts.fetch_add(1, Ordering::SeqCst) == 0
@@ -1771,7 +1776,7 @@ mod tests {
         true
     }
 
-    /// 随机区间、并发读都和源文件逐字节一致；整片下完后新开代理读同一目录零上游请求。
+    /// Random and concurrent ranges match the source byte for byte; once complete, a new proxy on the same dir makes no upstream requests.
     #[tokio::test(flavor = "multi_thread")]
     async fn reads_match_and_cache_is_reused() {
         let u = upstream((10 * BLOCK + 12345) as usize).await;
@@ -1807,7 +1812,7 @@ mod tests {
         let (st, body) = get(&url, None, false).await;
         assert_eq!((st, body.len() as u64), (200, n));
         assert!(body == *u.data);
-        // 整片模式：后台补完全部块
+        // Whole-file mode: the background fills every block
         let f = lock(&s.files).get("srv_1_a").unwrap().clone();
         assert!(
             until(|| f.st().done.iter().all(|d| *d), 20).await,
@@ -1815,17 +1820,21 @@ mod tests {
         );
         assert!(until(|| !f.st().busy(), 5).await);
         let before = reqs(&u, "/f").len();
-        // 新开一个代理（模拟下次启动）：全部走本地
+        // A new proxy (next launch): everything is local
         let s2 = Stream::start(&dir, true).unwrap();
         let url2 = s2.video("srv_1_a", &format!("{}/f", u.base), &auth(&u));
         let (_, body) = get(&url2, Some("bytes=5000000-"), false).await;
         assert!(body == u.data[5_000_000..]);
-        assert_eq!(reqs(&u, "/f").len(), before, "已缓存的部分不该再向上游要");
+        assert_eq!(
+            reqs(&u, "/f").len(),
+            before,
+            "cached data must not be fetched again"
+        );
         drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 上游卡住 3 秒没正文就对冲，先出数据的留下；中途断线后续上，内容仍一致。
+    /// A body-less upstream gets hedged after 3 s and the first with data wins; a mid-stream cut resumes with identical content.
     #[tokio::test(flavor = "multi_thread")]
     async fn hedges_stalls_and_resumes_after_cut() {
         let u = upstream((3 * BLOCK) as usize).await;
@@ -1846,12 +1855,12 @@ mod tests {
         let url = s.video("srv_3_a", &format!("{}/cut", u.base), &auth(&u));
         let (st, body) = get(&url, None, false).await;
         assert_eq!(st, 200);
-        assert!(body == *u.data, "断线续传后内容不一致");
+        assert!(body == *u.data, "content differs after resuming");
         assert!(reqs(&u, "/cut").len() >= 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 预览只取 1–2 块，取过的位置再要不发请求；拖到远处只剩一个主任务。
+    /// Previews fetch 1–2 blocks and never refetch; a far seek leaves just one main task.
     #[tokio::test(flavor = "multi_thread")]
     async fn preview_takes_few_blocks_and_seek_keeps_one_main() {
         let u = upstream((60 * BLOCK) as usize).await;
@@ -1874,9 +1883,13 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(reqs(&u, "/f").len(), n, "取过的位置不该再请求");
+        assert_eq!(
+            reqs(&u, "/f").len(),
+            n,
+            "a fetched position must not be requested again"
+        );
 
-        // 主播放器：开头读一点，过 2 秒（主任务不再算刚开）拖到 30 块处读一点
+        // Main player: read at the start, wait 2 s (no longer a young main task), then seek to block 30
         let _ = get(&url, Some("bytes=0-99"), false).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         let _ = get(
@@ -1886,7 +1899,7 @@ mod tests {
         )
         .await;
         tokio::time::sleep(Duration::from_secs(2)).await;
-        // 只缓存前方：开头那个主任务停在前方 AHEAD 块，被换掉后不再往后写；新的从 30 块写到 30 + AHEAD
+        // Ahead-only: the first main task stops AHEAD blocks in and, once replaced, writes no more; the new one writes 30..=30 + AHEAD
         let st = f.st();
         let done: Vec<usize> = (0..st.done.len()).filter(|&b| st.done[b]).collect();
         drop(st);
@@ -1899,7 +1912,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 403 原样回给 mpv；跨主机重定向不带 token、同源带；字幕取一次后走本地。
+    /// A 403 reaches mpv as is; cross-host redirects carry no token, same-origin ones do; subtitles are fetched once.
     #[tokio::test(flavor = "multi_thread")]
     async fn status_redirect_and_subs() {
         let u = upstream(BLOCK as usize + 10).await;
@@ -1913,7 +1926,7 @@ mod tests {
         let (st, body) = get(&url, Some("bytes=0-9"), false).await;
         assert_eq!((st, body.as_slice()), (206, &u.data[..10]));
         let first = reqs(&u, "/redir");
-        assert!(first[0].2, "同源要带 token");
+        assert!(first[0].2, "same origin must carry the token");
         let moved: Vec<_> = lock(&u.log)
             .iter()
             .filter(|r| r.0 == "/f")
@@ -1929,11 +1942,15 @@ mod tests {
         assert!(sub.ends_with("/srv_7_a_3.srt"));
         assert_eq!(get(&sub, None, false).await.1, b"hello");
         assert_eq!(get(&sub, None, false).await.1, b"hello");
-        assert_eq!(reqs(&u, "/sub").len(), 1, "字幕第二次走本地");
+        assert_eq!(
+            reqs(&u, "/sub").len(),
+            1,
+            "second subtitle read must be local"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// retain 删其余目录、停掉它们的下载；到容量上限时不再往后预取。
+    /// retain deletes the other dirs and stops their downloads; at the cap nothing is fetched beyond the window.
     #[tokio::test(flavor = "multi_thread")]
     async fn retain_and_capacity() {
         let u = upstream((40 * BLOCK) as usize).await;
@@ -1963,21 +1980,21 @@ mod tests {
         assert!(lock(&s.files).get("srv_9_a").is_none());
         let _ = std::fs::remove_dir_all(&dir);
 
-        // 容量只够 MIN_CAP：整片模式也只写到前方一段
+        // Cap of MIN_CAP: even whole-file mode only writes the window ahead
         let s = Stream::start(&dir, true).unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await; // 启动时按磁盘算容量，等它跑完再改
+        tokio::time::sleep(Duration::from_millis(500)).await; // startup computes the cap from the disk; let it finish first
         s.cap.store(MIN_CAP, Ordering::Relaxed);
         let a = s.video("srv_10_a", &format!("{}/f", u.base), &auth(&u));
         let _ = get(&a, Some("bytes=0-9"), false).await;
         let f = lock(&s.files).get("srv_10_a").unwrap().clone();
         tokio::time::sleep(Duration::from_secs(2)).await;
         let n = f.st().done.iter().filter(|d| **d).count() as u64;
-        assert!(n <= AHEAD + 2, "到了容量上限还在往后写：{n} 块");
+        assert!(n <= AHEAD + 2, "still writing past the cap: {n} blocks");
         drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 只缓存前方：写满前方 AHEAD 块就放掉上游连接（挂着不读会被读超时断开），读的位置往前走半段再续上。
+    /// Ahead-only: after AHEAD blocks the upstream connection is released (an idle one would time out); it resumes once the reader moves half the window.
     #[tokio::test(flavor = "multi_thread")]
     async fn limited_mode_releases_connection_and_resumes() {
         let u = upstream((60 * BLOCK) as usize).await;
@@ -1999,8 +2016,11 @@ mod tests {
             until(|| u.active.load(Ordering::SeqCst) == 0, 3).await,
             "写满前方后还挂着上游连接"
         );
-        assert!(f.st().main.is_some(), "主任务应该还在等读的位置往前走");
-        // 读到第 5 块：离写到的位置还差 12 块，不续；读到第 10 块：差 7 块（不到半段 8 块），续上写到 26
+        assert!(
+            f.st().main.is_some(),
+            "the main task should still wait for the reader"
+        );
+        // Read at block 5: 12 blocks short, no resume; at block 10: 7 short (under half of 16), resume up to 26
         let _ = get(
             &url,
             Some(&format!("bytes={}-{}", 5 * BLOCK, 5 * BLOCK + 9)),
@@ -2020,12 +2040,16 @@ mod tests {
             "{:?}",
             done(&f)
         );
-        assert_eq!(reqs(&u, "/f").len(), 2, "续写应只开一个新请求");
+        assert_eq!(
+            reqs(&u, "/f").len(),
+            2,
+            "resuming must open exactly one new request"
+        );
         drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 5xx 当成暂时的：主任务退避重试，读的一方等到数据，不把 502 回给 mpv。
+    /// 5xx is transient: the main task backs off and retries, the reader gets data, mpv never sees the 502.
     #[tokio::test(flavor = "multi_thread")]
     async fn transient_5xx_is_retried() {
         let u = upstream(BLOCK as usize + 100).await;
@@ -2083,7 +2107,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// retain 掉还在读的文件：读的连接断开，不再安排下载；播放结束（idle）停掉整片下载。
+    /// Retaining away a file being read drops the reader and schedules nothing more; idle at playback end stops whole-file downloads.
     #[tokio::test(flavor = "multi_thread")]
     async fn retain_and_idle_stop_downloads() {
         let u = upstream((20 * BLOCK) as usize).await;
@@ -2091,7 +2115,7 @@ mod tests {
         let s = Stream::start(&dir, true).unwrap();
         let url = s.video("srv_13_a", &format!("{}/slow", u.base), &auth(&u));
         let reading = tokio::spawn(async move { get(&url, None, false).await });
-        // 等读的一方真在收数据（总大小已知、第一块写了一部分）：测的是读数据中途被删，不是等总大小时
+        // Wait until the reader really receives data (size known, block 0 partly written): this tests removal mid-read, not while waiting for the size
         let f = lock(&s.files).get("srv_13_a").unwrap().clone();
         assert!(
             until(
@@ -2110,7 +2134,11 @@ mod tests {
         assert!(until(|| u.active.load(Ordering::SeqCst) == 0, 3).await);
         let n = reqs(&u, "/slow").len();
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(reqs(&u, "/slow").len(), n, "删掉的文件还在向上游要数据");
+        assert_eq!(
+            reqs(&u, "/slow").len(),
+            n,
+            "a removed file still fetches from upstream"
+        );
 
         let url = s.video("srv_14_a", &format!("{}/slow", u.base), &auth(&u));
         let _ = get(&url, Some("bytes=0-99"), false).await;
@@ -2125,11 +2153,11 @@ mod tests {
             until(|| u.active.load(Ordering::SeqCst) == 0, 3).await,
             "播放结束后还在下"
         );
-        assert!(first.exists(), "缓存要留着");
+        assert!(first.exists(), "the cache must stay");
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 容量小到连读的位置附近都放不下时照样写（只是超一点），不能拒绝写而让任务空转重开请求。
+    /// A cap too small even for the blocks around the reader still writes (slightly over) instead of refusing and spinning on new requests.
     #[tokio::test(flavor = "multi_thread")]
     async fn tiny_capacity_still_serves() {
         let u = upstream((8 * BLOCK) as usize).await;

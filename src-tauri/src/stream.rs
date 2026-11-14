@@ -1872,7 +1872,7 @@ mod tests {
 
     /// Retry delays: from each `cut <path>` entry (the upstream dropped or refused) to the next request for `path`.
     /// Timing the gaps rather than the whole read keeps data transfer out of it: under load moving tens of MB
-    /// in a debug build takes seconds (M05, 2026-11-15: 9.9 s against an 8 s bound for about 4 s of waits).
+    /// in a debug build takes seconds (measured: 9.9 s against an 8 s bound for about 4 s of waits).
     fn retry_delays(u: &Upstream, path: &str) -> Vec<Duration> {
         let cut = format!("cut {path}");
         let mut end = None;

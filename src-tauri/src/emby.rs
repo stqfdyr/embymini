@@ -498,24 +498,32 @@ pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    pub fn fixture<T: DeserializeOwned>(name: &str) -> T {
+    fn testdata(name: &str) -> String {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join(name);
-        serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()
+        std::fs::read_to_string(p).unwrap()
     }
 
-    pub fn client() -> Emby {
-        let s = Server {
+    pub fn fixture<T: DeserializeOwned>(name: &str) -> T {
+        serde_json::from_str(&testdata(name)).unwrap()
+    }
+
+    /// Test server entry: user id `uid`, token `tok`.
+    pub fn server_at(url: &str, port: u16) -> Server {
+        Server {
             id: "s".into(),
             name: String::new(),
-            url: "https://h.example".into(),
-            port: 443,
+            url: url.into(),
+            port,
             user: "u".into(),
             user_id: "uid".into(),
             token: "tok".into(),
-        };
-        Emby::new(Client::new(), &s, "dev")
+        }
+    }
+
+    pub fn client() -> Emby {
+        Emby::new(Client::new(), &server_at("https://h.example", 443), "dev")
     }
 
     #[test]
@@ -580,6 +588,19 @@ pub(crate) mod tests {
             strip_key("https://h/emby/v?api_key=x".into()),
             "https://h/emby/v"
         );
+        let given = MediaStream {
+            delivery_url: Some("/Videos/1/s.srt?api_key=k".into()),
+            ..ext.clone()
+        };
+        assert_eq!(
+            c.subtitle_url("1", src, &given),
+            "https://h.example/emby/Videos/1/s.srt"
+        );
+        let cdn = MediaSource {
+            direct_stream_url: Some("https://cdn.example/v.mkv?api_key=k&t=1".into()),
+            ..bare.clone()
+        };
+        assert_eq!(c.stream_url("9", &cdn), "https://cdn.example/v.mkv?t=1");
         assert_eq!(c.token_header(), "X-Emby-Token: tok");
         assert_eq!(subtitle_ext(Some("subrip")), "srt");
         assert_eq!(subtitle_ext(Some("PGSSUB")), "sup");
@@ -653,27 +674,45 @@ pub(crate) mod tests {
         );
     }
 
-    /// `call` turns each kind of reply into the right result.
-    #[tokio::test]
-    async fn call_maps_replies() {
+    type Heads = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// Local HTTP server: `route(path)` → (status line, body); the path is lowercased and the status line may carry
+    /// extra header lines. Reads each whole request (head + body) before replying so the client never sees a reset.
+    /// Returns its port and every request head as sent.
+    async fn fake(route: fn(&str) -> (&'static str, String)) -> (u16, Heads) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
+        let heads = Heads::default();
+        let seen = heads.clone();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = l.accept().await {
-                let mut buf = [0u8; 1024];
-                let n = s.read(&mut buf).await.unwrap_or(0);
-                let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                let path = head.split(' ').nth(1).unwrap_or_default();
-                let long = format!("\n{}", "x".repeat(300));
-                let (status, body) = match path {
-                    "/emby/unauth" => ("401 Unauthorized", ""),
-                    "/emby/empty" => ("204 No Content", ""),
-                    "/emby/html" => ("200 OK", "<html>"),
-                    "/emby/denied" => ("403 Forbidden", "Access denied"),
-                    "/emby/long" => ("400 Bad Request", long.as_str()),
-                    _ => ("200 OK", r#"{"a":1}"#),
+                let (mut req, mut chunk) = (Vec::new(), [0u8; 4096]);
+                let head = loop {
+                    let n = s.read(&mut chunk).await.unwrap_or(0);
+                    req.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&req).to_string();
+                    let Some(end) = text.find("\r\n\r\n") else {
+                        if n == 0 {
+                            break text;
+                        }
+                        continue;
+                    };
+                    let len: usize = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let l = l.to_lowercase();
+                            l.strip_prefix("content-length:")
+                                .map(|v| v.trim().parse().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if n == 0 || req.len() >= end + 4 + len {
+                        break text[..end].to_owned();
+                    }
                 };
+                let target = head.split(' ').nth(1).unwrap_or_default().to_lowercase();
+                let (status, body) = route(target.split('?').next().unwrap_or_default());
+                seen.lock().unwrap().push(head);
                 let resp = format!(
                     "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
@@ -681,16 +720,30 @@ pub(crate) mod tests {
                 let _ = s.write_all(resp.as_bytes()).await;
             }
         });
-        let server = Server {
-            id: "s".into(),
-            name: String::new(),
-            url: "http://127.0.0.1".into(),
-            port,
-            user: "u".into(),
-            user_id: "uid".into(),
-            token: "tok".into(),
-        };
-        let c = Emby::new(http_client().unwrap(), &server, "dev");
+        (port, heads)
+    }
+
+    fn local(port: u16) -> Emby {
+        Emby::new(
+            http_client().unwrap(),
+            &server_at("http://127.0.0.1", port),
+            "dev",
+        )
+    }
+
+    /// `call` turns each kind of reply into the right result and sends our UA and auth headers.
+    #[tokio::test]
+    async fn call_maps_replies() {
+        let (port, heads) = fake(|path| match path {
+            "/emby/unauth" => ("401 Unauthorized", String::new()),
+            "/emby/empty" => ("204 No Content", String::new()),
+            "/emby/html" => ("200 OK", "<html>".into()),
+            "/emby/denied" => ("403 Forbidden", "Access denied".into()),
+            "/emby/long" => ("400 Bad Request", format!("\n{}", "x".repeat(300))),
+            _ => ("200 OK", r#"{"a":1}"#.into()),
+        })
+        .await;
+        let c = local(port);
         let call = |p: &'static str| c.call(Method::GET, p, NO_QUERY, None);
         assert_eq!(call("/ok").await.unwrap()["a"], 1);
         assert_eq!(call("/empty").await.unwrap(), Value::Null);
@@ -705,6 +758,93 @@ pub(crate) mod tests {
         // A long body is never shown cut off, even after leading whitespace
         let e = call("/long").await.unwrap_err().to_string();
         assert_eq!(e, "请求被服务器拒绝（400）");
+
+        let head = heads.lock().unwrap()[0].clone();
+        // A copy of `device_name`'s lookup: catches a wrong lookup, not one hard-coding the "PC" fallback
+        let host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "PC".into());
+        // Header names arrive lowercased; values must match exactly
+        for want in [
+            format!("user-agent: {UA}\r\n"),
+            format!(
+                r#"x-emby-authorization: Emby UserId="uid", Client="EmbyMini", Device="{host}", DeviceId="dev", Version="{VERSION}", Token="tok""#
+            ),
+            "x-emby-token: tok\r\n".into(),
+        ] {
+            assert!(head.contains(&want), "missing {want:?} in\n{head}");
+        }
+    }
+
+    /// Login returns the user id and token, sends no token itself, and words a 401 as a bad password.
+    #[tokio::test]
+    async fn login_reads_user_and_token() {
+        let (port, heads) = fake(|path| match path {
+            "/ok/users/authenticatebyname" => (
+                "200 OK",
+                r#"{"User":{"Id":"u1"},"AccessToken":"t1"}"#.into(),
+            ),
+            "/denied/users/authenticatebyname" => ("401 Unauthorized", String::new()),
+            _ => ("200 OK", r#"{"User":{"Id":"u1"},"AccessToken":""}"#.into()),
+        })
+        .await;
+        let http = http_client().unwrap();
+        let at = |p: &str| format!("http://127.0.0.1:{port}/{p}");
+        let r = login(&http, &at("ok"), "dev", "u", "pw").await.unwrap();
+        assert_eq!(r, ("u1".to_owned(), "t1".to_owned()));
+        let head = heads.lock().unwrap()[0].clone();
+        assert!(
+            head.contains(r#"DeviceId="dev""#)
+                && !head.contains("Token=")
+                && !head.contains("x-emby-token"),
+            "{head}"
+        );
+        let e = login(&http, &at("denied"), "dev", "u", "pw")
+            .await
+            .unwrap_err();
+        assert_eq!(e.to_string(), "用户名或密码错误");
+        let e = login(&http, &at("empty"), "dev", "u", "pw")
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("AccessToken"), "{e}");
+    }
+
+    /// Typed endpoints parse real replies; PlaybackInfo asks for the original file and the chosen version.
+    #[tokio::test]
+    async fn typed_endpoints() {
+        let (port, heads) = fake(|path| match path {
+            "/emby/users/uid/items/1" => ("200 OK", testdata("series.json")),
+            "/emby/shows/s/episodes" => ("200 OK", testdata("episodes.json")),
+            "/emby/items/1/playbackinfo" => ("200 OK", testdata("playbackinfo.json")),
+            "/r" => ("302 Found\r\nlocation: /v", String::new()),
+            _ => ("403 Forbidden", String::new()),
+        })
+        .await;
+        let c = local(port);
+        assert_eq!(c.item("1").await.unwrap().kind, "Series");
+        let eps = c.episodes("s", "x").await.unwrap();
+        assert!(eps.len() > 1 && eps.iter().all(|e| e.kind == "Episode" && !e.id.is_empty()));
+        let source = "mediasource_1153511";
+        let pi = c.playback_info("1", Some(source)).await.unwrap();
+        assert!(pi.play_session_id.is_some() && pi.media_sources[0].id == source);
+        let head = heads.lock().unwrap().last().unwrap().clone();
+        let query: Vec<&str> = head
+            .split(' ')
+            .nth(1)
+            .and_then(|t| t.split_once('?'))
+            .map_or(vec![], |(_, q)| q.split('&').collect());
+        let want = format!("MediaSourceId={source}");
+        assert!(
+            query.contains(&"MaxStreamingBitrate=400000000") && query.contains(&want.as_str()),
+            "{head}"
+        );
+        // probe: final status after redirects, asked with the token and a one-byte range
+        assert_eq!(
+            c.probe(&format!("http://127.0.0.1:{port}/r")).await,
+            Some(403)
+        );
+        let head = heads.lock().unwrap().last().unwrap().clone();
+        assert!(head.contains("range: bytes=0-0") && head.contains("x-emby-token: tok"));
     }
 
     #[test]

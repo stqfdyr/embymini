@@ -2703,7 +2703,14 @@ mod tests {
             .iter()
             .filter(|v| v.as_str().is_some_and(|u| u.contains("/s/")))
             .count();
-        eprintln!("外挂字幕 {subs} 条经缓存代理");
+        if subs == 0 {
+            // Only the episode's own subtitles count: with none, this check proved nothing
+            eprintln!(
+                "注意：这一集没有外挂字幕，「字幕经缓存代理」没验到；换一集有外挂字幕的（EMBY_TEST_ITEM）"
+            );
+        } else {
+            eprintln!("外挂字幕 {subs} 条经缓存代理");
+        }
         let _ = std::fs::remove_dir_all(cache);
         eprintln!("截图在 {}；检查过的地址 {} 个", dir.display(), shown.len());
     }

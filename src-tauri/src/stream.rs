@@ -1620,11 +1620,14 @@ mod tests {
         ));
     }
 
+    /// A logged request: path, Range, whether the token was sent, arrival time.
+    type Logged = (String, String, bool, Instant);
+
     /// Test upstream: a Range server whose behaviour depends on the path; logs each request (path, Range, token sent).
     struct Upstream {
         base: String,
         other: String,
-        log: Arc<Mutex<Vec<(String, String, bool)>>>,
+        log: Arc<Mutex<Vec<Logged>>>,
         data: Arc<Vec<u8>>,
         /// Connections currently sending a body.
         active: Arc<AtomicU64>,
@@ -1643,7 +1646,7 @@ mod tests {
 
     async fn serve(
         l: tokio::net::TcpListener,
-        log: Arc<Mutex<Vec<(String, String, bool)>>>,
+        log: Arc<Mutex<Vec<Logged>>>,
         data: Arc<Vec<u8>>,
         redirect: Option<String>,
         active: Arc<AtomicU64>,
@@ -1675,7 +1678,10 @@ mod tests {
                 };
                 let range = hdr("range:").unwrap_or_default();
                 let token = hdr("x-emby-token:").is_some();
-                lock(&log).push((path.clone(), range.clone(), token));
+                lock(&log).push((path.clone(), range.clone(), token, Instant::now()));
+                let cut = |log: &Mutex<Vec<Logged>>| {
+                    lock(log).push((format!("cut {path}"), String::new(), false, Instant::now()));
+                };
                 if path.starts_with("/403") {
                     let _ = s.write_all(b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
                     return;
@@ -1698,11 +1704,13 @@ mod tests {
                 // First two requests: 502 (flaky relay)
                 if path.starts_with("/flaky") && flaky.fetch_add(1, Ordering::SeqCst) < 2 {
                     let _ = s.write_all(b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    cut(&log);
                     return;
                 }
                 // Second request: 429 with Retry-After (rate-limiting relay)
                 if path.starts_with("/busy") && flaky.fetch_add(1, Ordering::SeqCst) == 1 {
                     let _ = s.write_all(b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    cut(&log);
                     return;
                 }
                 // Requests 2–5: 503 (an outage with no data at all)
@@ -1710,6 +1718,7 @@ mod tests {
                     && (1..=4).contains(&flaky.fetch_add(1, Ordering::SeqCst))
                 {
                     let _ = s.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+                    cut(&log);
                     return;
                 }
                 // Second request: 403 (a redirect target that expired)
@@ -1767,6 +1776,7 @@ mod tests {
                     }
                     // Every request: cut after a bit over 2 blocks (a relay that keeps dropping)
                     if path.starts_with("/drops") && sent > 9 << 20 {
+                        cut(&log);
                         return;
                     }
                     if s.write_all(chunk).await.is_err() {
@@ -1830,7 +1840,26 @@ mod tests {
         (st, r.bytes().await.map(|b| b.to_vec()).unwrap_or_default())
     }
 
-    fn reqs(u: &Upstream, path: &str) -> Vec<(String, String, bool)> {
+    /// Retry delays: from each `cut <path>` entry (the upstream dropped or refused) to the next request for `path`.
+    /// Timing the gaps rather than the whole read keeps data transfer out of it: under load moving tens of MB
+    /// in a debug build takes seconds (M05, 2026-11-15: 9.9 s against an 8 s bound for about 4 s of waits).
+    fn retry_delays(u: &Upstream, path: &str) -> Vec<Duration> {
+        let cut = format!("cut {path}");
+        let mut end = None;
+        let mut out = Vec::new();
+        for (p, _, _, at) in lock(&u.log).iter() {
+            if *p == cut {
+                end = Some(*at);
+            } else if p.starts_with(path)
+                && let Some(t) = end.take()
+            {
+                out.push(*at - t);
+            }
+        }
+        out
+    }
+
+    fn reqs(u: &Upstream, path: &str) -> Vec<Logged> {
         lock(&u.log)
             .iter()
             .filter(|r| r.0.starts_with(path))
@@ -1916,8 +1945,9 @@ mod tests {
         assert_eq!(st, 206);
         assert!(body == u.data[..1024]);
         let took = t0.elapsed();
+        // Upper bounds leave seconds of slack for loaded machines and CI; they only need to beat the 20 s stall
         assert!(
-            took >= Duration::from_secs(3) && took < Duration::from_secs(6),
+            took >= Duration::from_secs(3) && took < Duration::from_secs(10),
             "{took:?}"
         );
         assert!(reqs(&u, "/stall").len() >= 2);
@@ -2185,12 +2215,15 @@ mod tests {
         let dir = tmp("flaky");
         let s = Stream::start(&dir, false).unwrap();
         let url = s.video("srv_12_a", &format!("{}/flaky", u.base), &auth(&u));
-        let t0 = Instant::now();
         let (st, body) = get(&url, Some("bytes=0-99"), false).await;
         assert_eq!(st, 206);
         assert!(body == u.data[..100]);
-        assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/flaky").len(), 3);
+        let d = retry_delays(&u, "/flaky");
+        assert!(
+            d.len() == 2 && d.iter().all(|d| *d < Duration::from_secs(3)),
+            "{d:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2201,13 +2234,16 @@ mod tests {
         let dir = tmp("drops");
         let s = Stream::start(&dir, false).unwrap();
         let url = s.video("srv_16_a", &format!("{}/drops", u.base), &auth(&u));
-        let t0 = Instant::now();
         let (st, body) = get(&url, None, false).await;
         assert_eq!(st, 200);
         assert!(body == *u.data, "content differs after cuts");
-        // 4 cuts: about 4 s with a 1 s retry each, 15 s (1+2+4+8) if the backoff keeps doubling
-        assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/drops").len(), 5);
+        // 4 cuts, each retried after about 1 s; a doubling backoff waits 1, 2, 4, 8 s
+        let d = retry_delays(&u, "/drops");
+        assert!(
+            d.len() == 4 && d.iter().all(|d| *d < Duration::from_millis(2500)),
+            "{d:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2374,17 +2410,14 @@ mod tests {
         let dir = tmp("flaky-thumb");
         let s = Stream::start(&dir, false).unwrap();
         let url = s.video("srv_20_a", &format!("{}/flaky", u.base), &auth(&u));
-        let t0 = Instant::now();
         let (st, body) = get(&url, Some("bytes=0-99"), true).await;
         assert_eq!(st, 206);
         assert!(body == u.data[..100]);
-        // Two 502s, each followed by a 1.5 s hold-off (crate::status::backoff)
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_millis(2500) && took < Duration::from_secs(6),
-            "{took:?}"
-        );
         assert_eq!(reqs(&u, "/flaky").len(), 3);
+        // Two 502s, each followed by a 1.5 s hold-off (crate::status::backoff)
+        let d = retry_delays(&u, "/flaky");
+        let ok = |d: &Duration| *d >= Duration::from_millis(1400) && *d < Duration::from_secs(3);
+        assert!(d.len() == 2 && d.iter().all(ok), "{d:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2444,13 +2477,16 @@ mod tests {
         let at = 2 * BLOCK;
         let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
         assert_eq!(st, 206);
-        let t0 = Instant::now();
         let (st, body) = get(&url, Some("bytes=0-99"), false).await;
         assert_eq!(st, 206);
         assert!(body == u.data[..100]);
-        // 4 × 1.5 s ≈ 6 s; a doubling backoff would take 1.5 + 2 + 4 + 8 ≈ 15.5 s
-        assert!(t0.elapsed() < Duration::from_secs(9), "{:?}", t0.elapsed());
         assert_eq!(reqs(&u, "/down").len(), 6);
+        // 4 × 1.5 s; a doubling backoff waits 1.5, 2, 4, 8 s
+        let d = retry_delays(&u, "/down");
+        assert!(
+            d.len() == 4 && d.iter().all(|d| *d < Duration::from_secs(3)),
+            "{d:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2465,16 +2501,14 @@ mod tests {
         let at = 2 * BLOCK;
         let (st, _) = get(&url, Some(&format!("bytes={at}-{}", at + 9)), true).await;
         assert_eq!(st, 206);
-        let t0 = Instant::now();
         let (st, body) = get(&url, Some("bytes=0-99"), false).await;
         assert_eq!(st, 206);
         assert!(body == u.data[..100]);
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_secs(2) && took < Duration::from_secs(4),
-            "{took:?}"
-        );
         assert_eq!(reqs(&u, "/busy").len(), 3);
+        // Retry-After is 2 s: not the own 1 s retry, nor the 5 s cap
+        let d = retry_delays(&u, "/busy");
+        let ok = |d: &Duration| *d >= Duration::from_millis(1900) && *d < Duration::from_secs(4);
+        assert!(d.len() == 1 && d.iter().all(ok), "{d:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

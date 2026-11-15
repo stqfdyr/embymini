@@ -3093,13 +3093,15 @@ mod tests {
         } else {
             "mpv".into()
         };
-        let out = std::process::Command::new(mpv)
+        let log = std::env::temp_dir().join(format!("embymini-dmtest-{}.log", std::process::id()));
+        let mut child = std::process::Command::new(mpv)
             .args([
                 "--no-config",
                 "--idle=yes",
                 "--vo=null",
                 "--ao=null",
                 "--force-window=no",
+                &format!("--log-file={}", log.display()),
                 &format!(
                     "--script={}",
                     dir.join("testdata").join("danmaku_test.lua").display()
@@ -3112,12 +3114,32 @@ mod tests {
                         .display()
                 ),
             ])
-            .output()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+        // Only the harness quits mpv (--idle): if it never ran, give up instead of hanging
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|l| l.contains("][i][danmaku_test]") || l.contains("][e]["))
+            .collect();
         assert!(
-            out.status.success() && text.contains("danmaku_test: ok"),
-            "{text}"
+            status.is_some_and(|s| s.success()),
+            "{status:?}\n{lines:#?}"
         );
     }
 

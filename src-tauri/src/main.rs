@@ -1,4 +1,4 @@
-// release 下不弹控制台窗口，不要删。
+// No console window in release builds: keep this.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
@@ -23,23 +23,25 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 use tokio::sync::{mpsc, watch};
 
-/// 从点关闭（或开始退出）算起的时刻；关闭各阶段耗时写日志，查「关闭时卡一下」卡在哪一段。
+/// When the user closed the window (or the process began exiting): each close phase logs its time since, to find
+/// where "closing hangs for a moment" is spent. Only the window events start it, never [`App::shutdown`], so an
+/// update whose installer fails to start leaves no stale start behind.
 static CLOSE_T0: OnceLock<Instant> = OnceLock::new();
 
-/// 开始计时（重复调用以第一次为准）。
+/// Starts the timer; later calls keep the first start.
 fn exit_start() {
     CLOSE_T0.get_or_init(Instant::now);
 }
 
-/// 记一个关闭阶段；还没开始关闭时（例如平时关掉 mpv）什么都不做。
+/// Logs a close phase; does nothing when not closing (e.g. mpv closed during normal use or for an update).
 pub(crate) fn exit_mark(phase: &str) {
     if let Some(t0) = CLOSE_T0.get() {
         log::info!("关闭耗时 {phase}：{} ms", t0.elapsed().as_millis());
     }
 }
 
-/// 运行标记（数据目录下的 `running`，内容是版本号）：启动时写、正常退出（含自动更新）时删。
-/// 启动时它还在 = 上次崩溃、被结束进程或关机时被杀。
+/// Running marker (`running` in the data dir, holding the version): written at start, removed on a clean exit
+/// (auto-update included). Still there at start = the last run crashed or was killed.
 const RUNNING: &str = "running";
 
 pub(crate) fn set_running(root: &std::path::Path, on: bool) {
@@ -55,28 +57,28 @@ struct App {
     path: PathBuf,
     cfg: Mutex<Config>,
     http: reqwest::Client,
-    /// 资源目录里的 mpv 自带配置（ModernZ 等）；打包时若附带了 mpv.exe 也在这里。
+    /// Bundled mpv config in the resource dir (ModernZ etc.); also holds mpv.exe when the package ships one.
     mpv_dir: Option<PathBuf>,
-    /// mpv 的缓存目录：数据目录下的 `mpv-cache`，卸载时勾选「删除应用程序数据」会一起删掉。
+    /// mpv's cache dir, `mpv-cache` under the data dir, so uninstalling with "delete app data" removes it.
     mpv_cache: Option<PathBuf>,
     player: Mutex<Option<Player>>,
-    /// 海报、背景图的磁盘缓存（`emby-img` 协议）。
+    /// Disk cache for posters and backdrops (the `emby-img` protocol).
     images: std::sync::Arc<images::Images>,
-    /// 本地缓存代理（视频、字幕）；起不来时为 None，播放直连。
+    /// Local caching proxy (video, subtitles); None when it failed to start, then playback goes direct.
     stream: Option<stream::Stream>,
-    /// 弹幕缓存目录（数据目录下的 `cache/danmaku`），缓存管理里算在「字幕和弹幕」。
+    /// Danmaku cache dir (`cache/danmaku`), counted under subtitles in cache management.
     danmaku_dir: PathBuf,
-    /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
+    /// Bumped on every play click; a start that finishes after a newer click discards itself.
     play_seq: AtomicU64,
-    /// 程序要退出了：起播中的 `play` 收到后放弃起播（见 [`App::unless_quit`]）。
+    /// The program is exiting: a starting `play` gives up (see [`App::unless_quit`]).
     quit: watch::Sender<bool>,
-    /// 还没返回的 `play` 个数（[`Starting`]），退出时等它们收尾。
+    /// `play` calls not yet returned ([`Starting`]); exit waits for them.
     starting: AtomicUsize,
-    /// 已叫停、还在收尾（回传 Stopped）的播放任务，退出时等它们（见 [`App::begin_shutdown`]）。
+    /// Players told to quit that are still reporting Stopped; exit waits for them (see [`App::retire`]).
     closing: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
 }
 
-/// 进入 `play` 时加一、离开时减一。
+/// Counts `play` calls in progress: up on entry, down when dropped.
 struct Starting<'a>(&'a AtomicUsize);
 
 impl<'a> Starting<'a> {
@@ -92,18 +94,18 @@ impl Drop for Starting<'_> {
     }
 }
 
-/// 正在进行的一次播放：发控制命令的通道 + 转发播放事件的任务（会话结束后才结束）。
+/// The current playback: its control channel and the event-forwarding task (ends after the session).
 struct Player {
     ctl: mpsc::UnboundedSender<player::Ctl>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
-/// 设置里填的 mpv 路径：去掉首尾空白和引号（资源管理器「复制为路径」会带双引号）。
+/// The mpv path from settings without surrounding blanks and quotes (Explorer's "Copy as path" adds them).
 fn clean_path(p: &str) -> &str {
     p.trim().trim_matches('"').trim()
 }
 
-/// 锁中毒（持锁时 panic）也照常取用：这里的数据都是整体替换，不会停在半改状态。
+/// Ignores lock poisoning: the data here is replaced whole, never left half-updated by a panic.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -130,39 +132,55 @@ impl App {
         lock(&self.player).is_some() || self.starting.load(Ordering::SeqCst) > 0
     }
 
-    /// 让正在播放的 mpv 退出（没有就什么都不做）；返回播放任务，需要时可等它回传完 Stopped。
-    fn stop_player(&self) -> Option<tauri::async_runtime::JoinHandle<()>> {
-        let p = lock(&self.player).take()?;
-        let _ = p.ctl.send(player::Ctl::Quit);
-        Some(p.task)
+    /// Tells the running mpv to quit; false when there is none.
+    fn stop_player(&self) -> bool {
+        let Some(p) = lock(&self.player).take() else {
+            return false;
+        };
+        self.retire(p);
+        true
     }
 
-    /// 起播要等几秒（取 PlaybackInfo、连 IPC），这期间 mpv 窗口已经开着。程序退出时丢掉起播的 future，
-    /// mpv 随 `Child` 一起被杀（`kill_on_drop`），不留一个没人管的空窗口。
+    /// Saves the volume a player ended with, unless a newer `play` was clicked since `seq`: exit also waits for
+    /// the switched-away player, whose late `Ended` must not overwrite the current title's volume.
+    fn save_volume(&self, seq: u64, volume: f64) {
+        if self.play_seq.load(Ordering::SeqCst) == seq {
+            self.remember(|c| c.volume = Some(volume));
+        }
+    }
+
+    /// Sends Quit and keeps the task: it still reports Stopped, and [`App::shutdown`] waits for it.
+    fn retire(&self, p: Player) {
+        let _ = p.ctl.send(player::Ctl::Quit);
+        let mut closing = lock(&self.closing);
+        closing.retain(|t| !t.inner().is_finished());
+        closing.push(p.task);
+    }
+
+    /// Starting takes seconds (PlaybackInfo, IPC) with the mpv window already open. On exit the start future is
+    /// dropped and mpv dies with its `Child` (`kill_on_drop`), leaving no orphaned empty window.
     async fn unless_quit<F: Future>(&self, f: F) -> Option<F::Output> {
         let mut quit = self.quit.subscribe();
         tokio::select! {
-            biased; // 已经在退出时，即使 f 也就绪了也放弃
+            biased; // already exiting: give up even if f is ready too
             _ = quit.wait_for(|q| *q) => None,
             r = f => Some(r),
         }
     }
 
-    /// 退出的第一步，点关闭时就做（不等窗口销毁、`RunEvent::Exit`）：叫停起播中的 `play`，
-    /// 让正在播的 mpv 立刻退出；它的回传任务留给 [`App::shutdown`] 去等。可重复调用。
+    /// First exit step, run as soon as close is clicked (before window teardown and `RunEvent::Exit`): stops
+    /// starting `play` calls and tells mpv to quit; [`App::shutdown`] waits for the reports. Repeatable.
     fn begin_shutdown(&self) {
         self.quit.send_replace(true);
-        if let Some(task) = self.stop_player() {
+        if self.stop_player() {
             log::info!("程序退出，先关闭播放器并回传进度");
-            lock(&self.closing).push(task);
         }
     }
 
-    /// 程序退出前调用：mpv 是独立进程，不会跟着 EmbyMini 退出，而回传进度的任务会随进程消失，
-    /// 续播点就丢了。所以先叫停起播中的 `play` 并等它们返回（否则可能刚起播完又登记一个播放器），
-    /// 再让正在播的 mpv 退出、等回传 Stopped。总共最多等 `wait`。
+    /// Call before exiting: mpv is a separate process that outlives us, while the report tasks die with us and the
+    /// resume point is lost. So stop starting `play` calls and wait for them (or one may register a player right
+    /// after), then quit mpv and wait for the Stopped reports. Waits `wait` at most in total.
     fn shutdown(&self, wait: Duration) {
-        exit_start();
         self.begin_shutdown();
         tauri::async_runtime::block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
@@ -170,7 +188,7 @@ impl App {
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            self.begin_shutdown(); // 等的这段时间里刚起播完登记的播放器
+            self.begin_shutdown(); // a player registered while we waited
             let tasks = std::mem::take(&mut *lock(&self.closing));
             for task in tasks {
                 if tokio::time::timeout_at(deadline, task).await.is_err() {
@@ -639,7 +657,7 @@ async fn play(
     let _starting = Starting::enter(&app.starting);
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let _ = app.stop_player(); // switching titles: the old mpv quits and reports on its own, no need to wait
+    app.stop_player(); // switching titles: the old mpv quits and reports on its own; only exit waits for it
     let (preload_percent, volume, dm) = {
         let c = app.cfg();
         (f64::from(c.preload_percent), c.volume, c.danmaku.clone())
@@ -685,10 +703,11 @@ async fn play(
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     tauri::async_runtime::spawn(session.run(ctl_rx, ev_tx));
-    let task = tauri::async_runtime::spawn(forward_events(handle, ev_rx));
+    let task = tauri::async_runtime::spawn(forward_events(handle, seq, ev_rx));
     // Just in case another player got registered meanwhile: close it rather than leave an orphaned mpv
-    if let Some(old) = lock(&app.player).replace(Player { ctl: ctl_tx, task }) {
-        let _ = old.ctl.send(player::Ctl::Quit);
+    let old = lock(&app.player).replace(Player { ctl: ctl_tx, task });
+    if let Some(old) = old {
+        app.retire(old);
     }
     Ok(())
 }
@@ -697,14 +716,13 @@ async fn play(
 /// drops its sender then), so waiting on it at exit also waits for the reports and the saved volume.
 async fn forward_events(
     handle: tauri::AppHandle,
+    seq: u64,
     mut events: mpsc::UnboundedReceiver<player::Event>,
 ) {
     while let Some(ev) = events.recv().await {
         let app = handle.state::<App>();
         match ev {
-            player::Event::Ended { volume: Some(v) } => {
-                app.remember(|c| c.volume = Some(v));
-            }
+            player::Event::Ended { volume: Some(v) } => app.save_volume(seq, v),
             // Danmaku panel changes only go to the config; the UI does not need them
             player::Event::DanmakuStyle { style } => {
                 app.remember(|c| c.danmaku.style = style);
@@ -723,7 +741,7 @@ async fn forward_events(
 }
 
 fn main() {
-    // panic 写进日志，再交给默认处理
+    // Log panics, then hand them to the default hook
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error!("程序出错（panic）：{info}");
@@ -739,23 +757,7 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
-        .plugin(
-            // 默认 40 KB 就整个删掉重来，排查要的记录留不住：放到 2 MB，轮换时留最近 3 份；时间用本地时间
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .max_file_size(2_000_000)
-                .rotation_strategy(RotationStrategy::KeepSome(3))
-                .timezone_strategy(TimezoneStrategy::UseLocal)
-                .clear_targets()
-                .targets([
-                    Target::new(TargetKind::Stdout),
-                    Target::new(TargetKind::Folder {
-                        path: root.join("logs"),
-                        file_name: None,
-                    }),
-                ])
-                .build(),
-        )
+        .plugin(log_plugin(root.join("logs")))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .register_asynchronous_uri_scheme_protocol(images::SCHEME, |ctx, req, responder| {
@@ -765,91 +767,7 @@ fn main() {
                 responder.respond(serve_image(&handle, &path).await);
             });
         })
-        .setup(move |app| {
-            let p = app.path();
-            let old = [
-                p.app_config_dir()?,
-                p.app_local_data_dir()?,
-                p.app_cache_dir()?,
-            ];
-            match config::migrate(&root, &old[0], &old) {
-                Ok(true) => log::info!("已把旧版本的配置搬到数据目录"),
-                Ok(false) => {}
-                Err(e) => log::warn!("搬旧版本的配置失败：{e}"),
-            }
-            // WebView2 的数据（含图片磁盘缓存）默认在 %LOCALAPPDATA%，只能在建窗口时改，所以主窗口在这里建
-            let win = app
-                .config()
-                .app
-                .windows
-                .first()
-                .cloned()
-                .ok_or("缺少主窗口配置")?;
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &win)?
-                .data_directory(root.join("webview"))
-                .build()?;
-            let path = root.join("config.json");
-            let cfg = config::load(&path)
-                .map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
-            config::save(&path, &cfg)?; // 首次启动把生成的 device_id 落盘
-            if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
-                log::warn!("上次没有正常退出（版本 {v}）");
-            }
-            set_running(&root, true);
-            // shortcut: 旧版本诊断数据留下的暂存与标记（暂存最多约 20 MB），用户大多升过几版后去掉
-            let old = root.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                for f in ["telemetry", "last-exit.json", "running.json"] {
-                    remove_path(&old.join(f));
-                }
-            });
-            let mpv_dir = app
-                .path()
-                .resource_dir()
-                .ok()
-                .and_then(|d| player::bundled_dir(&d));
-            // CI 冒烟测试按这一行判断安装后的路径是否正确（不能带 \\?\ 前缀），改措辞要同步改 windows.yml
-            log::info!(
-                "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
-                emby::VERSION,
-                root.display(),
-                mpv_dir
-                    .as_deref()
-                    .map_or("（无）".into(), |d| d.display().to_string())
-            );
-            let mpv_cache = Some(root.join("mpv-cache"));
-            let http = emby::http_client()?;
-            let images =
-                images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
-            images.start();
-            let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
-            // The installer may still be running right after an update: wait before deleting its leftovers.
-            tauri::async_runtime::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let _ = tauri::async_runtime::spawn_blocking(|| {
-                    for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
-                        remove_path(&p);
-                    }
-                })
-                .await;
-            });
-            app.manage(App {
-                path,
-                cfg: Mutex::new(cfg),
-                http,
-                images,
-                stream,
-                danmaku_dir: root.join("cache").join("danmaku"),
-                mpv_dir,
-                mpv_cache,
-                player: Mutex::new(None),
-                play_seq: AtomicU64::new(0),
-                quit: watch::Sender::new(false),
-                starting: AtomicUsize::new(0),
-                closing: Mutex::new(Vec::new()),
-            });
-            Ok(())
-        })
+        .setup(move |app| setup(app, &root))
         .invoke_handler(tauri::generate_handler![
             config_get,
             server_add,
@@ -868,40 +786,173 @@ fn main() {
         ])
         .build(ctx)
         .unwrap_or_else(|e| panic!("EmbyMini 启动失败：{e}"))
-        .run(move |handle, ev| match ev {
-            // 点关闭：先藏窗口、让 mpv 退出，再走销毁窗口、等回传这些慢的步骤，用户看到的是立刻关掉
-            tauri::RunEvent::WindowEvent {
-                label,
-                event: tauri::WindowEvent::CloseRequested { .. },
-                ..
-            } if label == "main" => {
-                exit_start();
-                exit_mark("close_requested");
-                if let Some(w) = handle.get_webview_window("main") {
-                    let _ = w.hide();
-                }
-                exit_mark("hidden");
-                handle.state::<App>().begin_shutdown();
-                exit_mark("mpv_quit_sent");
+        .run(move |handle, ev| on_run_event(handle, &ev, &exit_root));
+}
+
+/// The default 40 KB limit deletes the whole log and starts over, losing what troubleshooting needs:
+/// 2 MB, keep the last 3 on rotation, local time.
+fn log_plugin<R: tauri::Runtime>(dir: PathBuf) -> tauri::plugin::TauriPlugin<R> {
+    tauri_plugin_log::Builder::new()
+        .level(log::LevelFilter::Info)
+        .max_file_size(2_000_000)
+        .rotation_strategy(RotationStrategy::KeepSome(3))
+        .timezone_strategy(TimezoneStrategy::UseLocal)
+        .clear_targets()
+        .targets([
+            Target::new(TargetKind::Stdout),
+            Target::new(TargetKind::Folder {
+                path: dir,
+                file_name: None,
+            }),
+        ])
+        .build()
+}
+
+/// Startup: move old config, build the main window, load the config, start the caches and register [`App`].
+fn setup(app: &mut tauri::App, root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let p = app.path();
+    let old = [
+        p.app_config_dir()?,
+        p.app_local_data_dir()?,
+        p.app_cache_dir()?,
+    ];
+    match config::migrate(root, &old[0], &old) {
+        Ok(true) => log::info!("已把旧版本的配置搬到数据目录"),
+        Ok(false) => {}
+        Err(e) => log::warn!("搬旧版本的配置失败：{e}"),
+    }
+    // WebView2 data (including its image disk cache) defaults to %LOCALAPPDATA% and can only be moved when
+    // the window is built, so the main window is built here
+    let win = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or("缺少主窗口配置")?;
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &win)?
+        .data_directory(root.join("webview"))
+        .build()?;
+    let path = root.join("config.json");
+    let cfg =
+        config::load(&path).map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
+    config::save(&path, &cfg)?; // first start: persist the generated device_id
+    if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
+        log::warn!("上次没有正常退出（版本 {v}）");
+    }
+    set_running(root, true);
+    let mpv_dir = app
+        .path()
+        .resource_dir()
+        .ok()
+        .and_then(|d| player::bundled_dir(&d));
+    // The CI smoke test checks the installed paths with this line (no \\?\ prefix): rewording it means updating windows.yml
+    log::info!(
+        "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
+        emby::VERSION,
+        root.display(),
+        mpv_dir
+            .as_deref()
+            .map_or("（无）".into(), |d| d.display().to_string())
+    );
+    spawn_cleanups(root.to_path_buf());
+    let http = emby::http_client()?;
+    let images = images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
+    images.start();
+    let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
+    app.manage(App {
+        path,
+        cfg: Mutex::new(cfg),
+        http,
+        images,
+        stream,
+        danmaku_dir: root.join("cache").join("danmaku"),
+        mpv_dir,
+        mpv_cache: Some(root.join("mpv-cache")),
+        player: Mutex::new(None),
+        play_seq: AtomicU64::new(0),
+        quit: watch::Sender::new(false),
+        starting: AtomicUsize::new(0),
+        closing: Mutex::new(Vec::new()),
+    });
+    Ok(())
+}
+
+/// Background deletion of leftovers from older versions and from the last update.
+fn spawn_cleanups(root: PathBuf) {
+    // shortcut: staging and markers left by the old diagnostics (staging up to ~20 MB); drop once most users have upgraded a few versions
+    tauri::async_runtime::spawn_blocking(move || {
+        for f in ["telemetry", "last-exit.json", "running.json"] {
+            remove_path(&root.join(f));
+        }
+    });
+    // The installer may still be running right after an update: wait before deleting its leftovers.
+    tauri::async_runtime::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let _ = tauri::async_runtime::spawn_blocking(|| {
+            for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
+                remove_path(&p);
             }
-            tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::Destroyed,
-                ..
-            } => exit_mark("window_destroyed"),
-            tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
-            tauri::RunEvent::Exit => {
-                exit_start();
-                exit_mark("exit");
-                handle.state::<App>().shutdown(Duration::from_secs(3));
-                set_running(&exit_root, false);
+        })
+        .await;
+    });
+}
+
+/// Close: hide the window and tell mpv to quit at once, so the user sees it close right away; the slow parts
+/// (window teardown, waiting for the reports) happen after. Each phase is logged with [`exit_mark`].
+fn on_run_event(handle: &AppHandle, ev: &tauri::RunEvent, root: &std::path::Path) {
+    match ev {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. },
+            ..
+        } if label == "main" => {
+            exit_start();
+            exit_mark("close_requested");
+            if let Some(w) = handle.get_webview_window("main") {
+                let _ = w.hide();
             }
-            _ => {}
-        });
+            exit_mark("hidden");
+            handle.state::<App>().begin_shutdown();
+            exit_mark("mpv_quit_sent");
+        }
+        tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } => exit_mark("window_destroyed"),
+        tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
+        tauri::RunEvent::Exit => {
+            exit_start();
+            exit_mark("exit");
+            handle.state::<App>().shutdown(Duration::from_secs(3));
+            set_running(root, false);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The updater calls shutdown without exiting when the installer fails: that must not start the close timer.
+    /// (No test calls `exit_start`, so the global stays unset.)
+    #[test]
+    fn shutdown_does_not_start_the_close_timer() {
+        test_app(None).shutdown(Duration::ZERO);
+        assert!(CLOSE_T0.get().is_none());
+    }
+
+    /// Only the newest play's volume is saved; a switched-away player ending late is ignored.
+    #[test]
+    fn only_the_newest_play_saves_its_volume() {
+        let app = test_app(None);
+        app.play_seq.store(2, Ordering::SeqCst);
+        app.save_volume(1, 30.0);
+        assert_eq!(app.cfg().volume, None);
+        app.save_volume(2, 40.0);
+        assert_eq!(app.cfg().volume, Some(40.0));
+    }
 
     #[test]
     fn clean_path_strips_quotes() {
@@ -1041,7 +1092,7 @@ mod tests {
             mpv_dir: None,
             mpv_cache: None,
             player: Mutex::new(player),
-            // 这些测试不取图：空路径不建目录，不在临时目录留东西
+            // these tests fetch no images: an empty path creates no dirs and leaves nothing in temp
             images: images::Images::new(PathBuf::new(), images::CAP, reqwest::Client::new()),
             stream: None,
             danmaku_dir: PathBuf::new(),
@@ -1052,7 +1103,7 @@ mod tests {
         }
     }
 
-    /// 起播中退出：起播被放弃（mpv 随之被杀），shutdown 等到 play 返回，不白等满 wait。
+    /// Exit while starting: the start is dropped (killing mpv) and shutdown waits only until play returns.
     #[test]
     fn shutdown_cancels_starting_play() {
         let app = std::sync::Arc::new(test_app(None));
@@ -1064,21 +1115,64 @@ mod tests {
         while app.starting.load(Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
+        assert_eq!(
+            tauri::async_runtime::block_on(app.unless_quit(async { 1 })),
+            Some(1)
+        );
         let t0 = std::time::Instant::now();
         app.shutdown(Duration::from_secs(3));
         assert!(t0.elapsed() < Duration::from_secs(1));
         assert_eq!(app.starting.load(Ordering::SeqCst), 0);
         assert!(tauri::async_runtime::block_on(task).unwrap().is_none());
-        // 已经在退出：再点播放直接放弃
+        // already exiting: a new play gives up at once
         let late = tauri::async_runtime::block_on(app.unless_quit(async { 1 }));
         assert_eq!(late, None);
     }
 
-    /// 退出时要等播放任务收尾（回传 Stopped），但不能无限等。
+    /// A `play` that registers its player while shutdown waits for it: shutdown quits that player too and
+    /// waits for its report, instead of leaving a running mpv behind.
+    #[test]
+    fn shutdown_quits_a_player_registered_while_waiting() {
+        let app = std::sync::Arc::new(test_app(None));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, d) = (app.clone(), done.clone());
+        let _play = tauri::async_runtime::spawn(async move {
+            let _g = Starting::enter(&a.starting);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (ctl, mut rx) = mpsc::unbounded_channel();
+            let task = tauri::async_runtime::spawn(async move {
+                assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
+                d.store(true, Ordering::SeqCst);
+            });
+            *lock(&a.player) = Some(Player { ctl, task });
+        });
+        while app.starting.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        app.shutdown(Duration::from_secs(3));
+        assert!(done.load(Ordering::SeqCst));
+        assert!(lock(&app.player).is_none());
+    }
+
+    #[test]
+    fn running_marker_holds_the_version() {
+        let dir = std::env::temp_dir().join(format!("embymini-running-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        set_running(&dir, true);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(RUNNING)).unwrap(),
+            emby::VERSION
+        );
+        set_running(&dir, false);
+        assert!(!dir.join(RUNNING).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Exit waits for the player to finish reporting Stopped, but not forever.
     #[test]
     fn shutdown_waits_for_player_then_gives_up() {
         let app = |task, ctl| test_app(Some(Player { ctl, task }));
-        // 收到 Quit 后 200ms 才收尾：shutdown 应等到它结束
+        // finishes 200 ms after Quit: shutdown waits for it
         let (tx, mut rx) = mpsc::unbounded_channel();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d = done.clone();
@@ -1090,11 +1184,51 @@ mod tests {
         app(task, tx).shutdown(Duration::from_secs(3));
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
 
-        // 卡住不收尾：最多等 wait
+        // never finishes: wait at most `wait`
         let (tx, _rx) = mpsc::unbounded_channel();
         let task = tauri::async_runtime::spawn(std::future::pending::<()>());
         let t0 = std::time::Instant::now();
         app(task, tx).shutdown(Duration::from_millis(300));
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Switching titles then quitting at once: the previous title's report is waited for too, not dropped.
+    #[test]
+    fn shutdown_waits_for_the_switched_away_player() {
+        let quit_then = |delay| {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let d = done.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
+                tokio::time::sleep(delay).await;
+                d.store(true, Ordering::SeqCst);
+            });
+            (Player { ctl: tx, task }, done)
+        };
+        let (old, old_done) = quit_then(Duration::from_millis(300));
+        let app = test_app(Some(old));
+        let _ = app.stop_player(); // what `play` does on a new click
+        let (new, _) = quit_then(Duration::ZERO);
+        *lock(&app.player) = Some(new);
+        app.shutdown(Duration::from_secs(3));
+        assert!(old_done.load(Ordering::SeqCst));
+    }
+
+    /// Finished tasks are pruned on the next switch, so the list stays as long as the players still reporting.
+    #[test]
+    fn retire_prunes_finished_tasks() {
+        let app = test_app(None);
+        let player = |task| Player {
+            ctl: mpsc::unbounded_channel().0,
+            task,
+        };
+        app.retire(player(tauri::async_runtime::spawn(async {})));
+        while !lock(&app.closing)[0].inner().is_finished() {
+            std::thread::yield_now();
+        }
+        app.retire(player(tauri::async_runtime::spawn(std::future::pending())));
+        assert_eq!(lock(&app.closing).len(), 1);
+        assert!(!lock(&app.closing)[0].inner().is_finished());
     }
 }

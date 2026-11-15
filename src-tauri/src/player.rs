@@ -1761,8 +1761,10 @@ mod tests {
         st.dm_show(0).await;
         st.dm_show(0).await; // init 只发一次
         let style = json!({ "on": true, "opacity": 5, "speed": 4 }).to_string();
-        st.on_danmaku(&json!(["embymini-danmaku-style", style]))
-            .await;
+        st.on_message(
+            json!({ "event": "client-message", "args": ["embymini-danmaku-style", style] }),
+        )
+        .await;
         st.on_danmaku(&json!(["embymini-danmaku-pick", "77", "3"]))
             .await;
         let file = dir.join("1.json");
@@ -2176,7 +2178,9 @@ mod tests {
         assert_eq!(st.pref_sub, None);
         st.on_message(json!({ "event": "file-loaded" })).await;
         st.on_message(prop("current-tracks/sub", Value::Null)).await; // unloading
-        assert_eq!(st.pref_sub, None);
+        st.on_message(prop("current-tracks/audio", Value::Null))
+            .await;
+        assert_eq!((&st.pref_sub, &st.pref_audio), (&None, &None));
         st.on_message(prop("current-tracks/audio", json!({ "lang": "eng" })))
             .await;
         st.on_message(prop("current-tracks/sub", sdh)).await;
@@ -2280,6 +2284,7 @@ mod tests {
             st.queue[1].ready.is_some(),
             "kept: the session end stops its download"
         );
+        assert_eq!(st.cur, None);
         st.jump(1).await;
         assert_eq!(st.want, Some(1));
     }

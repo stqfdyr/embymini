@@ -1,19 +1,20 @@
-<!-- 首页：轮播 → 我的媒体 → 继续观看 → 每个媒体库的最新内容。 -->
+<!-- Home: carousel → my media → continue watching → latest of each library. -->
 <script lang="ts">
   import Hero from '../lib/Hero.svelte'
   import LibraryRow from '../lib/LibraryRow.svelte'
+  import LoadError from '../lib/LoadError.svelte'
   import Row from '../lib/Row.svelte'
   import Wide from '../lib/Wide.svelte'
-  import { LIST_FIELDS, errText, get, img, loader, play, prefetch, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
+  import { LIST_FIELDS, get, img, loader, play, prefetch, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
   import { openMenu } from '../lib/menu.svelte'
   import { clock, episodeLabel } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
   import type { Page } from '../lib/types'
 
-  /** 只有这些类型的库能按「电影 / 剧集」浏览（音乐、直播、播放列表不在首页显示）。 */
+  /** Library types browsable as movies / series (music, live TV and playlists stay off the home page). */
   const BROWSABLE = new Set(['movies', 'tvshows', 'homevideos', 'boxsets', 'mixed', undefined])
 
-  // 轮播是随机取的，只在手动刷新时换；播放结束的后台刷新只更新媒体库与继续观看
+  // The carousel is random, so only a manual refresh changes it; background refreshes update the rows below
   const hero = loader(() => {
     void session.refresh
     return get<Page>(`/Users/${uid()}/Items`, { Recursive: true, IncludeItemTypes: 'Movie,Series', SortBy: 'Random', ImageTypes: 'Backdrop', Limit: 8, Fields: LIST_FIELDS })
@@ -60,7 +61,7 @@
 
   {#each d.views as v (v.Id)}<LibraryRow view={v} />{/each}
 {:else if q.error}
-  <div class="center-msg">加载失败：{errText(q.error)}</div>
+  <LoadError error={q.error} />
 {:else}
   <div class="skel-hero skeleton"></div>
   {#each { length: 2 } as _, r (r)}

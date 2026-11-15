@@ -1,5 +1,5 @@
-<!-- 竖版海报卡：评分（右下）、剧集角标（未看集数或总集数）或已看对勾（右上）、标题 + 年份。
-     右键出菜单；悬停预取详情，点进去不用等。 -->
+<!-- Poster card: rating (bottom right), series badge (unplayed or episode count) or played tick (top right), title, year.
+     Context menu on right click; hovering prefetches the detail so opening it does not wait. -->
 <script lang="ts">
   import { Check } from '@lucide/svelte'
   import { cancelPrefetch, img, itemMenu, prefetch } from './api.svelte'
@@ -36,14 +36,14 @@
     position: relative; aspect-ratio: 2 / 3; border-radius: var(--radius); overflow: hidden;
     transition: transform 0.15s var(--ease);
   }
-  /* 细描边代替投影：浅色海报边缘也清楚，滚动时不用重画阴影 */
+  /* A hairline instead of a shadow: light posters keep their edge and scrolling repaints no shadows */
   .art::after { content: ''; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 1px var(--stroke); pointer-events: none; }
   img { width: 100%; height: 100%; object-fit: cover; transition: opacity 0.25s var(--ease), transform 0.35s var(--ease); }
   .poster:hover img { transform: scale(1.04); }
   .poster:active .art { transform: scale(0.97); }
   .badge {
     position: absolute; top: 6px; right: 6px; min-width: 20px; height: 20px; padding: 0 6px;
-    border-radius: 10px; background: var(--accent); color: #fff; font-size: 11px; font-weight: 600;
+    border-radius: 10px; background: var(--accent); color: var(--accent-text); font-size: 11px; font-weight: 600;
     display: grid; place-items: center;
   }
   .score {

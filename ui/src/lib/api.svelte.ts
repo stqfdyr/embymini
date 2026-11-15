@@ -95,6 +95,7 @@ export function loader<T>(fn: () => Promise<T>, key?: () => string) {
       const snap = readSnap<T>(k)
       if (snap !== undefined) s.data = snap
     }
+    s.error = undefined // a retry shows the loading state rather than the same message until it fails again
     fn().then(
       (d) => {
         if (!alive) return
@@ -207,7 +208,8 @@ export function itemMenu(it: Item, open?: () => void): MenuItem[] {
 /**
  * Paged list (library, person's works): `more()` fetches the next page (called when the grid nears its end).
  * Starts over from page one when reactive values read in `query()` (sort, filter, id) or a manual reload change;
- * late results of older requests are dropped by generation. Call during component init.
+ * late results of older requests are dropped by generation. After a failure `more()` does nothing until `retry()`,
+ * a new query or a refresh, so the grid cannot retry in a loop. Call during component init.
  */
 export function pager(query: () => Record<string, unknown>, size = 60) {
   const s = $state({ items: [] as Item[], total: 0, busy: false, error: '', loaded: false })
@@ -216,9 +218,11 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
   /** Showing the first-page snapshot (snap.ts): the next fetch starts at 0 and replaces it. */
   let fromSnap = false
   const key = () => snapKey(`pager|${JSON.stringify(q)}`)
+  let failed = false
   async function more() {
-    if (s.busy || (s.loaded && !fromSnap && s.items.length >= s.total)) return
+    if (failed || s.busy || (s.loaded && !fromSnap && s.items.length >= s.total)) return
     s.busy = true
+    s.error = ''
     const mine = gen
     const start = fromSnap ? 0 : s.items.length
     try {
@@ -233,8 +237,10 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
       s.loaded = true
       s.error = ''
     } catch (e) {
-      // Like loader: keep showing the snapshot without an error (scrolling retries)
-      if (mine === gen && !fromSnap) s.error = errText(e)
+      if (mine !== gen) return
+      failed = true
+      // Like loader: a snapshot stays on screen without an error (F5 retries)
+      if (!fromSnap) s.error = errText(e)
     } finally {
       if (mine === gen) s.busy = false
     }
@@ -245,10 +251,12 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
     gen++
     const snap = readSnap<{ items: Item[]; total: number }>(key())
     fromSnap = !!snap
+    failed = false
     Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap })
     untrack(more)
   })
-  return { s, more }
+  const retry = () => ((failed = false), more())
+  return { s, more, retry }
 }
 
 /** Width tiers: DPR-scaled widths round up to one, so zoom levels and card sizes share cached images. */

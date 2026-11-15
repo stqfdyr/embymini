@@ -2,6 +2,7 @@
 <script lang="ts">
   import { User } from '@lucide/svelte'
   import Grid from '../lib/Grid.svelte'
+  import LoadError from '../lib/LoadError.svelte'
   import { LIST_FIELDS, errText, get, img, loader, pager, session, uid } from '../lib/api.svelte'
   import { fade } from '../lib/fade'
   import { date } from '../lib/fmt'
@@ -14,7 +15,7 @@
     void session.refresh
     return get<Item>(`/Users/${uid()}/Items/${id}`)
   }, () => `person:${id}`)
-  const { s: pg, more } = pager(() => ({
+  const { s: pg, more, retry } = pager(() => ({
     PersonIds: id, Recursive: true, IncludeItemTypes: 'Movie,Series', Fields: LIST_FIELDS,
     SortBy: 'ProductionYear,PremiereDate,SortName', SortOrder: 'Descending',
   }))
@@ -45,8 +46,8 @@
   {/if}
 
   <div class="page-title"><h2>作品</h2>{#if pg.total}<span class="muted">{pg.total} 部</span>{/if}</div>
-  {#if pg.error}<div class="center-msg">加载失败：{pg.error}</div>{/if}
   <Grid items={pg.items} onmore={more} loading={pg.busy} />
+  {#if pg.error}<LoadError error={pg.error} {retry} />{/if}
   {#if pg.loaded && !pg.items.length}<div class="center-msg">这个服务器上没有相关的电影或剧集</div>{/if}
 </div>
 

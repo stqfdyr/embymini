@@ -1,4 +1,4 @@
-<!-- 首页的「某个媒体库最新内容」一行：自己取数，刷新时保留旧内容原地更新。 -->
+<!-- A home row with one library's latest items: fetches on its own, updates in place on refresh, hidden when empty or failed. -->
 <script lang="ts">
   import Poster from './Poster.svelte'
   import Row from './Row.svelte'

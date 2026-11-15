@@ -1,4 +1,4 @@
-<!-- 横滑行：标题 + 右侧数量 / 更多；悬停时左右出箭头，一次滚一屏。 -->
+<!-- Horizontal row: title plus count / more link; hover arrows scroll one screen at a time. -->
 <script lang="ts">
   import type { Snippet } from 'svelte'
   import { ChevronLeft, ChevronRight } from '@lucide/svelte'
@@ -17,7 +17,8 @@
     update()
     const ro = new ResizeObserver(update)
     ro.observe(el)
-    // 整行快进入视口时，行里屏幕右边看不到的海报也开始加载（懒加载只管视口内的，往右滑才开始取会看到空卡）
+    // As the row nears the viewport, load its off-screen (right-hand) images too: lazy loading would leave blank cards
+    // until the row is scrolled sideways
     const io = new IntersectionObserver((es) => {
       if (!es[0].isIntersecting) return
       el.querySelectorAll<HTMLImageElement>('img[loading="lazy"]').forEach((i) => (i.loading = 'eager'))

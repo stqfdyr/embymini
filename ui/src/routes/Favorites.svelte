@@ -1,7 +1,8 @@
-<!-- 收藏：电影与剧集。 -->
+<!-- Favorites: movies and series. -->
 <script lang="ts">
   import Grid from '../lib/Grid.svelte'
-  import { LIST_FIELDS, errText, get, loader, session, uid } from '../lib/api.svelte'
+  import LoadError from '../lib/LoadError.svelte'
+  import { LIST_FIELDS, get, loader, session, uid } from '../lib/api.svelte'
   import { restoreScrollWhen } from '../lib/router.svelte'
   import type { Page } from '../lib/types'
 
@@ -17,7 +18,7 @@
   {#if q.data}
     {#if q.data.Items.length}<Grid items={q.data.Items} />{:else}<div class="center-msg">还没有收藏。在详情页点 ♡，或在海报上右键 →「收藏」</div>{/if}
   {:else if q.error}
-    <div class="center-msg">加载失败：{errText(q.error)}</div>
+    <LoadError error={q.error} />
   {:else}
     <Grid items={[]} loading />
   {/if}

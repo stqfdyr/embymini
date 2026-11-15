@@ -661,9 +661,16 @@ mod tests {
     fn route(path: &str) -> (&'static str, String) {
         let ok = |v: Value| ("200 OK", v.to_string());
         let comments = |m: &str| ok(json!({"comments":[{"p":"1.5,1,16777215","m":m}]}));
-        let gone = || ("404 Not Found", json!({"success":false,"errorMessage":"没有这一集"}).to_string());
+        let gone = || {
+            (
+                "404 Not Found",
+                json!({"success":false,"errorMessage":"没有这一集"}).to_string(),
+            )
+        };
         match path.trim_start_matches("/x/tok/api/v2/") {
-            "match" => ok(json!({"matches":[{"episodeId":101,"animeTitle":"某剧","episodeTitle":"第3集"}]})),
+            "match" => ok(
+                json!({"matches":[{"episodeId":101,"animeTitle":"某剧","episodeTitle":"第3集"}]}),
+            ),
             "bangumi/7" => ok(json!({"bangumi":{"animeTitle":"某剧","episodes":[
                 {"episodeId":1,"episodeTitle":"第1集"},{"episodeId":2},{"episodeId":3,"episodeTitle":"第3集"}]}})),
             "comment/101" => match MODE.load(Ordering::SeqCst) {
@@ -699,11 +706,17 @@ mod tests {
         let list = |l: &Loaded| serde_json::from_str::<Value>(&l.list).unwrap()[0][3].clone();
 
         let l = load(&api, &dir, &auto).await.unwrap().unwrap();
-        assert_eq!((l.title.as_str(), l.manual, l.stale), ("某剧 第3集", false, false));
+        assert_eq!(
+            (l.title.as_str(), l.manual, l.stale),
+            ("某剧 第3集", false, false)
+        );
         assert_eq!(list(&l), "好");
         let cached = dir.join(format!("{}-101.json", crate::config::server_tag(&api.base)));
         assert!(cached.is_file());
-        assert!(!old.exists() && recent.exists(), "a successful fetch prunes week-old files only");
+        assert!(
+            !old.exists() && recent.exists(),
+            "a successful fetch prunes week-old files only"
+        );
 
         let n = heads.lock().unwrap().len();
         assert!(load(&api, &dir, &auto).await.unwrap().is_some());

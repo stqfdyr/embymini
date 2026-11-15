@@ -647,6 +647,7 @@ impl Session {
             dead: None,
             told: false,
             init: false,
+            seq: 0,
         });
         set_up(&mut st, at).await;
 
@@ -792,11 +793,15 @@ struct Dm {
     told: bool,
     /// 已把设置发给脚本。
     init: bool,
+    /// Bumped by every load meant for the script; a result from an older one is dropped, so a slow
+    /// auto match finishing after a manual pick cannot replace it (the script only checks the item).
+    seq: u64,
 }
 
 /// 后台弹幕任务的结果。
 enum DmMsg {
-    Loaded(usize, Result<Option<danmaku::Loaded>, DmFail>),
+    /// (episode index, [`Dm::seq`] of the load, result).
+    Loaded(usize, u64, Result<Option<danmaku::Loaded>, DmFail>),
     /// 回给脚本的消息（名字, JSON）：搜索结果、集列表。
     Reply(&'static str, Value),
 }
@@ -1344,7 +1349,7 @@ impl State {
 
     /// 在后台取第 i 集的弹幕；`deliver` = 取完交给脚本（当前集），否则只是预取进缓存（下一集）。
     fn dm_fetch(&mut self, i: usize, deliver: bool) {
-        let Some(d) = &self.dm else { return };
+        let Some(d) = &mut self.dm else { return };
         let Some(api) = d.ctx.api.clone() else { return };
         let item = &self.queue[i].item;
         let want = danmaku::Want {
@@ -1358,11 +1363,13 @@ impl State {
                 .cloned(),
         };
         let (dir, tx) = (d.ctx.dir.clone(), d.tx.clone());
+        d.seq += u64::from(deliver);
+        let seq = d.seq;
         tokio::spawn(async move {
             let r = danmaku::load(&api, &dir, &want).await;
             match (deliver, r) {
                 (true, r) => {
-                    let _ = tx.send(DmMsg::Loaded(i, r));
+                    let _ = tx.send(DmMsg::Loaded(i, seq, r));
                 }
                 (false, Err(e)) => log::info!("预取下一集弹幕没成：{e}"),
                 (false, Ok(_)) => {}
@@ -1407,15 +1414,15 @@ impl State {
     }
 
     async fn on_dm_result(&mut self, m: DmMsg) {
-        let (i, r) = match m {
+        let (i, seq, r) = match m {
             DmMsg::Reply(name, v) => return self.dm_send(name, v).await,
-            DmMsg::Loaded(i, r) => (i, r),
+            DmMsg::Loaded(i, seq, r) => (i, seq, r),
         };
-        if self.cur != Some(i) {
-            return; // 已经换集了
-        }
         let item = self.queue[i].item.id.clone();
         let Some(d) = &mut self.dm else { return };
+        if self.cur != Some(i) || seq != d.seq {
+            return; // moved to another episode, or a newer load for this one is under way
+        }
         // 没匹配上、取不到时提示一次（之后的集只在面板里显示），地址不对时也只提示一次
         let toast = !std::mem::replace(&mut d.told, true);
         let status = match r {
@@ -1819,6 +1826,7 @@ mod tests {
             dead: None,
             told: false,
             init: false,
+            seq: 0,
         });
         st.cur = Some(0);
         st.dm_show(0).await;
@@ -1838,9 +1846,9 @@ mod tests {
             manual: true,
             stale: false,
         };
-        st.on_dm_result(DmMsg::Loaded(1, Ok(None))).await; // 不是当前集：丢掉
-        st.on_dm_result(DmMsg::Loaded(0, Ok(Some(loaded)))).await;
-        st.on_dm_result(DmMsg::Loaded(0, Err(DmFail::Setup("地址不对".into()))))
+        st.on_dm_result(DmMsg::Loaded(1, 0, Ok(None))).await; // 不是当前集：丢掉
+        st.on_dm_result(DmMsg::Loaded(0, 0, Ok(Some(loaded)))).await;
+        st.on_dm_result(DmMsg::Loaded(0, 0, Err(DmFail::Setup("地址不对".into()))))
             .await;
         assert!(!st.dm_ready());
         st.dm_settings(None, vec!["剧透".into()]).await; // 设置页改了屏蔽词：重新下发
@@ -1889,6 +1897,51 @@ mod tests {
             (Some("setup"), Some(true))
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A slow auto match finishing after a manual pick (or a reload) must not replace the newer result.
+    #[tokio::test]
+    async fn danmaku_drops_superseded_loads() {
+        let (st_port, _) = emby::tests::fake(|_| ("404 Not Found", "{}".into())).await;
+        let (mut st, mpv, _ev) = offline_state(1);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        st.dm = Some(Dm {
+            ctx: danmaku::Ctx {
+                api: danmaku::Api::new(
+                    emby::http_client().unwrap(),
+                    &format!("http://127.0.0.1:{st_port}"),
+                ),
+                dir: std::env::temp_dir().join(format!("embymini-dm-seq-{}", std::process::id())),
+                cfg: danmaku::Config::default(),
+            },
+            tx,
+            shown: None,
+            dead: None,
+            told: false,
+            init: true,
+            seq: 0,
+        });
+        st.cur = Some(0);
+        st.dm_load(0).await;
+        st.on_danmaku(&json!(["embymini-danmaku-reload"])).await;
+        let loaded = |title: &str| danmaku::Loaded {
+            list: "[]".into(),
+            title: title.into(),
+            manual: false,
+            stale: false,
+        };
+        st.on_dm_result(DmMsg::Loaded(0, 1, Ok(Some(loaded("old")))))
+            .await;
+        st.on_dm_result(DmMsg::Loaded(0, 2, Ok(Some(loaded("new")))))
+            .await;
+        let loads: Vec<Value> = commands(st, mpv)
+            .await
+            .into_iter()
+            .filter(|c| c[2] == "load")
+            .map(|c| serde_json::from_str(c[3].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(loads.len(), 1, "{loads:?}");
+        assert_eq!(loads[0]["title"], "new");
     }
 
     /// Every loadfile command the State wrote to mpv: (url, mode).

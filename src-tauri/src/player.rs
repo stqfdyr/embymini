@@ -160,6 +160,7 @@ pub enum Event {
         pick: danmaku::Pick,
     },
 }
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Track {
     /// The server gave none: mpv picks by slang / alang.
@@ -513,13 +514,14 @@ pub async fn start(
 ) -> Result<Session, Error> {
     let ipc = ipc_path();
     let mut child = spawn_mpv(&opts, &ipc.0)?;
-    let (queue, io) = tokio::join!(
+    // try_join: the first failure ends the start (mpv gone need not wait on a slow upstream, nor the reverse)
+    let r = tokio::try_join!(
         build_queue(&emby, item_id, source, from_start),
         connect(&ipc.0, &mut child)
     );
-    let ((queue, at), io) = match (queue, io) {
-        (Ok(q), Ok(io)) => (q, io),
-        (Err(e), _) | (_, Err(e)) => {
+    let ((queue, at), io) = match r {
+        Ok(r) => r,
+        Err(e) => {
             let _ = child.kill().await;
             return Err(e);
         }
@@ -651,6 +653,7 @@ impl Session {
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut speed = tokio::time::interval(SPEED_EVERY);
+        speed.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut line = Vec::new();
         let mut ctl_open = true;
         let mut quit_sent = false;
@@ -775,6 +778,7 @@ fn crash_message(item: &Item, status: &std::io::Result<ExitStatus>) -> Option<St
         code.map_or("无".into(), |c| c.to_string())
     ))
 }
+
 /// 弹幕的会话状态。
 struct Dm {
     ctx: danmaku::Ctx,
@@ -2298,7 +2302,15 @@ mod tests {
             emby,
             queue,
             at: 0,
-            child: tokio::process::Command::new("true").spawn().unwrap(),
+            // A child that exits at once; Windows has no `true`
+            child: if cfg!(windows) {
+                tokio::process::Command::new("cmd")
+                    .args(["/C", "exit"])
+                    .spawn()
+            } else {
+                tokio::process::Command::new("true").spawn()
+            }
+            .unwrap(),
             io: Box::new(ours),
             ipc: IpcPath(std::env::temp_dir().join("embymini-fake-session.sock")),
             preload: 80.0,
@@ -2340,11 +2352,13 @@ mod tests {
             .unwrap();
         let start = json!({ "event": "start-file", "playlist_entry_id": 1 });
         wr.write_all(format!("{start}\n").as_bytes()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await; // both lines handled before the quit
-        let _ = ctl.send(Ctl::Quit); // fails when the session is already gone; the assert below says so
+        // start-file's episode list reaching mpv proves the bad line before it was handled; only then ask to quit
         let got_quit = tokio::time::timeout(Duration::from_secs(2), async {
             while let Ok(Some(l)) = lines.next_line().await {
-                if serde_json::from_str::<Value>(&l).unwrap()["command"] == json!(["quit"]) {
+                let cmd = serde_json::from_str::<Value>(&l).unwrap()["command"].take();
+                if cmd[2] == "episodes" {
+                    ctl.send(Ctl::Quit).unwrap();
+                } else if cmd == json!(["quit"]) {
                     return true;
                 }
             }

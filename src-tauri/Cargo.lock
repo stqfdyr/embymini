@@ -1016,6 +1016,7 @@ version = "0.4.0"
 dependencies = [
  "bytes",
  "dunce",
+ "httpdate",
  "hyper",
  "hyper-util",
  "image",

@@ -22,6 +22,8 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt"
 dunce = "1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
+# Retry-After as an HTTP date; already in the tree via hyper
+httpdate = "1"
 tauri-plugin-updater = "2"
 sysinfo = { version = "0.38", default-features = false, features = ["disk"] }
 # Local caching proxy (stream.rs): already in the tree via reqwest, only the server side is enabled

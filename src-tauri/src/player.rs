@@ -3089,7 +3089,8 @@ mod tests {
     fn lua_harness(harness: &str, script: &str) {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mpv = test_mpv(&dir.join("mpv"));
-        let log = std::env::temp_dir().join(format!("{harness}-{}.log", std::process::id()));
+        let log =
+            std::env::temp_dir().join(format!("embymini-{harness}-{}.log", std::process::id()));
         let mut child = std::process::Command::new(&mpv)
             .args([
                 "--no-config",

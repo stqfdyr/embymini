@@ -1013,11 +1013,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let target = dir.join("target");
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("big"), vec![0u8; 4096]).unwrap();
+        std::fs::write(target.join("big"), vec![0u8; 5000]).unwrap();
         let link = dir.join("thumbfast.out");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(path_size(&link) < 4096);
-        assert_eq!(path_size(&target), 4096);
+        assert!(path_size(&link) < 5000);
+        assert_eq!(path_size(&target), 5000);
         remove_path(&link);
         assert!(!link.exists() && target.join("big").exists());
         remove_path(&target);

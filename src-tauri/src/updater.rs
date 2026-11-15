@@ -198,4 +198,25 @@ mod tests {
         );
         assert_eq!(reason(&U::EmptyEndpoints), U::EmptyEndpoints.to_string());
     }
+
+    /// Connection failures get the Emby wording; a bad reply or a bad request keeps reqwest's text.
+    #[tokio::test]
+    async fn reqwest_errors_worded_by_kind() {
+        use tauri_plugin_updater::Error as U;
+        let (port, _) = crate::emby::tests::fake(|_| ("200 OK", "<html>".into())).await;
+        let c = reqwest::Client::new();
+        let decode = c
+            .get(format!("http://127.0.0.1:{port}/latest.json"))
+            .send()
+            .await
+            .unwrap();
+        let decode = decode.json::<serde_json::Value>().await.unwrap_err();
+        let text = decode.to_string();
+        assert_eq!(reason(&U::Reqwest(decode)), text);
+        let bad = c.get("not a url").send().await.unwrap_err();
+        let text = bad.to_string();
+        assert_eq!(reason(&U::Reqwest(bad)), text);
+        let refused = c.get("http://127.0.0.1:1/").send().await.unwrap_err();
+        assert!(reason(&U::Reqwest(refused)).starts_with("连不上服务器"));
+    }
 }

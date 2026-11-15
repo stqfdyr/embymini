@@ -1,11 +1,14 @@
-//! mpv 外部进程 + JSON IPC：同季连播、按进度预加载下一集、外挂字幕与默认轨、Emby 进度回传。
+//! mpv as an external process driven over JSON IPC: whole-season playback, preloading the next episode, external
+//! subtitles and default tracks, and Emby progress reports.
 //!
-//! 一次播放 = 一个 [`Session`]：启动 mpv 的同时建队列、准备首集，连上 IPC 后由 [`Session::run`]
-//! 在一个循环里处理 mpv 事件。网络请求不进这个循环：进度回传交给回传任务（[`spawn_reporter`]），
-//! 下一集的 PlaybackInfo 在后台取（[`State::prepare_later`]），上游再慢，按键和退出也照常响应。
-//! 队列是整季，自然往后播靠「到预加载进度才追加下一集」，手动上一集 / 下一集 / 选集由 EmbyMini 处理
-//! （见 [`State::jump`]）。换集时沿用上一集选的音轨、字幕。
-//! 视频和字幕经本地缓存代理（[`crate::stream`]）读：交给 mpv 时才登记（[`State::load`]），换集时只留当前集和下一集的缓存。
+//! One playback is one [`Session`]: mpv starts while the queue is built and the first episode prepared; once IPC is
+//! connected, [`Session::run`] handles mpv events in a single loop. Network requests stay out of that loop: reports
+//! go through the report task ([`spawn_reporter`]) and other episodes' PlaybackInfo is fetched in the background
+//! ([`State::prepare_later`]), so keys and quit respond however slow the upstream is.
+//! The queue is the whole season. Playing on appends the next episode once the preload progress is reached;
+//! previous / next / episode picks are handled here ([`State::jump`]). Audio and subtitle choices carry over.
+//! Video and subtitles are read through the local cache proxy ([`crate::stream`]): registered when handed to mpv
+//! ([`State::load`]); on an episode change only the current and next episode keep their cache.
 
 use crate::danmaku::{self, Fail as DmFail};
 use crate::emby::{self, Emby, Error, Item, MediaStream, NO_QUERY};
@@ -16,6 +19,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, WriteHalf};
@@ -23,51 +27,59 @@ use tokio::process::Child;
 use tokio::sync::mpsc;
 
 const TICKS_PER_SEC: f64 = 10_000_000.0;
+/// Progress report interval (Emby's own web client also reports about every 10 s).
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
-/// mpv 里「上一集 / 下一集」按钮和按键发出的消息（见 mpv/input.conf、mpv/script-opts/modernz.conf）。
+/// How often the upstream download speed goes to the OSC top bar ([`SPEED_MSG`]).
+const SPEED_EVERY: Duration = Duration::from_secs(1);
+/// Sent by mpv's previous / next buttons and keys (see mpv/input.conf, mpv/script-opts/modernz.conf).
 const NEXT_MSG: &str = "embymini-next";
 const PREV_MSG: &str = "embymini-prev";
-/// 选集菜单（mpv/scripts/embymini.lua）选中某一集，参数是队列下标。
+/// The episode menu (mpv/scripts/embymini.lua) picked an episode; the argument is its queue index.
 const JUMP_MSG: &str = "embymini-jump";
-/// 发给 ModernZ：下一集是否已在 mpv 列表里（`yes` / `no`），是的话下一集按钮变绿带闪电（mpv/scripts/modernz.lua）。
+/// To ModernZ: whether the next episode is already in mpv's playlist (`yes` / `no`); if so the next button turns
+/// green with a bolt (mpv/scripts/modernz.lua).
 const NEXT_READY_MSG: &str = "embymini-next-ready";
-/// 发给 ModernZ：上游下载速度（字节 / 秒），顶栏网速显示它。经缓存代理时 mpv 自己的读取速度是本机磁盘的速度，不是网速。
+/// To ModernZ: upstream download speed in bytes/s for the top bar. Through the cache proxy mpv's own read rate is
+/// the local disk's, not the network's.
 const SPEED_MSG: &str = "embymini-speed";
-/// 弹幕脚本（mpv/scripts/danmaku.lua）发来的消息前缀：`style`、`search`、`episodes`、`pick`、`reload`，见 [`State::on_danmaku`]。
+/// Prefix of messages from the danmaku script (mpv/scripts/danmaku.lua): `style`, `search`, `episodes`, `pick`,
+/// `reload`; see [`State::on_danmaku`].
 const DM_MSG: &str = "embymini-danmaku-";
 
-/// 资源目录里自带的 mpv 配置目录（`<资源>/mpv`），不存在返回 None。
+/// The bundled mpv config directory (`<resources>/mpv`), or None if it is missing.
 ///
-/// Windows 上 Tauri 的资源目录来自 `canonicalize(当前 exe)`，带 `\\?\` 前缀（逐字路径）。
-/// mpv 用 `/` 拼配置文件名（`…\mpv/mpv.conf`），再原样交给 CreateFileW；逐字路径里 `/` 不算分隔符，
-/// 结果 mpv.conf、scripts、fonts 一个都读不到，ModernZ 不加载，只剩 mpv 自带的控制条。
-/// 所以先用 dunce 去掉前缀。测试 `bundled_config_loads` 在 Windows CI 上验证这一点。
+/// On Windows Tauri's resource dir comes from `canonicalize(current exe)` and carries the `\\?\` verbatim prefix.
+/// mpv joins config file names with `/` (`…\mpv/mpv.conf`) and hands that to CreateFileW as is; in a verbatim path
+/// `/` is not a separator, so mpv.conf, scripts and fonts all fail to load and only mpv's own OSC is left.
+/// dunce strips the prefix; `bundled_config_loads` checks this on Windows CI.
 pub fn bundled_dir(resource_dir: &Path) -> Option<PathBuf> {
     Some(dunce::simplified(resource_dir).join("mpv")).filter(|d| d.is_dir())
 }
 
 pub struct Options {
     pub mpv: PathBuf,
-    /// 自带配置目录（ModernZ、mpv.conf、input.conf），作为 `--config-dir`。
+    /// Bundled config directory (ModernZ, mpv.conf, input.conf), passed as `--config-dir`.
     pub config_dir: Option<PathBuf>,
     pub preload_percent: f64,
-    /// 上次退出时的音量（每次播放都是新的 mpv 进程，不传就回到 100）。
+    /// Volume at the last exit (each playback is a new mpv process, which would otherwise start at 100).
     pub volume: Option<f64>,
-    /// mpv 运行时自己写的文件（显卡着色器缓存等）放这里。不指定的话，即使给了 `--config-dir`，
-    /// mpv 也会写到它自己的 `%LOCALAPPDATA%\mpv\cache`，卸载 EmbyMini 时清不掉。
+    /// Where mpv writes its own files (GPU shader cache etc.). Without it mpv writes to its own
+    /// `%LOCALAPPDATA%\mpv\cache` even with `--config-dir`, which uninstalling EmbyMini cannot clean up.
     pub cache_dir: Option<PathBuf>,
-    /// 个人 mpv 配置（存在才加载）：在自带配置之后读，同名选项以它为准；放在数据目录，升级不覆盖。
+    /// Personal mpv config, loaded if it exists: read after the bundled one so its options win; it lives in the
+    /// data directory so updates leave it alone.
     pub user_conf: Option<PathBuf>,
-    /// 本地缓存代理；没有（起不来）时 mpv 直连上游、token 经请求头带。
+    /// Local cache proxy; without it (it failed to start) mpv reads upstream directly with the token in a header.
     pub stream: Option<Stream>,
-    /// 弹幕（数据在这里取，渲染在 mpv 脚本里）；None = 不加载弹幕脚本的数据。
+    /// Danmaku data source (rendering is the mpv script's job); None = no danmaku data for the script.
     pub danmaku: Option<danmaku::Ctx>,
+    /// Appended to mpv's arguments last (tests use it to run headless).
     pub extra_args: Vec<String>,
 }
 
-/// mpv 的启动参数。顺序有讲究：自带配置（`--config-dir`）→ 个人配置（`--include`，覆盖自带的）→
-/// EmbyMini 记住的音量、缓存目录 → EmbyMini 必须控制的项（IPC、UA、窗口、空闲退出，个人配置改不掉），
-/// 最后是调用方附加的参数。
+/// mpv's command line, in this order: bundled config (`--config-dir`) → personal config (`--include`, overrides the
+/// bundled one) → remembered volume and cache dirs → what EmbyMini must control (IPC, UA, window, idle exit; the
+/// personal config cannot change these) → the caller's extra arguments.
 fn mpv_args(opts: &Options, ipc: &Path) -> Vec<String> {
     let mut args = Vec::new();
     if let Some(dir) = &opts.config_dir {
@@ -84,8 +96,8 @@ fn mpv_args(opts: &Options, ipc: &Path) -> Vec<String> {
             args.push(format!("--{opt}={}", dir.display()));
         }
     }
-    // 进度条预览（thumbfast）要另起一个 mpv，Windows 上它只会去 PATH 里找，找不到自带的这个。
-    // `-append` 只加一项、不按逗号拆，路径里有逗号也没事
+    // Seek bar previews (thumbfast) start a second mpv, which on Windows is only looked up in PATH.
+    // `-append` adds one entry without splitting on commas, so a comma in the path is fine
     args.push(format!(
         "--script-opts-append=thumbfast-mpv_path={}",
         opts.mpv.display()
@@ -97,18 +109,21 @@ fn mpv_args(opts: &Options, ipc: &Path) -> Vec<String> {
     args
 }
 
+/// Commands from the app to a running session.
 pub enum Ctl {
     Quit,
-    /// 设置页改了弹幕接口地址或屏蔽词：正在播放时马上生效（「重新加载」就用新地址）。
+    /// The danmaku API address or block words changed in settings: applies at once ("reload" uses the new address).
     Danmaku {
         api: Option<danmaku::Api>,
         words: Vec<String>,
     },
+    /// Tests: a raw command for mpv.
     #[cfg(test)]
     Mpv(Value),
 }
 
-/// 发给前端的播放事件。
+/// Playback events for the frontend. The UI acts only on `failed` and `ended`; `started`, `preloaded` and
+/// `stopped` are the milestones tests wait on (they mirror the Sessions reports and cost one small message each).
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(
     tag = "type",
@@ -126,26 +141,25 @@ pub enum Event {
         item_id: String,
         position_ticks: i64,
     },
-    /// 加载失败（mpv 打不开文件）。message 是给用户看的中文原因。
+    /// An episode failed to load or broke off; `message` is the reason shown to the user.
     Failed {
         item_id: String,
         message: String,
     },
-    /// 整个播放会话结束；volume 是退出时的音量，下次起播沿用。
+    /// The whole playback session is over; `volume` is the volume at exit, reused next time.
     Ended {
         volume: Option<f64>,
     },
-    /// 弹幕面板里改了显示设置，存进配置。
+    /// Danmaku display settings changed in the panel; saved to the config.
     DanmakuStyle {
         style: danmaku::Style,
     },
-    /// 手动匹配了弹幕，存进配置（键见 [`danmaku::key`]）。
+    /// A manual danmaku match; saved to the config (key: [`danmaku::key`]).
     DanmakuPick {
         key: String,
         pick: danmaku::Pick,
     },
 }
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Track {
     /// The server gave none: mpv picks by slang / alang.
@@ -318,11 +332,11 @@ struct Sub {
     lang: String,
 }
 
-/// 一集的播放参数（来自 PlaybackInfo）。
+/// Playback parameters of one episode (from PlaybackInfo).
 struct Ready {
-    /// 上游直链（不带 token）；交给 mpv 时换成缓存代理的本地地址。
+    /// Upstream direct URL (no token); swapped for the cache proxy's local URL when handed to mpv.
     url: String,
-    /// 缓存目录名：上游 + 条目 + 版本，同一个文件每次都一样（下次打开直接用上次的缓存）。
+    /// Cache directory name: upstream + item + version, the same every time (the next playback reuses the cache).
     name: String,
     source_id: String,
     session_id: Option<String>,
@@ -359,7 +373,7 @@ fn ready(emby: &Emby, item: &Item, info: emby::PlaybackInfo) -> Result<Ready, Er
         .into_iter()
         .map(|s| Sub {
             url: emby.subtitle_url(&item.id, &src, s),
-            // 以视频的缓存名开头：retain 掉视频时它的字幕登记一起清掉
+            // Prefixed with the video's cache name: retaining away the video drops its subtitles' registrations too
             file: format!(
                 "{name}_{}.{}",
                 s.index,
@@ -385,54 +399,63 @@ fn ready(emby: &Emby, item: &Item, info: emby::PlaybackInfo) -> Result<Ready, Er
     })
 }
 
-/// 缓存里的文件名：各段只留字母、数字和 `-`（id 里别的字符换成 `-`），用 `_` 连起来。
+/// Cache file name: each part keeps ASCII letters, digits and `-` (anything else becomes `-`), joined with `_`.
 fn cache_name(parts: &[&str]) -> String {
     parts
         .iter()
-        .map(|p| {
-            p.chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect::<String>()
-        })
+        .map(|p| p.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"))
         .collect::<Vec<_>>()
         .join("_")
 }
 
+/// One episode in the queue.
 struct Entry {
     item: Item,
+    /// Where to start, in seconds (the resume point; only the episode playback started from has one).
     start: f64,
     ready: Option<Ready>,
-    /// 已经 loadfile 进 mpv 播放列表。
+    /// Already loadfile'd into mpv's playlist.
     loaded: bool,
-    /// 准备失败过（不在每次进度更新时重试，手动切下一集时会再试）。
+    /// Preparing it failed (not retried on every progress update; switching to it by hand retries).
     failed: bool,
     entry_id: Option<i64>,
     started: bool,
     stopped: bool,
-    /// 正在后台预加载（避免每次进度更新都再发一次）。
+    /// Being prepared in the background (so progress updates do not ask again).
     preparing: bool,
 }
 
-/// 后台准备好一集之后要做什么。
+impl Entry {
+    fn new(item: Item) -> Self {
+        Self {
+            item,
+            start: 0.0,
+            ready: None,
+            loaded: false,
+            failed: false,
+            entry_id: None,
+            started: false,
+            stopped: false,
+            preparing: false,
+        }
+    }
+}
+
+/// What to do once an episode has been prepared in the background.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum After {
-    /// 预加载：追加到 mpv 列表末尾（仍在播上一集时才追加）。
+    /// Preload: append it to mpv's playlist (only if the previous episode is still playing).
     Append,
-    /// 用户要切过去（上一集 / 下一集 / 选集）：替换列表立即播放。
+    /// The user switched to it (previous / next / episode menu): replace the playlist and play it now.
     Play,
 }
 
-/// 后台准备的结果：(队列下标, 之后做什么, PlaybackInfo 结果)。
+/// A background preparation's result: (queue index, what to do next, PlaybackInfo result).
 type Prepared = (usize, After, Result<Ready, Error>);
 
-/// 回传任务：按顺序发 Sessions 请求。放在单独的任务里，上游慢的时候（实测 API 偶尔要 15–30 秒）
-/// 不会卡住 mpv 事件处理，也不会让 Stopped 跑到 Playing 前面。积压时只保留最新的一条 Progress。
+/// The report task: sends Sessions requests in order. In its own task so a slow upstream (the API sometimes takes
+/// 15–30 s) never stalls mpv event handling, and Stopped never overtakes Playing. When backed up, only the newest
+/// Progress is kept.
 fn spawn_reporter(
     emby: Emby,
 ) -> (
@@ -443,9 +466,9 @@ fn spawn_reporter(
     let task = tokio::spawn(async move {
         while let Some((path, body)) = rx.recv().await {
             if path.ends_with("/Progress") && !rx.is_empty() {
-                continue; // 后面还有更新的进度或 Stopped，这条已经过时
+                continue; // a newer Progress or a Stopped is queued behind it, so this one is stale
             }
-            let _ = emby.call(Method::POST, &path, NO_QUERY, Some(&body)).await; // 失败在 call 里记日志
+            let _ = emby.call(Method::POST, &path, NO_QUERY, Some(&body)).await; // `call` logs failures
         }
     });
     (tx, task)
@@ -454,21 +477,33 @@ fn spawn_reporter(
 trait Io: AsyncRead + AsyncWrite + Unpin + Send + Sync {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + Sync> Io for T {}
 
+/// The IPC endpoint's path. On Unix mpv creates a socket file there that stays behind when mpv is killed, so it is
+/// removed once the session (or an abandoned start) lets go of it; Windows named pipes leave nothing behind.
+struct IpcPath(PathBuf);
+
+impl Drop for IpcPath {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 pub struct Session {
     emby: Emby,
     queue: Vec<Entry>,
-    /// 起播的那一集在队列里的下标。
+    /// Queue index of the episode playback started from.
     at: usize,
     child: Child,
     io: Box<dyn Io>,
-    ipc: PathBuf,
+    ipc: IpcPath,
     preload: f64,
     stream: Option<Stream>,
     danmaku: Option<danmaku::Ctx>,
 }
 
-/// 启动 mpv（窗口立刻出来），同时建队列（剧集 = 本集所在整季）、准备首集，再连上 IPC。出错直接返回给界面。
-/// `source`：首集用哪个版本（详情页选的）；之后自动切的集用服务器默认的。
+/// Starts mpv (its window shows at once) while building the queue and preparing the first episode, then connects
+/// to its IPC. Errors go straight back to the UI. `source`: the version picked on the detail page, for the first
+/// episode only; later episodes play the server's default.
 pub async fn start(
     emby: Emby,
     item_id: &str,
@@ -477,70 +512,11 @@ pub async fn start(
     opts: Options,
 ) -> Result<Session, Error> {
     let ipc = ipc_path();
-    let args = mpv_args(&opts, &ipc);
-    // 参数里只有路径和开关，没有 token（token 在缓存代理里，没有代理时经 IPC 设置），可以整串记日志
-    log::info!("启动 mpv：{} {}", opts.mpv.display(), args.join(" "));
-    let mut cmd = tokio::process::Command::new(&opts.mpv);
-    // 播放直连，不走代理：mpv（ffmpeg）只认这类环境变量，用户的终端或代理软件可能设过
-    for k in [
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-    ] {
-        cmd.env_remove(k);
-    }
-    // 起播途中放弃（程序退出、出错）时丢掉 Child 就杀掉 mpv，不留空窗口
-    cmd.kill_on_drop(true)
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::Other(format!("无法启动 mpv（{}）：{e}", opts.mpv.display())))?;
-
-    let queue = async {
-        // 条目和 PlaybackInfo 只依赖 id，并行取；单集列表要等条目里的剧 / 季 id
-        let (item, info) =
-            tokio::try_join!(emby.item(item_id), emby.playback_info(item_id, source))?;
-        let first = ready(&emby, &item, info)?;
-        let mut items = Vec::new();
-        if let (true, Some(series), Some(season)) =
-            (item.kind == "Episode", &item.series_id, &item.season_id)
-        {
-            items = emby.episodes(series, season).await?;
-        }
-        let at = match items.iter().position(|e| e.id == item.id) {
-            Some(at) => at,
-            None => {
-                items = vec![item.clone()];
-                0
-            }
-        };
-        let mut queue: Vec<Entry> = items
-            .into_iter()
-            .map(|item| Entry {
-                item,
-                start: 0.0,
-                ready: None,
-                loaded: false,
-                failed: false,
-                entry_id: None,
-                started: false,
-                stopped: false,
-                preparing: false,
-            })
-            .collect();
-        queue[at].ready = Some(first);
-        if !from_start {
-            queue[at].start = item.user_data.playback_position_ticks as f64 / TICKS_PER_SEC;
-        }
-        Ok::<_, Error>((queue, at))
-    };
-    let (queue, io) = tokio::join!(queue, connect(&ipc, &mut child));
+    let mut child = spawn_mpv(&opts, &ipc.0)?;
+    let (queue, io) = tokio::join!(
+        build_queue(&emby, item_id, source, from_start),
+        connect(&ipc.0, &mut child)
+    );
     let ((queue, at), io) = match (queue, io) {
         (Ok(q), Ok(io)) => (q, io),
         (Err(e), _) | (_, Err(e)) => {
@@ -567,12 +543,75 @@ pub async fn start(
     })
 }
 
+fn spawn_mpv(opts: &Options, ipc: &Path) -> Result<Child, Error> {
+    let args = mpv_args(opts, ipc);
+    // Only paths and switches, never the token (it lives in the cache proxy, or goes over IPC), so log it whole
+    log::info!("启动 mpv：{} {}", opts.mpv.display(), args.join(" "));
+    let mut cmd = tokio::process::Command::new(&opts.mpv);
+    // Playback never goes through a proxy: mpv (ffmpeg) only honours these variables, which a terminal or proxy
+    // tool may have set
+    for k in [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ] {
+        cmd.env_remove(k);
+    }
+    // Dropping the Child (start abandoned on exit or error) kills mpv, leaving no empty window behind
+    cmd.kill_on_drop(true)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.spawn()
+        .map_err(|e| Error::Other(format!("无法启动 mpv（{}）：{e}", opts.mpv.display())))
+}
+
+/// The play queue and the index of `item_id` in it: an episode brings its whole season (alone if the season list
+/// fails), anything else plays alone. The first entry is prepared here (with `source`) and resumes unless
+/// `from_start`.
+async fn build_queue(
+    emby: &Emby,
+    item_id: &str,
+    source: Option<&str>,
+    from_start: bool,
+) -> Result<(Vec<Entry>, usize), Error> {
+    // The item and its PlaybackInfo need only the id, so fetch both at once; the season list needs the item
+    let (item, info) = tokio::try_join!(emby.item(item_id), emby.playback_info(item_id, source))?;
+    let first = ready(emby, &item, info)?;
+    let mut items = Vec::new();
+    if let (true, Some(series), Some(season)) =
+        (item.kind == "Episode", &item.series_id, &item.season_id)
+    {
+        // Without the list only the rest of the season is lost, so play this episode anyway
+        items = emby.episodes(series, season).await.unwrap_or_else(|e| {
+            log::warn!("取整季单集失败，只播这一集：{e}");
+            Vec::new()
+        });
+    }
+    let at = items
+        .iter()
+        .position(|e| e.id == item.id)
+        .unwrap_or_else(|| {
+            items = vec![item.clone()];
+            0
+        });
+    let mut queue: Vec<Entry> = items.into_iter().map(Entry::new).collect();
+    queue[at].ready = Some(first);
+    if !from_start {
+        queue[at].start = item.user_data.playback_position_ticks as f64 / TICKS_PER_SEC;
+    }
+    Ok((queue, at))
+}
+
 impl Session {
-    /// 不播了（起播期间用户又点了别的）：直接结束 mpv。还没开始播，不用回传。
+    /// Not playing after all (the user picked something else while this started): just end mpv. Nothing played,
+    /// so nothing to report.
     pub async fn abort(mut self) {
         let _ = self.child.kill().await;
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(&self.ipc);
     }
 
     pub async fn run(
@@ -584,15 +623,15 @@ impl Session {
             emby,
             queue,
             at,
-            mut child,
+            child,
             io,
-            ipc,
+            ipc: _ipc, // removed when the session ends
             preload,
             stream,
             danmaku,
         } = self;
         let (rd, wr) = tokio::io::split(io);
-        let mut lines = BufReader::new(rd).lines();
+        let mut rd = BufReader::new(rd);
         let (reports, reporter) = spawn_reporter(emby.clone());
         let (prepared, mut prepared_rx) = mpsc::unbounded_channel();
         let (dm_tx, mut dm_rx) = mpsc::unbounded_channel();
@@ -607,47 +646,27 @@ impl Session {
             told: false,
             init: false,
         });
-
-        // 没有缓存代理时 mpv 直连上游：token 走请求头，不进 URL（见 emby::strip_key）；要在第一次 loadfile 之前设好
-        if st.stream.is_none() {
-            let header = st.emby.token_header();
-            st.send(json!([
-                "change-list",
-                "http-header-fields",
-                "append",
-                header
-            ]))
-            .await;
-        }
-        for (id, name) in [
-            "time-pos",
-            "duration",
-            "pause",
-            "volume",
-            "current-tracks/audio",
-            "current-tracks/sub",
-            "sid",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            st.send(json!(["observe_property", id + 1, name])).await;
-        }
-        st.load(at, "append-play").await;
+        set_up(&mut st, at).await;
 
         let mut tick = tokio::time::interval(PROGRESS_EVERY);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut second = tokio::time::interval(Duration::from_secs(1));
+        let mut speed = tokio::time::interval(SPEED_EVERY);
+        let mut line = Vec::new();
         let mut ctl_open = true;
         let mut quit_sent = false;
         loop {
             tokio::select! {
-                line = lines.next_line() => match line {
-                    Ok(Some(l)) => match serde_json::from_str::<Value>(&l) {
+                // read_until is cancel safe: a partly read line stays in `line` for the next round
+                n = rd.read_until(b'\n', &mut line) => {
+                    if !matches!(n, Ok(1..)) {
+                        break; // mpv exited and closed the pipe
+                    }
+                    // mpv may send invalid UTF-8 (odd file tags, file names); one bad string must not end the session
+                    match serde_json::from_str::<Value>(&String::from_utf8_lossy(&line)) {
                         Ok(v) => st.on_message(v).await,
                         Err(e) => log::warn!("mpv IPC 消息解析失败：{e}"),
-                    },
-                    _ => break, // mpv 退出，管道关闭
+                    }
+                    line.clear();
                 },
                 c = ctl.recv(), if ctl_open => match c {
                     Some(Ctl::Quit) => { log::info!("关闭播放器"); quit_sent = true; st.send(json!(["quit"])).await; }
@@ -659,60 +678,103 @@ impl Session {
                 Some((i, after, r)) = prepared_rx.recv() => st.on_prepared(i, after, r).await,
                 Some(m) = dm_rx.recv() => st.on_dm_result(m).await,
                 _ = tick.tick() => st.progress("TimeUpdate"),
-                _ = second.tick(), if st.stream.is_some() => st.send_speed().await,
+                _ = speed.tick(), if st.stream.is_some() => st.send_speed().await,
             }
         }
-        if let Some(i) = st.cur {
-            st.stop(i); // mpv 被直接关掉、没来得及发 end-file 时补发
-        }
-        let status = child.wait().await;
-        crate::exit_mark("mpv_exited");
-        if let Some(s) = &st.stream {
-            let names: Vec<String> = st
-                .queue
-                .iter()
-                .filter_map(|e| e.ready.as_ref().map(|r| r.name.clone()))
-                .collect();
-            s.idle(&names);
-        }
-        let code = status.as_ref().ok().and_then(|s| s.code());
-        // 一集都没播起来 mpv 就异常退出（显卡初始化失败、崩溃），又不是我们叫它退的：告诉界面，不能悄无声息
-        if !quit_sent
-            && !st.failed_sent
-            && !status.as_ref().is_ok_and(|s| s.success())
-            && !st.queue.iter().any(|e| e.started)
-        {
-            let e = &st.queue[at];
-            let message = format!(
-                "无法播放「{}」：播放器意外退出（退出码 {}），启动参数见日志",
-                title(&e.item),
-                code.map_or("无".into(), |c| c.to_string())
-            );
+        finish(st, child, reporter, at, quit_sent).await;
+    }
+}
+
+/// First commands to a fresh mpv: the auth header when there is no cache proxy, the observed properties, then the
+/// first episode.
+async fn set_up(st: &mut State, at: usize) {
+    // Without the cache proxy mpv reads upstream directly: the token goes in a header, never in the URL
+    // (see emby::strip_key), and must be set before the first loadfile
+    if st.stream.is_none() {
+        let header = st.emby.token_header();
+        st.send(json!([
+            "change-list",
+            "http-header-fields",
+            "append",
+            header
+        ]))
+        .await;
+    }
+    for (id, name) in [
+        "time-pos",
+        "duration",
+        "pause",
+        "volume",
+        "current-tracks/audio",
+        "current-tracks/sub",
+        "sid",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        st.send(json!(["observe_property", id + 1, name])).await;
+    }
+    st.load(at, "append-play").await;
+}
+
+/// After mpv's pipe closed: report the last stop, wait for mpv, release the cache, tell the UI about a crash, then
+/// drain the reports and send `Ended` last (closing the app waits on that to know the reports went out).
+async fn finish(
+    mut st: State,
+    mut child: Child,
+    reporter: tokio::task::JoinHandle<()>,
+    at: usize,
+    quit_sent: bool,
+) {
+    if let Some(i) = st.cur {
+        st.stop(i); // mpv was closed before it could send end-file
+    }
+    let status = child.wait().await;
+    crate::exit_mark("mpv_exited");
+    if let Some(s) = &st.stream {
+        let names: Vec<String> = st
+            .queue
+            .iter()
+            .filter_map(|e| e.ready.as_ref().map(|r| r.name.clone()))
+            .collect();
+        s.idle(&names);
+    }
+    // mpv died before anything played (GPU init failure, crash) and we did not ask it to quit: never fail silently
+    if !quit_sent && !st.failed_sent && !st.queue.iter().any(|e| e.started) {
+        let e = &st.queue[at];
+        if let Some(message) = crash_message(&e.item, &status) {
             log::warn!("{message}（条目 {}）", e.item.id);
             let _ = st.events.send(Event::Failed {
                 item_id: e.item.id.clone(),
                 message,
             });
         }
-        #[cfg(unix)]
-        let _ = std::fs::remove_file(&ipc);
-        #[cfg(not(unix))]
-        let _ = ipc;
-        // 等回传队列发完再报「结束」：程序退出时也靠这一步保证 Stopped 发出去
-        let State {
-            events,
-            volume,
-            reports,
-            ..
-        } = st;
-        drop(reports);
-        let _ = reporter.await;
-        crate::exit_mark("reported");
-        log::info!("播放结束");
-        let _ = events.send(Event::Ended { volume });
     }
+    let State {
+        events,
+        volume,
+        reports,
+        ..
+    } = st;
+    drop(reports);
+    let _ = reporter.await;
+    crate::exit_mark("reported");
+    log::info!("播放结束");
+    let _ = events.send(Event::Ended { volume });
 }
 
+/// The user-facing message for mpv exiting on its own with `status`; None for a clean exit.
+fn crash_message(item: &Item, status: &std::io::Result<ExitStatus>) -> Option<String> {
+    if status.as_ref().is_ok_and(ExitStatus::success) {
+        return None;
+    }
+    let code = status.as_ref().ok().and_then(ExitStatus::code);
+    Some(format!(
+        "无法播放「{}」：播放器意外退出（退出码 {}），启动参数见日志",
+        title(item),
+        code.map_or("无".into(), |c| c.to_string())
+    ))
+}
 /// 弹幕的会话状态。
 struct Dm {
     ctx: danmaku::Ctx,
@@ -1468,18 +1530,18 @@ impl State {
     }
 }
 
-fn ipc_path() -> PathBuf {
+fn ipc_path() -> IpcPath {
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let name = format!(
         "embymini-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    if cfg!(windows) {
+    IpcPath(if cfg!(windows) {
         PathBuf::from(format!(r"\\.\pipe\{name}"))
     } else {
         std::env::temp_dir().join(format!("{name}.sock"))
-    }
+    })
 }
 
 #[cfg(windows)]
@@ -1494,7 +1556,7 @@ async fn open(path: &Path) -> std::io::Result<Box<dyn Io>> {
     Ok(Box::new(tokio::net::UnixStream::connect(path).await?))
 }
 
-/// mpv 启动后才创建 IPC 端点，轮询等它出现（最多 10 秒）。
+/// mpv creates its IPC endpoint only once it is up: poll for it for up to 10 s, giving up early if mpv exits.
 async fn connect(path: &Path, child: &mut Child) -> Result<Box<dyn Io>, Error> {
     for _ in 0..100 {
         if let Ok(io) = open(path).await {
@@ -1507,7 +1569,6 @@ async fn connect(path: &Path, child: &mut Child) -> Result<Box<dyn Io>, Error> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let _ = child.kill().await;
     Err(Error::Other("连接 mpv 超时".into()))
 }
 
@@ -1689,19 +1750,11 @@ mod tests {
         let (rep_tx, _) = mpsc::unbounded_channel();
         let (prep_tx, _) = mpsc::unbounded_channel();
         let queue = (0..n)
-            .map(|k| Entry {
-                item: Item {
+            .map(|k| {
+                Entry::new(Item {
                     id: format!("e{k}"),
                     ..Default::default()
-                },
-                start: 0.0,
-                ready: None,
-                loaded: false,
-                failed: false,
-                entry_id: None,
-                started: false,
-                stopped: false,
-                preparing: false,
+                })
             })
             .collect();
         let st = State::new(
@@ -1944,21 +1997,7 @@ mod tests {
         });
         let server = emby::tests::server_at("http://127.0.0.1", port);
         let emby = Emby::new(emby::http_client().unwrap(), &server, "dev");
-        let (st, _, _) = offline_state(2);
-        let mut queue = st.queue;
-        queue[0].ready = Some(ready_for("e0"));
-        let (ours, theirs) = tokio::io::duplex(1 << 16);
-        let session = Session {
-            emby,
-            queue,
-            at: 0,
-            child: tokio::process::Command::new("true").spawn().unwrap(),
-            io: Box::new(ours),
-            ipc: std::env::temp_dir().join("embymini-slow-test.sock"),
-            preload: 80.0,
-            stream: None,
-            danmaku: None,
-        };
+        let (session, theirs) = fake_session(emby);
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let run = tokio::spawn(session.run(ctl_rx, ev_tx));
@@ -1966,15 +2005,8 @@ mod tests {
         // Fake mpv: answers loadfile, reports start, and progress at 95% triggers a preload (to the stuck upstream)
         let (rd, mut wr) = tokio::io::split(theirs);
         let mut lines = BufReader::new(rd).lines();
+        answer_loadfile(&mut lines, &mut wr).await;
         let mut say = async |v: Value| wr.write_all(format!("{v}\n").as_bytes()).await.unwrap();
-        loop {
-            let v: Value =
-                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-            if v["command"][0] == "loadfile" {
-                say(json!({ "request_id": v["request_id"], "error": "success", "data": { "playlist_entry_id": 1 } })).await;
-                break;
-            }
-        }
         say(json!({ "event": "start-file", "playlist_entry_id": 1 })).await;
         say(json!({ "event": "property-change", "name": "duration", "data": 100.0 })).await;
         say(json!({ "event": "property-change", "name": "time-pos", "data": 95.0 })).await;
@@ -2001,6 +2033,174 @@ mod tests {
             .expect("会话没有结束")
             .unwrap();
         assert!(matches!(ev_rx.recv().await, Some(Event::Ended { .. })));
+    }
+
+    /// The queue: an episode brings its season, resuming the episode played; an episode missing from the list, or a
+    /// season list that fails to load, plays alone; anything else plays alone; the item itself failing is an error.
+    #[tokio::test]
+    async fn queue_from_the_season() {
+        let (port, _) = emby::tests::fake(|path| {
+            let ep = |id: &str, series: &str| {
+                format!(
+                    r#"{{"Id":"{id}","Type":"Episode","SeriesId":"{series}","SeasonId":"ss","UserData":{{"PlaybackPositionTicks":25000000}}}}"#
+                )
+            };
+            match path {
+                p if p.ends_with("/playbackinfo") => (
+                    "200 OK",
+                    include_str!("../testdata/playbackinfo.json").into(),
+                ),
+                "/emby/users/uid/items/e2" => ("200 OK", ep("e2", "s")),
+                "/emby/users/uid/items/e9" => ("200 OK", ep("e9", "s")),
+                "/emby/users/uid/items/x" => ("200 OK", ep("x", "bad")),
+                "/emby/users/uid/items/m" => ("200 OK", r#"{"Id":"m","Type":"Movie"}"#.into()),
+                "/emby/shows/s/episodes" => (
+                    "200 OK",
+                    format!(r#"{{"Items":[{},{},{}]}}"#, ep("e1", "s"), ep("e2", "s"), ep("e3", "s")),
+                ),
+                _ => ("500 Internal Server Error", String::new()),
+            }
+        })
+        .await;
+        let emby = emby::tests::local(port);
+        let ids = |q: &[Entry]| {
+            q.iter()
+                .map(|e| e.item.id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let (q, at) = build_queue(&emby, "e2", None, false).await.unwrap();
+        assert_eq!((ids(&q).as_str(), at), ("e1,e2,e3", 1));
+        assert!(
+            (q[1].start - 2.5).abs() < 1e-9,
+            "resume point {}",
+            q[1].start
+        );
+        assert_eq!(
+            q.iter().map(|e| e.ready.is_some()).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        let (q, _) = build_queue(&emby, "e2", None, true).await.unwrap();
+        assert!(
+            q[1].start.abs() < 1e-9,
+            "from the start, got {}",
+            q[1].start
+        );
+
+        for id in ["e9", "x", "m"] {
+            let (q, at) = build_queue(&emby, id, None, false).await.unwrap();
+            assert_eq!((ids(&q).as_str(), at), (id, 0));
+            assert!(q[0].ready.is_some());
+        }
+        assert!(build_queue(&emby, "gone", None, false).await.is_err());
+    }
+
+    /// mpv exiting on its own: a clean exit says nothing; an exit code or a signal (no code) is shown to the user.
+    #[cfg(unix)]
+    #[test]
+    fn crash_messages() {
+        use std::os::unix::process::ExitStatusExt;
+        let item = Item {
+            name: "片名".into(),
+            ..Default::default()
+        };
+        let msg = |raw| crash_message(&item, &Ok(ExitStatus::from_raw(raw)));
+        assert_eq!(msg(0), None);
+        assert_eq!(
+            msg(1 << 8).as_deref(),
+            Some("无法播放「片名」：播放器意外退出（退出码 1），启动参数见日志")
+        );
+        assert!(msg(9).unwrap().contains("退出码 无"), "killed by a signal");
+        let gone = crash_message(&item, &Err(std::io::Error::other("wait failed")));
+        assert!(gone.unwrap().contains("退出码 无"));
+    }
+
+    /// The Unix IPC socket file goes away with its path, also when a start is abandoned.
+    #[cfg(unix)]
+    #[test]
+    fn ipc_socket_removed_on_drop() {
+        let ipc = ipc_path();
+        let file = ipc.0.clone();
+        std::fs::write(&file, "").unwrap();
+        drop(ipc);
+        assert!(!file.exists());
+    }
+
+    /// A two-episode session on the first episode, talking to a fake mpv (the returned end) and a dummy child.
+    fn fake_session(emby: Emby) -> (Session, tokio::io::DuplexStream) {
+        let (st, _, _) = offline_state(2);
+        let mut queue = st.queue;
+        queue[0].ready = Some(ready_for("e0"));
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let session = Session {
+            emby,
+            queue,
+            at: 0,
+            child: tokio::process::Command::new("true").spawn().unwrap(),
+            io: Box::new(ours),
+            ipc: IpcPath(std::env::temp_dir().join("embymini-fake-session.sock")),
+            preload: 80.0,
+            stream: None,
+            danmaku: None,
+        };
+        (session, theirs)
+    }
+
+    /// Fake mpv: reads commands until the first loadfile and answers it with entry id 1.
+    async fn answer_loadfile(
+        lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        wr: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    ) {
+        loop {
+            let v: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            if v["command"][0] == "loadfile" {
+                let r = json!({ "request_id": v["request_id"], "error": "success", "data": { "playlist_entry_id": 1 } });
+                wr.write_all(format!("{r}\n").as_bytes()).await.unwrap();
+                return;
+            }
+        }
+    }
+
+    /// mpv may send invalid UTF-8 (its IPC docs say so: odd file tags, non-UTF-8 file names); one such line must not
+    /// end the session, or keys and quit would stop working while mpv plays on.
+    #[tokio::test]
+    async fn invalid_utf8_from_mpv_keeps_the_session() {
+        let (session, theirs) = fake_session(crate::emby::tests::client());
+        let (ctl, ctl_rx) = mpsc::unbounded_channel();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn(session.run(ctl_rx, ev_tx));
+        let (rd, mut wr) = tokio::io::split(theirs);
+        let mut lines = BufReader::new(rd).lines();
+        answer_loadfile(&mut lines, &mut wr).await;
+        wr.write_all(b"{\"event\":\"property-change\",\"name\":\"current-tracks/audio\",\"data\":{\"title\":\"\xc4\xe3\"}}\n")
+            .await
+            .unwrap();
+        let start = json!({ "event": "start-file", "playlist_entry_id": 1 });
+        wr.write_all(format!("{start}\n").as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // both lines handled before the quit
+        let _ = ctl.send(Ctl::Quit); // fails when the session is already gone; the assert below says so
+        let got_quit = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Ok(Some(l)) = lines.next_line().await {
+                if serde_json::from_str::<Value>(&l).unwrap()["command"] == json!(["quit"]) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert_eq!(got_quit, Ok(true), "a non-UTF-8 line ended the session");
+        drop((lines, wr));
+        run.await.unwrap();
+        let mut got = Vec::new();
+        while let Some(e) = ev_rx.recv().await {
+            got.push(e);
+        }
+        assert!(
+            matches!(got.last(), Some(Event::Ended { .. })),
+            "session ended without Ended: {got:?}"
+        );
     }
 
     /// When mpv plays a finished episode again (playlist loop), the second time reports start and stop too.
@@ -2364,20 +2564,20 @@ mod tests {
         );
     }
 
-    /// 跑一次自带 mpv 的检查结果。
+    /// What one run of mpv with the bundled config showed.
     #[derive(Debug, PartialEq)]
     struct MpvRun {
         config: bool,
         modernz: bool,
         thumbfast: bool,
         builtin_osc: bool,
-        /// mpv 日志里的错误行（`[e]`），Windows 上应为空（配置写错、选项不存在都会出现在这里）。
+        /// Error lines (`[e]`) from mpv's log; should be none on Windows (bad config lines and unknown options land here).
         errors: Vec<String>,
     }
 
     fn bundled_mpv_run(config_dir: &Path) -> MpvRun {
         let exe = if cfg!(windows) {
-            config_dir.join("mpv.exe") // CI 在 cargo test 之前已把 mpv.exe 下载到 src-tauri/mpv/
+            config_dir.join("mpv.exe") // CI downloads mpv.exe into src-tauri/mpv/ before cargo test
         } else {
             PathBuf::from("mpv")
         };
@@ -2405,14 +2605,14 @@ mod tests {
         }
     }
 
-    /// 个人配置要覆盖自带配置，EmbyMini 必须控制的项（如 UA）又不能被它改掉。走真实的 [`mpv_args`]。
+    /// The personal config overrides the bundled one, but cannot change what EmbyMini controls (such as the UA). Uses the real [`mpv_args`].
     #[test]
     #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
     fn user_conf_overrides_bundled() {
         let dir = std::env::temp_dir().join(format!("embymini-user-conf-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("mpv.conf");
-        // 自带配置是 1GiB；个人配置改成 123MiB，同时试图改 UA
+        // The bundled config says 1GiB; the personal one says 123MiB and also tries to change the UA
         std::fs::write(&conf, "demuxer-max-bytes=123MiB\nuser-agent=Other/1.0\n").unwrap();
         let bundled =
             dunce::simplified(&std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap())
@@ -2447,7 +2647,7 @@ mod tests {
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(status.success(), "{text}");
-        // 取展开后的那行（日志开头还会原样记一遍命令行，那行里是 `${…}`）
+        // The expanded line (the log also records the raw command line first, still with `${…}`)
         let line = text
             .lines()
             .find(|l| l.contains("EMBYMINI-CHECK") && !l.contains("${"))
@@ -2460,7 +2660,7 @@ mod tests {
         assert!(line.contains(emby::UA), "UA 被个人配置改掉了：{line}");
     }
 
-    /// 把自带配置目录整个复制到 `to`（模拟装在别的路径下）。
+    /// Copies the bundled config directory to `to` (as if installed elsewhere).
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for e in std::fs::read_dir(from).unwrap() {
@@ -2474,8 +2674,8 @@ mod tests {
         }
     }
 
-    /// 安装后的真实路径链：资源目录（Windows 上带 `\\?\`）→ bundled_dir → mpv 读到自带配置、加载 ModernZ、
-    /// 不加载自带 OSC、配置没有报错（d3d11-adapter 在没有 N 卡的机器上必报错，除外）。另测一次装在「中文 + 空格」目录下（中文用户名时 %LOCALAPPDATA% 就是这样）。
+    /// The installed path chain: resource dir (with `\\?\` on Windows) → bundled_dir → mpv reads the bundled config, loads ModernZ,
+    /// skips the built-in OSC and reports no config errors (except d3d11-adapter on machines without an NVIDIA GPU). Also run from a directory with Chinese characters and spaces (what %LOCALAPPDATA% looks like for a Chinese user name).
     #[test]
     #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
     fn bundled_config_loads() {
@@ -2486,7 +2686,7 @@ mod tests {
                     resource.to_string_lossy().starts_with(r"\\?\"),
                     r"前提不成立：canonicalize 没加 \\?\ 前缀"
                 );
-                // 对照组：不去前缀时 mpv 的表现。只打印，不作为通过条件
+                // Control group: how mpv behaves without stripping the prefix. Printed only, not a pass condition
                 eprintln!(
                     r"  对照（带 \\?\）：{:?}",
                     bundled_mpv_run(&resource.join("mpv"))
@@ -2505,8 +2705,8 @@ mod tests {
                 "自带配置没生效：{got:?}"
             );
             if cfg!(windows) {
-                // d3d11-adapter=NVIDIA 在没有 N 卡的机器上（CI）必报错，取决于机器而不是配置写错，放过；
-                // Linux 的 mpv 没有这个选项，所以只在 Windows 上要求其余零错误
+                // d3d11-adapter=NVIDIA always errors on machines without an NVIDIA GPU (CI): the machine, not a config mistake, so let it pass;
+                // Linux mpv has no such option, so only Windows requires zero other errors
                 let errors: Vec<_> = got
                     .errors
                     .iter()
@@ -2515,7 +2715,7 @@ mod tests {
                 assert!(errors.is_empty(), "mpv 报错：{errors:#?}");
             }
         };
-        // 和 Tauri 一样用 canonicalize 得到资源目录（Windows 上会带 \\?\ 前缀）
+        // Get the resource dir via canonicalize, as Tauri does (with the \\?\ prefix on Windows)
         check(&std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap());
 
         let odd = std::env::temp_dir().join(format!("EmbyMini 测试 {}", std::process::id()));
@@ -2527,7 +2727,7 @@ mod tests {
         std::fs::remove_dir_all(&odd).unwrap();
     }
 
-    // ---- 真服端到端：无头 mpv 跑完「起播 → 到进度预加载 → 自动切下一集 → 退出」，并核对、恢复服务端观看记录 ----
+    // ---- Real-server end to end: headless mpv goes start → preload at the set progress → next episode → quit, then the server's watch state is checked and restored ----
 
     fn env(k: &str) -> String {
         std::env::var(k).unwrap_or_else(|_| panic!("缺环境变量 {k}"))
@@ -2535,12 +2735,12 @@ mod tests {
 
     async fn playable(c: &Emby, item: &Item) -> bool {
         match prepare(c, item).await {
-            Ok(r) => c.probe(&r.url).await == Some(206), // probe 带 token 请求头
+            Ok(r) => c.probe(&r.url).await == Some(206), // probe sends the token header
             Err(_) => false,
         }
     }
 
-    /// 选一集「本集与下一集都能拉流」的剧集（服务器上个别条目 PlaybackInfo 正常、直链却 403）。可用 EMBY_TEST_ITEM 指定。
+    /// Picks an episode whose stream and next episode's stream both load (some items have a working PlaybackInfo but a 403 stream). EMBY_TEST_ITEM picks one.
     async fn pick_pair(c: &Emby) -> (Item, Item) {
         let ids: Vec<String> = match std::env::var("EMBY_TEST_ITEM") {
             Ok(id) => vec![id],
@@ -2585,17 +2785,17 @@ mod tests {
         panic!("没有找到「本集与下一集都能播放」的剧集，用 EMBY_TEST_ITEM 指定");
     }
 
-    /// 把观看记录恢复成测试前的样子（只用标准接口：PlayedItems + Sessions/Playing/Stopped）。
-    /// 返回没恢复成功的原因（不在这里 panic，免得后面的条目来不及恢复）。
+    /// Puts the watch state back as before the test (standard APIs only: PlayedItems + Sessions/Playing/Stopped).
+    /// Returns why it could not (no panic here, so later items still get restored).
     async fn restore(c: &Emby, before: &Item) -> Option<String> {
         let path = format!("/Users/{}/PlayedItems/{}", c.user_id, before.id);
         if before.user_data.played {
             c.call(Method::POST, &path, NO_QUERY, None).await.unwrap();
         } else {
-            c.call(Method::DELETE, &path, NO_QUERY, None).await.unwrap(); // 同时清零进度
+            c.call(Method::DELETE, &path, NO_QUERY, None).await.unwrap(); // also clears the position
             let p = before.user_data.playback_position_ticks;
             if p > 0 {
-                // 只发 Stopped 服务端不记进度（2026-10-13 实测），要走一遍带 PlaySessionId 的 Playing → Stopped
+                // A bare Stopped does not save the position (tested 2026-10-13); it takes Playing → Stopped with a PlaySessionId
                 let r = prepare(c, before).await.unwrap();
                 let body = json!({
                     "ItemId": before.id,
@@ -2629,7 +2829,7 @@ mod tests {
         })
     }
 
-    /// 用环境变量里的账号登录真服。
+    /// Logs in to the real server with the account from the environment.
     async fn login_from_env() -> Emby {
         use crate::config::{Server, normalize};
         let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok());
@@ -2656,7 +2856,7 @@ mod tests {
         Emby::new(http, &s, "embymini-e2e")
     }
 
-    /// PATH 里的 mpv + 仓库里的自带配置。
+    /// mpv from PATH + the bundled config from the repo.
     fn test_opts(extra_args: Vec<String>) -> Options {
         Options {
             mpv: "mpv".into(),
@@ -2676,8 +2876,8 @@ mod tests {
         test_opts(base.into_iter().chain(extra.iter().cloned()).collect())
     }
 
-    /// 和正式程序一样经本地缓存代理播放（缓存放临时目录，测完删）。只缓存前方：整片模式会在测试的一两分钟里
-    /// 把整集从中继拉下来（每次几 GB 流量），整片的逻辑由 stream.rs 的单测覆盖。
+    /// Plays through the local cache proxy like the app does (cache in a temp dir, removed afterwards). Ahead-only: whole-file mode would
+    /// pull whole episodes through the relay within the test's minute or two (GBs each time); stream.rs unit tests cover that mode.
     fn proxied(opts: Options, tag: &str) -> (Options, PathBuf) {
         let dir =
             std::env::temp_dir().join(format!("embymini-e2e-cache-{tag}-{}", std::process::id()));
@@ -2686,7 +2886,7 @@ mod tests {
         (Options { stream, ..opts }, dir)
     }
 
-    /// 本进程起的、还活着的 mpv（按命令行里本进程专属的 IPC 名字找）。
+    /// mpv processes started by this process that are still alive (found by this process's own IPC name on their command line).
     #[cfg(target_os = "linux")]
     fn our_mpvs() -> usize {
         let tag = format!("embymini-{}-", std::process::id());
@@ -2698,8 +2898,8 @@ mod tests {
             .count()
     }
 
-    /// 起播途中放弃（程序退出时丢掉起播的 future）：mpv 窗口已经开着，必须随之被杀掉，不能留下空窗口。
-    /// 上游只收连接不回话，起播一直卡在取 PlaybackInfo。
+    /// Start abandoned midway (the app drops the start future on exit): mpv's window is already open and must be killed with it,
+    /// never left empty. The upstream accepts connections and never answers, so the start hangs on PlaybackInfo.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "需要 PATH 里的 mpv"]
@@ -2715,7 +2915,7 @@ mod tests {
         let server = emby::tests::server_at("http://127.0.0.1", port);
         let emby = Emby::new(emby::http_client().unwrap(), &server, "dev");
         let starting = start(emby, "1", None, false, headless(&[]));
-        // 1.5 秒后还在起播（上游不回话），这时 mpv 已经起来了；然后放弃
+        // After 1.5 s the start is still waiting on the silent upstream while mpv is up; then give up
         let r = tokio::time::timeout(Duration::from_millis(1500), async {
             let mut starting = Box::pin(starting);
             tokio::select! {
@@ -2731,7 +2931,7 @@ mod tests {
         assert_eq!(our_mpvs(), 0, "放弃起播后 mpv 应该被杀掉");
     }
 
-    /// 测试自己另开一个 IPC 连接给 mpv 发命令，返回 data。
+    /// Sends mpv a command over a separate IPC connection of the test's own and returns `data`.
     async fn mpv_cmd(ipc: &Path, cmd: Value) -> Value {
         let io = open(ipc).await.unwrap();
         let (rd, mut wr) = tokio::io::split(io);
@@ -2751,13 +2951,13 @@ mod tests {
         mpv_cmd(ipc, json!(["get_property", name])).await
     }
 
-    /// 上游坏条目（PlaybackInfo 正常、直链 403）：应收到带 403 原因的 Failed，且不回传 Stopped。
+    /// A broken upstream item (PlaybackInfo fine, stream 403): expect Failed with the 403 reason and no Stopped report.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "需要真服账号、PATH 里的 mpv，以及 EMBY_BROKEN_ITEM（一个直链 403 的条目）"]
     async fn e2e_broken_item() {
         let c = login_from_env().await;
         let id = env("EMBY_BROKEN_ITEM");
-        // 上游修好的条目一播就会改观看记录，先探测，能播就停
+        // An item fixed upstream would change its watch state once played, so probe first and stop if it plays
         assert!(
             !playable(&c, &c.item(&id).await.unwrap()).await,
             "{id} 已经能播放了（上游修好了），换一个直链 403 的条目"
@@ -2802,7 +3002,7 @@ mod tests {
         let log = std::env::temp_dir().join(format!("embymini-e2e-{}.log", std::process::id()));
         let (opts, cache) = proxied(headless(&[format!("--log-file={}", log.display())]), "real");
         let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
-        let side = session.ipc.clone(); // 测试自己另开一个 IPC 连接读 mpv 属性
+        let side = session.ipc.0.clone(); // the test's own IPC connection for reading mpv properties
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let run = tokio::spawn(session.run(ctl_rx, ev_tx));
@@ -2822,7 +3022,7 @@ mod tests {
                 item_id: ep1.id.clone()
             }
         );
-        // 用户在第 1 集关掉字幕：第 2 集应沿用
+        // The user turns subtitles off in episode 1: episode 2 should keep that
         ctl.send(Ctl::Mpv(json!(["set_property", "sid", "no"])))
             .unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2847,7 +3047,7 @@ mod tests {
             }
             e => panic!("期望 ep1 自然播完，实际 {e:?}"),
         }
-        // 播完就查（回传在单独的任务里发，等它一下）：后面「上一集」会从头再播 ep1，有的服务器会因此清掉已看
+        // Check right after it finished (reports go out from their own task, so wait a little): the later "previous" replays ep1 from the start, and some servers then clear its played state
         tokio::time::sleep(Duration::from_secs(2)).await;
         let ep1_played = c.item(&ep1.id).await.unwrap().user_data.played;
         assert_eq!(
@@ -2864,7 +3064,7 @@ mod tests {
             "第 2 集没沿用「关字幕」"
         );
 
-        // 上一集：停掉第 2 集，从头重新播第 1 集
+        // Previous: stop episode 2 and replay episode 1 from the start
         ctl.send(Ctl::Mpv(json!(["script-message", PREV_MSG])))
             .unwrap();
         assert!(matches!(next().await, Event::Stopped { ref item_id, .. } if *item_id == ep2.id));
@@ -2934,7 +3134,7 @@ mod tests {
         });
         let (opts, cache) = proxied(opts, "danmaku");
         let session = start(c.clone(), &id, None, false, opts).await.unwrap();
-        let ipc = session.ipc.clone();
+        let ipc = session.ipc.0.clone();
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let run = tokio::spawn(session.run(ctl_rx, ev_tx));
@@ -2980,9 +3180,9 @@ mod tests {
         }
     }
 
-    /// 播放界面截图 + 防泄露检查：真流程起播（有窗口），模拟常用操作并截图到 SHOT_DIR，
-    /// 同时断言 mpv 能显示出来的地址（path、播放列表、外挂字幕）里都没有 token。
-    /// 无显示器时：`Xvfb :98 -screen 0 2560x1600x24 &`，`DISPLAY=:98 MPV_EXTRA=--gpu-sw`。
+    /// Player screenshots + leak check: a real start (with a window), common actions simulated and captured to SHOT_DIR,
+    /// while asserting that no address mpv can show (path, playlist, external subtitles) contains the token.
+    /// Without a display: `Xvfb :98 -screen 0 2560x1600x24 &`, `DISPLAY=:98 MPV_EXTRA=--gpu-sw`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "需要真服账号、DISPLAY、SHOT_DIR 和 PATH 里的 mpv"]
     async fn e2e_ui_shots() {
@@ -3002,7 +3202,7 @@ mod tests {
             "shots",
         );
         let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
-        let ipc = session.ipc.clone();
+        let ipc = session.ipc.0.clone();
         let (ctl, ctl_rx) = mpsc::unbounded_channel();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let run = tokio::spawn(session.run(ctl_rx, ev_tx));
@@ -3033,10 +3233,10 @@ mod tests {
         );
         pause(1500).await;
         shot("01-start").await;
-        // 第 1 集的外挂字幕地址（换集后轨道列表就是第 2 集的了）
+        // Episode 1's external subtitle URL (after the switch the track list is episode 2's)
         let ep1_tracks = get_property(&ipc, "track-list").await;
         pause(3000).await;
-        key("RIGHT").await; // 加载后的第一次 seek：也要出进度条
+        key("RIGHT").await; // the first seek after loading must show the progress bar too
         pause(500).await;
         shot("02-first-seek").await;
         key("UP").await;
@@ -3046,7 +3246,7 @@ mod tests {
         pause(1000).await;
         shot("04-episode-menu").await;
         key("DOWN").await;
-        key("ENTER").await; // 选集菜单选下一集
+        key("ENTER").await; // pick the next episode in the episode menu
         assert!(matches!(next().await, Event::Stopped { ref item_id, .. } if *item_id == ep1.id));
         assert_eq!(
             next().await,
@@ -3087,7 +3287,7 @@ mod tests {
             bad.extend(restore(&c, b).await);
         }
         assert!(bad.is_empty(), "{bad:?}");
-        // token 本身和 api_key 参数都不能出现（断言信息里不打印 token）
+        // Neither the token nor an api_key parameter may appear (assert messages never print the token)
         let header = c.token_header();
         let token = header.trim_start_matches("X-Emby-Token: ");
         assert!(!token.is_empty());
@@ -3097,7 +3297,7 @@ mod tests {
             .filter(|v| v.contains(token) || v.contains("api_key"))
             .count();
         assert_eq!(leaked, 0, "mpv 能显示出来的地址里有 {leaked} 处带 token");
-        // 视频和外挂字幕都经缓存代理（path 在第一个；内嵌轨的 external-filename 是 null）
+        // Video and external subtitles both go through the cache proxy (path first; embedded tracks have a null external-filename)
         let direct = shown
             .iter()
             .filter_map(Value::as_str)
@@ -3123,8 +3323,8 @@ mod tests {
         eprintln!("截图在 {}；检查过的地址 {} 个", dir.display(), shown.len());
     }
 
-    /// 缓存代理验收（整片模式，真服 + 无头 mpv）：后台整片下载、拖到没缓存 / 已缓存的位置各要多久、
-    /// 关掉播放器后不再下载、重开同一集从缓存起播。会经中继下几百 MB。
+    /// Cache proxy acceptance (whole-file mode, real server + headless mpv): background whole-file download, seek time to uncached / cached
+    /// positions, no more downloading after the player closes, and reopening the same episode starts from the cache. Pulls a few hundred MB through the relay.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "需要真服账号和 PATH 里的 mpv；整片模式会下几百 MB"]
     async fn e2e_cache_proxy() {
@@ -3155,14 +3355,14 @@ mod tests {
             };
             let t0 = Instant::now();
             let session = start(c.clone(), &ep1.id, None, true, opts).await.unwrap();
-            let ipc = session.ipc.clone();
+            let ipc = session.ipc.0.clone();
             let (ctl, ctl_rx) = mpsc::unbounded_channel();
             let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
             let run = tokio::spawn(session.run(ctl_rx, ev_tx));
             assert!(matches!(ev_rx.recv().await, Some(Event::Started { .. })));
             (t0.elapsed(), ipc, ctl, ev_rx, run)
         };
-        // 拖到 at 秒，等 time-pos 走过 at 开始前进
+        // Seek to `at` seconds and wait for time-pos to move past it
         let seek = async |ipc: &Path, at: f64| {
             let t0 = Instant::now();
             mpv_cmd(ipc, json!(["seek", at, "absolute"])).await;

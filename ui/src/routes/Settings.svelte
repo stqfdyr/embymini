@@ -1,18 +1,18 @@
-<!-- 设置：服务器（添加 / 切换 / 编辑 / 重新登录 / 删除，地址与端口分开填）+ 播放（mpv 路径、预加载进度、边播边缓存、缓存管理、个人 mpv 配置的位置）
-     + 弹幕（接口地址、屏蔽词；显示设置在播放器的弹幕面板里）
-     + 关于（版本与检查更新、更新代理、界面用哪块 GPU）。分组列表样式。 -->
+<!-- Settings as grouped lists: servers (add / switch / edit / sign in again / delete, address and port apart), playback
+     (mpv path, next-episode preload, whole-file cache, cache management, personal mpv.conf), danmaku (API, blocked words;
+     display options live in the player's panel), about (version and updates, update proxy, which GPU renders the UI). -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
   import { Check, Download, Eye, EyeOff, HardDrive, LogIn, Pencil, Plus, RefreshCw, Trash2 } from '@lucide/svelte'
-  import { errText, loadConfig, refresh, session } from '../lib/api.svelte'
+  import { errText, loadConfig, session } from '../lib/api.svelte'
   import { go } from '../lib/router.svelte'
   import { ask } from '../lib/Dialog.svelte'
   import CacheDialog from '../lib/CacheDialog.svelte'
 
   const blank = { url: '', port: '', user: '', password: '' }
   let form = $state({ ...blank })
-  /** 正在编辑的服务器 id；和「添加」共用 form。 */
+  /** Id of the server being edited; shares `form` with adding. */
   let editing = $state<string | null>(null)
   let relogin = $state<{ id: string; password: string } | null>(null)
   let busy = $state(false)
@@ -24,30 +24,33 @@
   let cacheOpen = $state(false)
   let dmApi = $state(session.cfg?.danmakuApi ?? '')
   let dmWords = $state((session.cfg?.danmakuWords ?? []).join('\n'))
-  /** 接口地址里可能带令牌：默认按密码框遮住，免得截图时露出来。 */
+  /** The API address may carry a token: masked by default so it does not end up in screenshots. */
   let dmShow = $state(false)
-  const saveDm = () =>
-    run(async () => {
-      await invoke('danmaku_set', { api: dmApi, words: dmWords.split('\n') })
-      await loadConfig()
-      dmApi = session.cfg?.danmakuApi ?? '' // 显示后端规范化后的值（去掉了空白和末尾的 /）
-      dmWords = (session.cfg?.danmakuWords ?? []).join('\n')
-    }, '已保存，下次播放生效')
   let adding = $state(!session.cfg?.servers.length)
 
+  /** Apply a change, then reload the config (other pages are unmounted here and refetch when shown).
+   *  Resolves to whether it worked; a failure shows the backend's reason and leaves the inputs as typed. */
   async function run(f: () => Promise<unknown>, ok?: string) {
     busy = true
     msg = null
     try {
       await f()
       await loadConfig()
-      refresh()
       if (ok) msg = { text: ok, ok: true }
+      return true
     } catch (e) {
       msg = { text: errText(e), ok: false }
+      return false
     } finally {
       busy = false
     }
+  }
+
+  async function saveDm() {
+    if (!(await run(() => invoke('danmaku_set', { api: dmApi, words: dmWords.split('\n') }), '已保存，下次播放生效'))) return
+    // Show the backend's normalized values (trimmed, no trailing /)
+    dmApi = session.cfg?.danmakuApi ?? ''
+    dmWords = (session.cfg?.danmakuWords ?? []).join('\n')
   }
 
   function formPort() {
@@ -55,12 +58,12 @@
     if (port !== null && !(port > 0 && port < 65536)) throw { message: '端口应为 1–65535' }
     return port
   }
-  const add = () =>
-    run(async () => {
-      await invoke('server_add', { url: form.url, port: formPort(), user: form.user, password: form.password })
-      form = { ...blank }
-      go('/')
-    })
+  // Go home only once the new config is loaded, or Home would mount against the previous server first
+  async function add() {
+    if (!(await run(() => invoke('server_add', { url: form.url, port: formPort(), user: form.user, password: form.password })))) return
+    form = { ...blank }
+    go('/')
+  }
   function startEdit(s: { id: string; url: string; port: number; user: string }) {
     form = { url: s.url, port: String(s.port), user: s.user, password: '' }
     editing = s.id
@@ -72,25 +75,20 @@
     editing = null
     adding = true
   }
-  /** 只改地址时后端沿用原 token，不用填密码；改了用户名或填了密码就重新登录。 */
-  const save = (id: string) =>
-    run(async () => {
-      await invoke('server_edit', { id, url: form.url, port: formPort(), user: form.user, password: form.password })
-      editing = null
-      form = { ...blank }
-    }, '已保存')
-  function login() {
-    const r = relogin
-    if (!r) return
-    run(async () => {
-      await invoke('server_login', { id: r.id, password: r.password })
-      relogin = null
-    }, '已重新登录')
+  /** Address-only edits keep the token (no password needed); a new user name or password signs in again. */
+  async function save(id: string) {
+    if (!(await run(() => invoke('server_edit', { id, url: form.url, port: formPort(), user: form.user, password: form.password }), '已保存'))) return
+    editing = null
+    form = { ...blank }
   }
-  const use = (id: string) => run(() => invoke('server_use', { id }).then(() => go('/')))
+  async function login() {
+    const r = relogin
+    if (r && (await run(() => invoke('server_login', { id: r.id, password: r.password }), '已重新登录'))) relogin = null
+  }
+  const use = async (id: string) => (await run(() => invoke('server_use', { id }))) && go('/')
   const remove = async (id: string, name: string) =>
     (await ask('删除服务器', `删除「${name}」？登录信息会一起删掉。`, '删除', true)) && run(() => invoke('server_remove', { id }))
-  /** 界面用哪块 GPU 渲染（WebGL 报的渲染器名），排查界面卡顿时看是不是落到了核显或软件渲染。 */
+  /** Which GPU renders the UI (WebGL renderer name), to tell a janky UI on integrated graphics or software rendering apart. */
   function gpuName() {
     try {
       const gl = document.createElement('canvas').getContext('webgl')
@@ -103,15 +101,14 @@
     }
   }
   const gpu = gpuName()
-  const savePlayer = () =>
-    run(async () => {
-      await invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload, updateProxy: updateProxy || null, cacheWhole })
-      await loadConfig()
-      mpvPath = session.cfg?.mpvPath ?? '' // 显示后端规范化后的值（去掉了引号、空白）
-      updateProxy = session.cfg?.updateProxy ?? ''
-    }, '已保存')
+  async function savePlayer() {
+    if (!(await run(() => invoke('settings_set', { mpvPath: mpvPath || null, preloadPercent: preload, updateProxy: updateProxy || null, cacheWhole }), '已保存'))) return
+    // Show the backend's normalized values (quotes and whitespace stripped)
+    mpvPath = session.cfg?.mpvPath ?? ''
+    updateProxy = session.cfg?.updateProxy ?? ''
+  }
 
-  /** 检查更新：idle → checking → latest / found（显示版本和说明）→ installing（进度）；出错回到 idle 并显示原因。 */
+  /** Update check: idle → checking → latest / found (version and notes) → installing (progress); errors fall back with the reason. */
   let upd = $state<{ step: 'idle' | 'checking' | 'latest' | 'found' | 'installing'; version?: string; notes?: string; pct?: number; error?: string }>({ step: 'idle' })
   async function checkUpdate() {
     upd = { step: 'checking' }
@@ -130,7 +127,7 @@
       if (total) upd.pct = Math.min(100, Math.round((got / total) * 100))
     })
     try {
-      await invoke('update_install') // 成功时程序会退出并由安装器重新打开
+      await invoke('update_install') // on success the app exits and the installer reopens it
     } catch (e) {
       upd = { step: 'found', version, notes, error: errText(e) }
     } finally {
@@ -281,16 +278,17 @@
   .grow { flex: 1; min-width: 0; }
   .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
   .sub { font-size: 12px; color: var(--text-2); margin-top: 2px; }
-  .tag { font-size: 11px; color: #fff; background: var(--accent); border-radius: 4px; padding: 0 6px; font-weight: 500; line-height: 18px; }
+  .tag { font-size: 11px; color: var(--accent-text); background: var(--accent); border-radius: 4px; padding: 0 6px; font-weight: 500; line-height: 18px; }
   .label { width: 110px; flex: none; }
   .val { width: 44px; text-align: right; font-variant-numeric: tabular-nums; color: var(--text-2); }
   .link { color: var(--accent); gap: 8px; text-align: left; }
   .link:hover { background: var(--fill); }
-  input:not([type='range']) {
-    height: 32px; border: 0; border-radius: var(--radius-s); padding: 0 10px; background: var(--fill); min-width: 0;
+  input:not([type='range']), textarea {
+    border: 0; border-radius: var(--radius-s); padding: 0 10px; background: var(--fill); min-width: 0;
     box-shadow: inset 0 -1px 0 var(--stroke-strong); transition: box-shadow 0.12s, background 0.12s;
   }
-  input:not([type='range']):focus { background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
+  input:not([type='range']) { height: 32px; }
+  input:not([type='range']):focus, textarea:focus { background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
   input[type='range'], input[type='checkbox'] { accent-color: var(--accent); }
   input[type='checkbox'] { width: 18px; height: 18px; }
   .form { display: grid; grid-template-columns: 170px 1fr 1fr; gap: 10px; }
@@ -299,14 +297,9 @@
   code { font-family: ui-monospace, Consolas, monospace; font-size: 11px; padding: 0 4px; border-radius: 4px; background: var(--fill); }
   .note { margin: 10px var(--gutter); font-size: 12px; color: var(--text-3); line-height: 1.8; }
   .msg { margin: 14px var(--gutter); color: var(--text-2); }
-  .msg.err { color: var(--danger); }
-  .sub.err { color: var(--danger); }
+  .err { color: var(--danger); }
   .notes { white-space: pre-wrap; max-height: 160px; overflow: auto; margin-top: 6px; }
   input.wide { width: 100%; }
   .line { display: flex; gap: 8px; align-items: center; }
-  textarea {
-    width: 100%; resize: vertical; border: 0; border-radius: var(--radius-s); padding: 6px 10px; background: var(--fill); font: inherit;
-    color: inherit; box-shadow: inset 0 -1px 0 var(--stroke-strong); transition: box-shadow 0.12s, background 0.12s;
-  }
-  textarea:focus { outline: none; background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
+  textarea { width: 100%; resize: vertical; padding: 6px 10px; font: inherit; color: inherit; }
 </style>

@@ -51,7 +51,7 @@
 <svelte:window onkeydown={(e) => e.key === 'Escape' && (e.stopPropagation(), onclose())} />
 
 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-<div class="backdrop" onclick={(e) => e.target === e.currentTarget && onclose()}>
+<div class="modal" onclick={(e) => e.target === e.currentTarget && onclose()}>
   <div class="dialog flyout" role="dialog" aria-modal="true" aria-label="缓存管理">
     <h3>缓存管理</h3>
     <div class="body">
@@ -78,8 +78,6 @@
 </div>
 
 <style>
-  .backdrop { position: fixed; inset: 0; z-index: 45; display: grid; place-items: center; background: rgba(0, 0, 0, 0.32); animation: dim-in 0.14s; }
-  @keyframes dim-in { from { opacity: 0; } }
   .dialog { width: min(520px, calc(100vw - 48px)); max-height: calc(100vh - 120px); display: flex; flex-direction: column; padding: 20px 0 16px; transform-origin: center; }
   h3 { margin: 0 22px 14px; font-size: 16px; font-weight: 600; }
   .body { overflow: auto; padding: 0 22px; display: flex; flex-direction: column; gap: 12px; }

@@ -2997,12 +2997,18 @@ mod tests {
         errors: Vec<String>,
     }
 
-    fn bundled_mpv_run(config_dir: &Path) -> MpvRun {
-        let exe = if cfg!(windows) {
-            config_dir.join("mpv.exe") // CI downloads mpv.exe into src-tauri/mpv/ before cargo test
+    /// The mpv to test with: `mpv.exe` in the bundled config dir on Windows (CI downloads it into src-tauri/mpv/
+    /// before cargo test), `mpv` from PATH elsewhere.
+    fn test_mpv(config_dir: &Path) -> PathBuf {
+        if cfg!(windows) {
+            config_dir.join("mpv.exe")
         } else {
             PathBuf::from("mpv")
-        };
+        }
+    }
+
+    fn bundled_mpv_run(config_dir: &Path) -> MpvRun {
+        let exe = test_mpv(config_dir);
         let log = std::env::temp_dir().join(format!("embymini-cfg-{}.log", std::process::id()));
         let status = std::process::Command::new(&exe)
             .arg(format!("--config-dir={}", config_dir.display()))
@@ -3041,11 +3047,7 @@ mod tests {
                 .join("mpv");
         let log = dir.join("mpv.log");
         let opts = Options {
-            mpv: if cfg!(windows) {
-                bundled.join("mpv.exe")
-            } else {
-                "mpv".into()
-            },
+            mpv: test_mpv(&bundled),
             user_conf: Some(conf),
             ..test_opts(vec![
                 "--vo=null".into(),
@@ -3083,18 +3085,15 @@ mod tests {
     }
 
     /// The danmaku script (layout, merging, escaping, panel, message handling) inside a real mpv against a fake `mp`:
-    /// `testdata/danmaku_test.lua` loads `mpv/scripts/danmaku.lua`, drives it and quits with 1 on any failed check.
+    /// `testdata/danmaku_test.lua` loads `mpv/scripts/danmaku.lua` (path in `EMBYMINI_DMTEST_SRC`), drives it and quits
+    /// with 1 on any failed check.
     #[test]
     #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
     fn danmaku_script() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mpv = if cfg!(windows) {
-            dir.join("mpv").join("mpv.exe")
-        } else {
-            "mpv".into()
-        };
+        let mpv = test_mpv(&dir.join("mpv"));
         let log = std::env::temp_dir().join(format!("embymini-dmtest-{}.log", std::process::id()));
-        let mut child = std::process::Command::new(mpv)
+        let mut child = std::process::Command::new(&mpv)
             .args([
                 "--no-config",
                 "--idle=yes",
@@ -3106,18 +3105,16 @@ mod tests {
                     "--script={}",
                     dir.join("testdata").join("danmaku_test.lua").display()
                 ),
-                &format!(
-                    "--script-opts=dmtest-src={}",
-                    dir.join("mpv")
-                        .join("scripts")
-                        .join("danmaku.lua")
-                        .display()
-                ),
             ])
+            // An environment variable, not --script-opts: that list splits at commas in the path
+            .env(
+                "EMBYMINI_DMTEST_SRC",
+                dir.join("mpv").join("scripts").join("danmaku.lua"),
+            )
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .unwrap();
+            .unwrap_or_else(|e| panic!("启动 {} 失败：{e}", mpv.display()));
         // Only the harness quits mpv (--idle): if it never ran, give up instead of hanging
         let deadline = Instant::now() + Duration::from_secs(60);
         let status = loop {

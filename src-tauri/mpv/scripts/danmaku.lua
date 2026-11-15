@@ -21,7 +21,7 @@ local DEFAULT = {
 local SPEEDS = { 13, 10, 8, 6.5, 5 }            -- seconds to cross the screen, per speed setting 1–5
 local SPEED_OPTS = { { 1, "极慢" }, { 2, "较慢" }, { 3, "适中" }, { 4, "较快" }, { 5, "极快" } }
 local AREAS = { { 0.25, "1/4" }, { 0.5, "半屏" }, { 0.75, "3/4" }, { 1, "满屏" } }
-local BORDERS = { { "heavy", "重墨" }, { "outline", "描边" }, { "shadow", "投影" }, { "bold", "粗体" } }
+local BORDER_OPTS = { { "heavy", "重墨" }, { "outline", "描边" }, { "shadow", "投影" }, { "bold", "粗体" } } -- panel row: the borders plus the bold toggle
 local FIXED = 5                                 -- seconds a top / bottom comment stays
 local MERGE_WINDOW = 15                         -- repeats within this many seconds of the first are merged into it
 local FONT_RATIO, MIN_FONT, LINE = 0.032, 14, 1.2 -- font size = window height × ratio × scale; row = LINE × font
@@ -39,6 +39,7 @@ local offset = 0                                -- seconds, positive = later; th
 local raw = nil                                 -- this episode: { t, mode, color, text, w (em) }
 local list = {}                                 -- filtered and merged
 local src = { kind = "idle", text = "" }        -- panel status line; kind = idle / loading / ok / none / error / setup
+                                                -- (ok also has title and note, so a long title is cut but not the note)
 local want = nil                                -- the episode's item id (first status of an episode has start); others are stale
 
 -- Screen and clock ------------------------------------------------------------------------------------------
@@ -92,9 +93,9 @@ local function fit(s, em)
     return table.concat(out) .. "…"
 end
 
--- Braces would open an override block and backslashes an escape
+-- Braces would open an override block, backslashes an escape, a newline a new event (events are joined by \n)
 local function ass_escape(s)
-    return (s:gsub("\\", "＼"):gsub("{", "｛"):gsub("}", "｝"))
+    return (s:gsub("\\", "＼"):gsub("{", "｛"):gsub("}", "｝"):gsub("[\r\n]", " "))
 end
 
 local function blocked(c)
@@ -346,6 +347,7 @@ local function lookup(name, arg)
 end
 
 local function manual_match()
+    asked = nil                                 -- a late reply to the previous lookup must not replace this prompt
     local title = mp.get_property("media-title", "")
     local kw = title:match("^(.-) S%d+E%d+") or title
     input.get({
@@ -432,15 +434,16 @@ local function draw_panel()
     y = y + rh
     -- Row 2: source / status
     local room = (cx1 - lx) / (fsz * 0.86)      -- in em
-    local status = src.text ~= "" and src.text or (style.on and "播放后自动匹配弹幕" or "弹幕已关闭")
+    -- Escaped before cutting: full-width ＼｛｝ are wider than what they replace
+    local status
     if src.kind == "ok" and raw then
-        local count = string.format(" · %d 条", #raw)
-        status = fit(src.text, room - em_width(count)) .. count
+        local tail = ass_escape(src.note) .. string.format(" · %d 条", #raw)
+        status = fit(ass_escape(src.title), room - em_width(tail)) .. tail
     else
-        status = fit(status, room)
+        status = fit(ass_escape(src.text ~= "" and src.text or (style.on and "播放后自动匹配弹幕" or "弹幕已关闭")), room)
     end
     local bad = src.kind == "error" or src.kind == "setup"
-    text(out, lx, y + rh / 2, 4, fsz * 0.86, ass_escape(status), bad and "6B8BFF" or "A0A0A0")
+    text(out, lx, y + rh / 2, 4, fsz * 0.86, status, bad and "6B8BFF" or "A0A0A0")
     y = y + rh
     label("屏蔽类型")
     seg({ { "noScroll", "滚动" }, { "noTop", "顶部" }, { "noBottom", "底部" }, { "noColor", "彩色" } },
@@ -469,7 +472,7 @@ local function draw_panel()
     end)
     y = y + rh
     label("描边")
-    seg(BORDERS, function(v) if v == "bold" then return style.bold end return style.border == v end, function(v)
+    seg(BORDER_OPTS, function(v) if v == "bold" then return style.bold end return style.border == v end, function(v)
         if v == "bold" then style.bold = not style.bold else style.border = v end
         set(nil, true)
     end)
@@ -553,7 +556,8 @@ mp.register_script_message("search", function(json, arg)
         prompt = "选择剧集：",
         items = items,
         submit = function(i)
-            if asked == key then lookup("episodes", tostring(v[i].id)) end
+            if asked ~= key then return toast("已换集或重新搜索，请重新手动匹配") end
+            lookup("episodes", tostring(v[i].id))
         end,
     })
 end)
@@ -570,7 +574,8 @@ mp.register_script_message("episodes", function(json, arg)
         items = items,
         default_item = (v.at or 0) + 1,
         submit = function(i)
-            if asked == key then mp.commandv("script-message", "embymini-danmaku-pick", tostring(v.anime), tostring(i - 1)) end
+            if asked ~= key then return toast("已换集或重新搜索，请重新手动匹配") end
+            mp.commandv("script-message", "embymini-danmaku-pick", tostring(v.anime), tostring(i - 1))
         end,
     })
 end)
@@ -611,7 +616,8 @@ mp.register_script_message("load", function(json)
     for _, c in ipairs(v.list or {}) do
         raw[#raw + 1] = { t = c[1], mode = c[2], color = c[3], text = c[4], w = c[5] or em_width(c[4]) }
     end
-    src = { kind = "ok", text = v.title .. (v.manual and "（手动匹配）" or "") .. (v.stale and "（接口暂不可用，用的旧缓存）" or "") }
+    local note = (v.manual and "（手动匹配）" or "") .. (v.stale and "（接口暂不可用，用的旧缓存）" or "")
+    src = { kind = "ok", text = v.title .. note, title = v.title, note = note }
     rebuild()
     mp.msg.verbose(string.format("载入 %d 条（显示 %d 条），%.0f ms", #raw, #list, (mp.get_time() - t0) * 1000))
     publish()

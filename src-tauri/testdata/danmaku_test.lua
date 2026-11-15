@@ -1,5 +1,5 @@
 -- Runs mpv/scripts/danmaku.lua against a fake `mp` and checks what it draws and sends.
--- Started by the player test `danmaku_script` (path in --script-opts=dmtest-src=…); quits mpv with 0 on success.
+-- Started by the player test `danmaku_script` (script path in EMBYMINI_DMTEST_SRC); quits mpv with 0 on success.
 local utils = require "mp.utils"
 local real = mp
 
@@ -202,12 +202,38 @@ local function run()
     fake.events["start-file"]()
     pick.submit(2)
     check(#sent("embymini-danmaku-pick") == 0, "pick from before an episode change dropped")
+    check(fake.osd and fake.osd:find("请重新手动匹配") ~= nil, "a dropped pick says so")
     send("search", { { id = 3, title = "迟到", count = 1 } }, "新")
     check(fake.select == pick, "reply from before an episode change dropped")
+
+    -- A late reply to the previous search does not replace a new search prompt
+    episode("C", { { 10, 1, 16777215, "c", 0.55 } })
+    fake.handlers.panel()
+    click("手动匹配")
+    fake.input.submit("甲")
+    fake.handlers.panel()
+    click("手动匹配")
+    fake.select = nil
+    send("search", { { id = 4, title = "甲剧", count = 1 } }, "甲")
+    check(fake.select == nil, "late reply dropped while a new prompt is open")
+
+    -- Status line: newlines do not split the event; escaping happens before cutting; a long title keeps its note
+    local function status_line(prefix)
+        for _, l in ipairs(panel()) do if l.text:find("^" .. prefix) then return l.text end end
+        return ""
+    end
+    fake.handlers.panel()
+    send("status", { kind = "loading", text = "第一行\n第二行", item = "C" })
+    check(status_line("第一行") == "第一行 第二行", "newline in status flattened")
+    send("status", { kind = "loading", text = string.rep("{", 60), item = "C" })
+    local _, braces = status_line("｛"):gsub("｛", "")
+    check(braces > 20 and braces < 29, "escaped braces cut to the panel width, got " .. braces)
+    send("load", { item = "C", title = string.rep("长", 40), stale = true, list = { { 10, 1, 16777215, "c", 0.55 } } })
+    check(status_line("长"):find("…（接口暂不可用，用的旧缓存） · 1 条$") ~= nil, "stale note kept: " .. status_line("长"))
 end
 
 local ok, err = pcall(function()
-    local chunk = assert(loadfile(real.get_opt("dmtest-src"), "t", env))
+    local chunk = assert(loadfile(os.getenv("EMBYMINI_DMTEST_SRC"), "t", env))
     chunk()
     run()
 end)

@@ -1,10 +1,9 @@
-// 列表数据快照（常规的 stale-while-revalidate 持久化，同 TanStack Query 的 localStorage persister 一类）：
-// 上次看到的首页、详情、整季、人物、收藏、媒体库第一页存在本地（WebView 的 localStorage，跨重启保留），
-// 再次打开时先用它把页面画出来（海报直接从磁盘缓存出），后台取到新数据再原地替换并更新快照。
-// 只是缓存：读写失败、被清掉都不影响功能。
+// List snapshots (stale-while-revalidate persisted to localStorage, like TanStack Query's persister):
+// the last home, detail, season, person, favorites and first library page survive restarts, so a page draws from them at once
+// and is replaced in place when fresh data arrives. Only a cache: failed reads / writes or a wipe never break anything.
 const PREFIX = 'snap:'
 const INDEX = 'snap-index'
-/** 快照总字符数上限。Chromium 每个源的 localStorage 约 10 MB（UTF-16），留足余量。 */
+/** Total characters across snapshots; Chromium allows about 10 MB (UTF-16) per origin, so this leaves headroom. */
 const LIMIT = 3_000_000
 
 type Index = Record<string, [at: number, size: number]>
@@ -26,26 +25,26 @@ export function readSnap<T>(key: string): T | undefined {
   }
 }
 
-/** 快照占的字节（localStorage 按 UTF-16 存，一个字符 2 字节），缓存管理里显示。 */
+/** Bytes used (UTF-16, two per character), shown in cache management. */
 export function snapSize() {
   return Object.values(index()).reduce((n, [, size]) => n + size * 2, 0)
 }
 
-/** 清掉全部快照（缓存管理）。 */
+/** Drop every snapshot (cache management). */
 export function snapClear() {
   try {
     for (const k of Object.keys(index())) localStorage.removeItem(PREFIX + k)
     localStorage.removeItem(INDEX)
   } catch {
-    /* 清不掉就算了 */
+    /* best effort */
   }
 }
 
-/** 写一份快照；总量超上限时删最久没更新的。 */
+/** Store a snapshot; over the total limit, evict the least recently written (never this one). */
 export function writeSnap(key: string, value: unknown) {
   try {
     const raw = JSON.stringify(value)
-    if (raw.length > LIMIT / 4) return // 单份太大（比如翻了很多页的列表）不存
+    if (raw.length > LIMIT / 4) return // one huge entry would evict everything else
     const idx = index()
     idx[key] = [Date.now(), raw.length]
     let total = Object.values(idx).reduce((n, [, size]) => n + size, 0)
@@ -59,6 +58,6 @@ export function writeSnap(key: string, value: unknown) {
     localStorage.setItem(PREFIX + key, raw)
     localStorage.setItem(INDEX, JSON.stringify(idx))
   } catch {
-    /* 存不下就算了 */
+    /* quota full or storage unavailable: just skip */
   }
 }

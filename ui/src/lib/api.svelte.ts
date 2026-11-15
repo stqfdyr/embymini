@@ -1,4 +1,4 @@
-// 前端唯一的数据入口：invoke 封装 + GET 会话内缓存 + 图片地址。token 永远留在 Rust 里。
+// The UI's only data entry point: invoke wrappers, a per-session GET cache and image URLs. The token never leaves Rust.
 import { untrack } from 'svelte'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
@@ -6,26 +6,28 @@ import type { MenuItem } from './menu.svelte'
 import { readSnap, writeSnap } from './snap'
 import type { Item, Page } from './types'
 
-export type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; loggedIn: boolean }
-export type ConfigView = {
+// Mirrors of the Rust serde shapes (`config::ServerView`, `ConfigView` in main.rs, `emby::Error`); keep in sync by hand.
+type ServerView = { id: string; name: string; url: string; port: number; user: string; userId: string; base: string; loggedIn: boolean }
+type ConfigView = {
   active: string | null; servers: ServerView[]; mpvPath: string | null; preloadPercent: number; userMpvConf: string
   updateProxy: string | null; cacheWhole: boolean; danmakuApi: string; danmakuWords: string[]; version: string
 }
-export type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }
+type ApiError = { kind: 'unauthorized' | 'status' | 'network' | 'other'; message: string }
 
-/** 任意错误 → 给用户看的一句话（后端的 ApiError、JS 异常、字符串都能处理）。 */
+/** Any error (backend ApiError, JS exception, string) → one line for the user. */
 export const errText = (e: unknown) => String((e as { message?: unknown } | null)?.message ?? e)
 
-/** 列表卡片要的字段；详情另加 People / MediaSources 等重字段。 */
+/** Fields list cards need; the detail page adds heavy ones such as People and MediaSources. */
 export const LIST_FIELDS = 'ProductionYear,EndDate,CommunityRating,UserData,PrimaryImageAspectRatio,RunTimeTicks,Overview,Genres,OfficialRating,RecursiveItemCount'
 export const DETAIL_FIELDS = `${LIST_FIELDS},People,ExternalUrls,ProviderIds,MediaSources,Studios,PremiereDate,Status`
-/** 单集卡要的字段。 */
+/** Fields episode cards need. */
 export const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'
 
-/** 右下角提示（播放失败等），8 秒后自动消失，点一下也会消失；可带一个按钮（如「撤销」）。 */
-export type Toast = { id: number; text: string; action?: { label: string; run: () => unknown } }
+/** Bottom-right notice (playback failed etc.); gone after TOAST_MS or on click, may carry one button (e.g. undo). */
+type Toast = { id: number; text: string; action?: { label: string; run: () => unknown } }
 export const toasts = $state<Toast[]>([])
 let toastSeq = 0
+const TOAST_MS = 8000
 export function dismiss(id: number) {
   const i = toasts.findIndex((t) => t.id === id)
   if (i >= 0) toasts.splice(i, 1)
@@ -33,10 +35,10 @@ export function dismiss(id: number) {
 export function notify(text: string, action?: Toast['action']) {
   const id = ++toastSeq
   toasts.push({ id, text, action })
-  setTimeout(() => dismiss(id), 8000)
+  setTimeout(() => dismiss(id), TOAST_MS)
 }
 
-/** refresh：手动刷新（顶栏按钮、F5）；quiet：后台刷新（播放结束、收藏或已看变化后），页面原地更新，不闪不跳。 */
+/** `refresh`: manual reload (title bar button, F5); `quiet`: background reload (after playback, favorite or played changes), updated in place without flicker. */
 export const session = $state<{ cfg: ConfigView | null; server: ServerView | null; refresh: number; quiet: number }>({
   cfg: null,
   server: null,
@@ -45,7 +47,7 @@ export const session = $state<{ cfg: ConfigView | null; server: ServerView | nul
 })
 
 const cache = new Map<string, Promise<unknown>>()
-/** 列表里见过的条目（按 Id）：点开详情时先用它把页面顶部画出来，详情到了再补全，不让用户干等。 */
+/** Items seen in lists, by Id: the detail page draws its header from one while the full detail loads. */
 const seen = new Map<string, Item>()
 export const peek = (id: string) => seen.get(id)
 function remember(v: unknown) {
@@ -63,25 +65,26 @@ export async function loadConfig() {
 
 export const uid = () => session.server?.userId ?? ''
 
-/** 手动刷新：丢掉缓存，各页重新取数（媒体库网格会回到第一页）。 */
+/** Manual reload: drop the cache and refetch every page (library grids go back to page one). */
 export function refresh() {
   cache.clear()
   session.refresh++
 }
 
-/** 后台刷新（播放结束、收藏或已看变化后）：只更新数据，不重置列表和滚动位置。 */
+/** Background reload: refresh the data without resetting lists or scroll positions. */
 export function refreshQuiet() {
   cache.clear()
   session.quiet++
 }
 
-/** 快照的键带上当前服务器（不同服务器的数据不混）。 */
+/** Snapshot key scoped to the current server so servers never mix. */
 export const snapKey = (k: string) => `${session.server?.id}|${k}`
 
 /**
- * 取数并保留上一次的结果：重新取数期间继续显示旧数据，新数据到了原地替换。
- * `fn` 里同步读到的响应式值（id、session.refresh 等）变化时自动重取。只能在组件初始化时调用。
- * 给了 `key` 就先用本地快照把页面画出来（见 snap.ts），取到新数据再替换并更新快照；取数失败时继续显示快照。
+ * Fetch and keep the previous result on screen while refetching; new data replaces it in place.
+ * Refetches when reactive values read synchronously in `fn` change (id, session.refresh…). Call during component init.
+ * With `key`, the page first draws from the local snapshot (snap.ts) and the snapshot is updated on success;
+ * a failed fetch keeps showing the snapshot instead of an error.
  */
 export function loader<T>(fn: () => Promise<T>, key?: () => string) {
   const s = $state<{ data?: T; error?: unknown }>({})
@@ -111,12 +114,15 @@ export function loader<T>(fn: () => Promise<T>, key?: () => string) {
 let onUnauthorized: () => void = () => {}
 export const setUnauthorizedHandler = (f: () => void) => (onUnauthorized = f)
 
-function call<T>(method: string, path: string, query?: Record<string, unknown>, body?: unknown): Promise<T> {
-  return invoke<T>('emby', { method, path, query, body }).catch((e: ApiError) => {
+/** `invoke` that hands an `unauthorized` error to the sign-in handler before rethrowing it. */
+function invokeAuthed<T>(cmd: string, args: Record<string, unknown>): Promise<T> {
+  return invoke<T>(cmd, args).catch((e: ApiError) => {
     if (e?.kind === 'unauthorized') onUnauthorized()
     throw e
   })
 }
+
+const call = <T>(method: string, path: string, query?: Record<string, unknown>) => invokeAuthed<T>('emby', { method, path, query })
 
 export function get<T = unknown>(path: string, query: Record<string, unknown> = {}): Promise<T> {
   const key = `${session.server?.id}|${path}|${JSON.stringify(query)}`
@@ -124,20 +130,22 @@ export function get<T = unknown>(path: string, query: Record<string, unknown> = 
   if (!p) {
     p = call<T>('GET', path, query)
     cache.set(key, p)
-    p.then(remember, () => cache.delete(key))
+    // A refresh may have cleared the cache and refetched this key meanwhile; drop only our own failed entry
+    p.then(remember, () => cache.get(key) === p && cache.delete(key))
   }
   return p
 }
 
-/** 详情页要的条目详情；悬停预取和详情页用同一个请求，命中缓存。 */
+/** Item detail; hover prefetch and the detail page share this request, so the page hits the cache. */
 export const itemDetail = (id: string) => get<Item>(`/Users/${uid()}/Items/${id}`, { Fields: DETAIL_FIELDS })
 
-/** 鼠标在卡片上停一会儿就预取详情，点进去时多半已经到了。 */
+/** Hover this long on a card before prefetching its detail. */
+const HOVER_MS = 150
 let hoverTimer: ReturnType<typeof setTimeout> | undefined
 export function prefetch(id: string) {
   clearTimeout(hoverTimer)
   hoverTimer = setTimeout(() => {
-    // 详情和详情页的背景图（大图 + 模糊底图）一起预取，点进去时多半已经在缓存里
+    // Also the detail page's backdrop (full size + blurred base); widths must match Item.svelte
     itemDetail(id).then((d) => {
       const tag = d.BackdropImageTags?.[0]
       for (const w of [1600, 320]) {
@@ -145,22 +153,22 @@ export function prefetch(id: string) {
         if (src) new Image().src = src
       }
     }, () => {})
-  }, 150)
+  }, HOVER_MS)
 }
 export const cancelPrefetch = () => clearTimeout(hoverTimer)
 
-export function send(method: 'POST' | 'DELETE', path: string, query?: Record<string, unknown>) {
+function send(method: 'POST' | 'DELETE', path: string, query?: Record<string, unknown>) {
   cache.clear()
   return call<unknown>(method, path, query)
 }
 
-/** 收藏 / 已看：成功后后台刷新；失败（上游 502 之类）弹提示，不能点了没反应。 */
+/** Favorite / played: background reload on success; a failure (upstream 502…) shows a notice instead of doing nothing. */
 const mark = (kind: 'FavoriteItems' | 'PlayedItems', what: string) => (id: string, on: boolean) => {
   return send(on ? 'POST' : 'DELETE', `/Users/${uid()}/${kind}/${id}`).then(refreshQuiet, (e) => notify(`${what}失败：${errText(e)}`))
 }
 export const setFavorite = mark('FavoriteItems', '收藏')
 export const setPlayed = mark('PlayedItems', '标记已看')
-/** 从「继续观看」移除（服务端 HideFromResume，进度保留），提示条里可撤销。 */
+/** Remove from Continue Watching (server-side HideFromResume, progress kept); the notice offers undo. */
 function hideResume(it: Item, hide = true): Promise<unknown> {
   return send('POST', `/Users/${uid()}/Items/${it.Id}/HideFromResume`, { Hide: hide }).then(
     () => {
@@ -172,16 +180,13 @@ function hideResume(it: Item, hide = true): Promise<unknown> {
 }
 export const resumeMenu = (it: Item): MenuItem[] => [...itemMenu(it), 'sep', { label: '从继续观看中移除', icon: EyeOff, action: () => hideResume(it) }]
 
-/** 起播。出错（服务器拒绝、找不到 mpv 等）直接弹提示；加载失败由播放事件 failed 另行提示。
- *  `sourceId`：多版本（1080p / 4K 等）时详情页选的那个，不给就用服务器排的第一个。 */
+/** Start playback; a refusal (server error, mpv missing…) shows a notice, load failures arrive later as the `failed` player event.
+ *  `sourceId`: the version picked on the detail page (1080p / 4K…); without it the server's first one plays. */
 export function play(itemId: string, fromStart = false, sourceId?: string) {
-  return invoke('play', { itemId, fromStart, sourceId: sourceId ?? null }).catch((e: ApiError) => {
-    if (e?.kind === 'unauthorized') onUnauthorized()
-    notify(`播放失败：${errText(e)}`)
-  })
+  return invokeAuthed('play', { itemId, fromStart, sourceId: sourceId ?? null }).catch((e) => notify(`播放失败：${errText(e)}`))
 }
 
-/** 卡片右键菜单：能直接播的（电影、单集）给播放；都能标记已看、收藏。 */
+/** Card context menu: play for playable items (movies, episodes); played and favorite for all. */
 export function itemMenu(it: Item, open?: () => void): MenuItem[] {
   const playable = it.Type !== 'Series' && it.Type !== 'BoxSet' && it.Type !== 'CollectionFolder'
   const items: MenuItem[] = []
@@ -200,15 +205,15 @@ export function itemMenu(it: Item, open?: () => void): MenuItem[] {
 }
 
 /**
- * 分页列表（媒体库、人物作品）：`more()` 取下一页（网格滚到底时调用）。
- * `query()` 里读到的响应式值（排序、筛选、id）或手动刷新变了，就从第一页重来；旧请求晚到的结果按代次丢弃。
- * 只能在组件初始化时调用。
+ * Paged list (library, person's works): `more()` fetches the next page (called when the grid nears its end).
+ * Starts over from page one when reactive values read in `query()` (sort, filter, id) or a manual reload change;
+ * late results of older requests are dropped by generation. Call during component init.
  */
 export function pager(query: () => Record<string, unknown>, size = 60) {
   const s = $state({ items: [] as Item[], total: 0, busy: false, error: '', loaded: false })
   let gen = 0
   let q: Record<string, unknown> = {}
-  /** 第一页的本地快照（见 snap.ts）：先显示它，第一次取数从头取并替换。 */
+  /** Showing the first-page snapshot (snap.ts): the next fetch starts at 0 and replaces it. */
   let fromSnap = false
   const key = () => snapKey(`pager|${JSON.stringify(q)}`)
   async function more() {
@@ -228,7 +233,7 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
       s.loaded = true
       s.error = ''
     } catch (e) {
-      // 正显示快照时取数失败：同 loader，继续显示快照、不报错（滚动时会再取）
+      // Like loader: keep showing the snapshot without an error (scrolling retries)
       if (mine === gen && !fromSnap) s.error = errText(e)
     } finally {
       if (mine === gen) s.busy = false
@@ -246,13 +251,13 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
   return { s, more }
 }
 
-/** 宽度档位：按 DPR 放大后向上取档，换缩放比例、不同卡片尺寸也能命中同一份缓存。 */
+/** Width tiers: DPR-scaled widths round up to one, so zoom levels and card sizes share cached images. */
 const WIDTHS = [120, 160, 240, 320, 480, 640, 960, 1280, 1600, 1920, 2560, 3840]
 const IN_TAURI = '__TAURI_INTERNALS__' in globalThis
 
 /**
- * 图片地址（`index`：同类图的第几张，如第几张背景图）。没有 tag 返回空串。
- * 桌面版走 Rust 的图片缓存（`emby-img` 协议：磁盘缓存 → 上游，见 src-tauri/src/images.rs）；浏览器里开发时直连上游。
+ * Image URL (`index`: which image of that type, e.g. which backdrop); empty without a tag.
+ * The app goes through Rust's image cache (`emby-img` protocol, src-tauri/src/images.rs); a dev browser hits upstream directly.
  */
 export function img(id: string | undefined, type: string, tag: string | undefined | null, width: number, index = 0) {
   if (!id || !tag || !session.server) return ''
@@ -262,12 +267,12 @@ export function img(id: string | undefined, type: string, tag: string | undefine
   return `${session.server.base}/Items/${id}/Images/${type}/${index}?tag=${tag}&maxWidth=${w}&quality=90`
 }
 
-/** 原图的上游地址：给外部浏览器打开用（不走缓存、不缩图）。 */
+/** Upstream URL of the original image, for opening in an external browser (no cache, no resize). */
 export function imgOriginal(id: string, type: string, tag: string, index = 0) {
   return session.server ? `${session.server.base}/Items/${id}/Images/${type}/${index}?tag=${tag}` : ''
 }
 
-/** 横图：自身背景图 → 所属剧集的背景图 → 自身主图（单集截图）。 */
+/** Landscape image: own backdrop → parent series backdrop → own primary (episode still). */
 export function wideImg(it: Item, width: number) {
   if (it.BackdropImageTags?.length) return img(it.Id, 'Backdrop', it.BackdropImageTags[0], width)
   if (it.ParentBackdropImageTags?.length) return img(it.ParentBackdropItemId, 'Backdrop', it.ParentBackdropImageTags[0], width)

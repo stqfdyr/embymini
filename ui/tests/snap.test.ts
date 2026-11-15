@@ -1,5 +1,5 @@
-// 列表快照（src/lib/snap.ts）：读写、容量淘汰（删最久没更新的）、单份过大不存、localStorage 不可用时不抛错、占用与清空。
-// 跑法：npm test（Node 原生去掉类型后执行，不需要额外依赖）
+// List snapshots (src/lib/snap.ts): read / write, eviction of the least recently written, oversized entries skipped,
+// no throw when localStorage fails, usage and clearing. Run with `npm test` (Node strips the types itself).
 import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
 
@@ -23,33 +23,33 @@ beforeEach(() => {
   store.quota = Infinity
 })
 
-test('写了能读回来，没写过是 undefined', () => {
+test('reads back what was written; undefined when never written', () => {
   writeSnap('a', { x: 1 })
   assert.deepEqual(readSnap('a'), { x: 1 })
   assert.equal(readSnap('nope'), undefined)
 })
 
-test('超过总量上限时删最久没更新的，刚写的留着', async () => {
-  const big = 'x'.repeat(700_000) // 上限 300 万字符：4 份放得下，第 5 份要挤掉最早的
+test('over the total limit, evicts the least recently written and keeps the new one', async () => {
+  const big = 'x'.repeat(700_000) // limit is 3M characters: four fit, a fifth evicts the oldest
   for (const k of ['k1', 'k2', 'k3', 'k4']) {
     writeSnap(k, big)
-    await new Promise((r) => setTimeout(r, 2)) // 时间戳要分得出先后
+    await new Promise((r) => setTimeout(r, 2)) // distinct timestamps
   }
-  writeSnap('k2', big) // k2 刚更新过，不该先被删
+  writeSnap('k2', big) // k2 was just rewritten, so it must not go first
   await new Promise((r) => setTimeout(r, 2))
   writeSnap('k5', big)
-  assert.equal(readSnap('k1'), undefined, '最久没更新的被删')
+  assert.equal(readSnap('k1'), undefined, 'the least recently written is evicted')
   for (const k of ['k2', 'k3', 'k4', 'k5']) assert.equal(readSnap(k), big, k)
   const index = JSON.parse(store.getItem('snap-index')!)
   assert.deepEqual(Object.keys(index).sort(), ['k2', 'k3', 'k4', 'k5'])
 })
 
-test('单份超过上限的 1/4 不存', () => {
+test('an entry over a quarter of the limit is not stored', () => {
   writeSnap('huge', 'x'.repeat(800_000))
   assert.equal(readSnap('huge'), undefined)
 })
 
-test('存不下、读坏数据都不抛错', () => {
+test('a full store or corrupt data never throws', () => {
   store.quota = 10
   assert.doesNotThrow(() => writeSnap('a', { x: 1 }))
   store.quota = Infinity
@@ -57,8 +57,8 @@ test('存不下、读坏数据都不抛错', () => {
   assert.equal(readSnap('bad'), undefined)
 })
 
-test('占用按 UTF-16 算字节；清空后读不到', () => {
-  writeSnap('a', 'xx') // JSON 是 "xx"，4 个字符
+test('usage counts UTF-16 bytes; nothing reads back after clearing', () => {
+  writeSnap('a', 'xx') // the JSON is "xx", 4 characters
   writeSnap('b', { y: 2 })
   assert.equal(snapSize(), (4 + JSON.stringify({ y: 2 }).length) * 2)
   snapClear()

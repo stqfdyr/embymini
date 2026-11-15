@@ -1,6 +1,7 @@
-// 只在 `vite dev` 且页面不在 Tauri 里时生效：代替 Rust 后端处理 invoke，把请求转发到真服。
-// 用途：在没有 Windows 的机器上用浏览器开发界面、用 Playwright 截图。
-// 账号来自启动 vite 时的环境变量（EMBY_SERVER / PORT / EMBY_USER / EMBY_PASS），token 只留在 Node 进程里。
+// Active only under `vite dev` with the page outside Tauri: stands in for the Rust backend and forwards invoke to a real server,
+// so the UI can be developed and screenshot with Playwright on a machine without Windows.
+// Credentials come from vite's environment (EMBY_SERVER / PORT / EMBY_USER / EMBY_PASS); the token stays in this Node process.
+// Dev-only: error wording is simpler than the app's (`status::describe`) on purpose. Keep vite on localhost: this is an authenticated proxy.
 import type { Plugin } from 'vite'
 import type { IncomingMessage } from 'node:http'
 
@@ -51,7 +52,7 @@ export function devBridge(): Plugin {
           res.end(JSON.stringify(v ?? null))
         }
         try {
-          // 登录失败（上游 502 之类）不缓存，下一个请求重试，免得要重启 vite
+          // A failed sign-in (upstream 502…) is not cached: the next request retries without restarting vite
           session ??= login().catch((e) => ((session = null), Promise.reject(e)))
           const s = await session
           const args = await readJson(req)
@@ -71,15 +72,16 @@ export function devBridge(): Plugin {
               body: args.body ? JSON.stringify(args.body) : undefined,
             })
             const text = await r.text()
+            if (r.status === 401) session = null // token expired: sign in again on the next request
             if (!r.ok) return reply(500, { kind: r.status === 401 ? 'unauthorized' : 'status', message: `服务器返回 ${r.status}：${text.slice(0, 200)}` })
             return reply(200, text ? JSON.parse(text) : null)
           }
-          // 缓存都在 Rust 里，浏览器里没有：给一组假数字，看弹窗样式用
+          // The caches live in Rust: fake numbers, enough to style the dialog
           if (cmd === 'cache_info' || cmd === 'cache_clear') {
             const z = args.kind === 'all'
             return reply(200, { video: z ? 0 : 3.2 * 2 ** 30, images: z ? 0 : 446.3 * 2 ** 20, subs: 0, temp: z ? 0 : 483 * 1024, playing: false })
           }
-          // play / server_* / settings_set / danmaku_set：浏览器里没有 mpv，也不改本地配置，只记一笔（密码、弹幕接口地址里的令牌不打印）
+          // play / server_* / settings_set / danmaku_set: no mpv and no local config here, just log (password and danmaku API, which may hold a token, masked)
           console.log(`[dev-bridge] ${cmd}`, JSON.stringify(args, (k, v) => (k === 'password' || k === 'api' ? '***' : v)))
           return reply(200, null)
         } catch (e) {

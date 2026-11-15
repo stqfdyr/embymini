@@ -1869,6 +1869,16 @@ mod tests {
         assert!(st.queue[1].failed && !st.queue[1].loaded);
         assert!(loadfiles(st, mpv).await.is_empty());
 
+        // Already in the playlist, or a switch is pending: not appended
+        let (mut st, mpv, _ev) = offline_state(3);
+        st.cur = Some(0);
+        st.queue[1].loaded = true;
+        st.on_prepared(1, After::Append, Ok(ready_for("e1"))).await;
+        st.queue[1].loaded = false;
+        st.want = Some(2);
+        st.on_prepared(1, After::Append, Ok(ready_for("e1"))).await;
+        assert!(loadfiles(st, mpv).await.is_empty());
+
         // Picked episode 1, then changed to 2: episode 1's result is dropped, only 2 is played
         let (mut st, mpv, _ev) = offline_state(3);
         st.cur = Some(0);
@@ -2012,6 +2022,219 @@ mod tests {
             .filter(|e| matches!(e, Event::Stopped { .. }))
             .count();
         assert_eq!((started, stopped), (2, 2), "{got:?}");
+    }
+
+    fn prop(name: &str, data: Value) -> Value {
+        json!({ "event": "property-change", "name": name, "data": data })
+    }
+
+    /// Script messages: next / prev / jump switch episodes, with an OSD note at either end; bad jumps are ignored.
+    #[tokio::test]
+    async fn script_messages_switch_episodes() {
+        let msg = |args: Value| json!({ "event": "client-message", "args": args });
+        let (mut st, mpv, _ev) = offline_state(3);
+        for k in 0..3 {
+            st.queue[k].ready = Some(ready_for(&format!("e{k}")));
+        }
+        st.cur = Some(1);
+        st.queue[2].loaded = true;
+        st.on_message(msg(json!([NEXT_MSG]))).await; // in the playlist: playlist-next
+        for bad in ["1", "3", "x"] {
+            st.on_message(msg(json!([JUMP_MSG, bad]))).await; // the current one, out of range, garbage
+        }
+        st.on_message(msg(json!(["embymini-other"]))).await;
+        st.on_message(msg(json!([PREV_MSG]))).await; // prepared: replace at once
+        st.on_message(msg(json!([NEXT_MSG]))).await; // no longer in the playlist: replace
+        st.cur = Some(2);
+        st.on_message(msg(json!([NEXT_MSG]))).await;
+        st.cur = Some(0);
+        st.on_message(msg(json!([PREV_MSG]))).await;
+        st.on_message(msg(json!([JUMP_MSG, "2"]))).await;
+        let got: Vec<String> = commands(st, mpv)
+            .await
+            .iter()
+            .map(|c| match c[0].as_str().unwrap() {
+                "loadfile" => format!("{} {}", c[1].as_str().unwrap(), c[2].as_str().unwrap()),
+                "show-text" => c[1].as_str().unwrap().to_owned(),
+                other => other.to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "playlist-next",
+                "正在打开：",
+                "https://h.example/e0 replace",
+                "正在打开：",
+                "https://h.example/e2 replace",
+                "没有下一集了",
+                "已经是第一集",
+                "正在打开：",
+                "https://h.example/e2 replace",
+            ]
+        );
+    }
+
+    /// Preload: the next episode is prepared once playback passes the preload point (80% here), not before, not
+    /// without a duration, not when it is already in the playlist or failed before.
+    #[tokio::test]
+    async fn progress_triggers_preload() {
+        for (dur, pos, setup, want) in [
+            (100.0, 79.0, "", false),
+            (100.0, 80.0, "", true),
+            (0.0, 50.0, "", false),
+            (100.0, 90.0, "loaded", false),
+            (100.0, 90.0, "failed", false),
+        ] {
+            let (mut st, _mpv, _ev) = offline_state(2);
+            st.cur = Some(0);
+            st.queue[1].loaded = setup == "loaded";
+            st.queue[1].failed = setup == "failed";
+            st.on_message(prop("duration", json!(dur))).await;
+            st.on_message(prop("time-pos", json!(pos))).await;
+            assert_eq!(st.pos, pos);
+            assert_eq!(st.queue[1].preparing, want, "{dur} {pos} {setup}");
+            assert!(!st.queue[0].preparing);
+        }
+    }
+
+    /// Playing / Progress (pause, resume) / Stopped go to the report task with the position; nothing before the
+    /// file loads, nothing twice for the same pause state.
+    #[tokio::test]
+    async fn playback_reports_carry_the_position() {
+        let (mut st, _mpv, mut ev) = offline_state(1);
+        let (tx, mut reports) = mpsc::unbounded_channel();
+        st.reports = tx;
+        st.queue[0].ready = Some(ready_for("e0"));
+        st.queue[0].entry_id = Some(7);
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
+            .await;
+        st.on_message(prop("pause", json!(true))).await; // not loaded yet: no report
+        st.on_message(prop("pause", json!(false))).await;
+        st.on_message(json!({ "event": "file-loaded" })).await;
+        st.on_message(prop("time-pos", json!(12.5))).await;
+        st.on_message(prop("pause", json!(true))).await;
+        st.on_message(prop("pause", json!(true))).await;
+        st.on_message(prop("pause", json!(false))).await;
+        st.on_message(prop("volume", json!(55.0))).await;
+        st.on_message(json!({ "event": "end-file", "playlist_entry_id": 7, "reason": "eof" }))
+            .await;
+        assert_eq!((st.cur, st.volume), (None, Some(55.0)));
+        let mut got = Vec::new();
+        while let Ok((path, b)) = reports.try_recv() {
+            got.push((
+                path,
+                b["EventName"].as_str().unwrap_or_default().to_owned(),
+                b["PositionTicks"].as_i64().unwrap(),
+                b["IsPaused"].as_bool().unwrap(),
+            ));
+        }
+        let r = |p: &str, e: &str, t, paused| (p.to_owned(), e.to_owned(), t, paused);
+        assert_eq!(
+            got,
+            [
+                r("/Sessions/Playing", "", 0, false),
+                r("/Sessions/Playing/Progress", "Pause", 125_000_000, true),
+                r("/Sessions/Playing/Progress", "Unpause", 125_000_000, false),
+                r("/Sessions/Playing/Stopped", "", 125_000_000, false),
+            ]
+        );
+        let mut stopped = None;
+        while let Ok(e) = ev.try_recv() {
+            if let Event::Stopped { position_ticks, .. } = e {
+                stopped = Some(position_ticks);
+            }
+        }
+        assert_eq!(stopped, Some(125_000_000));
+    }
+
+    /// Track changes count as the user's choice only once this episode's tracks are set (file-loaded); the next
+    /// episode gets the same choice, its external subtitles added first.
+    #[tokio::test]
+    async fn track_choices_carry_to_the_next_episode() {
+        let pi: PlaybackInfo = fixture("playbackinfo.json");
+        let streams = &pi.media_sources[0].media_streams;
+        let (mut st, mpv, _ev) = offline_state(2);
+        for k in 0..2 {
+            let mut r = ready_for(&format!("e{k}"));
+            r.streams = streams.clone();
+            st.queue[k].ready = Some(r);
+            st.queue[k].entry_id = Some(7 + k as i64);
+        }
+        st.queue[1].ready.as_mut().unwrap().subs.push(Sub {
+            url: "https://h.example/sub".into(),
+            file: "e1_5.ass".into(),
+            title: "简中".into(),
+            lang: "chi".into(),
+        });
+        let sdh = json!({ "lang": "en", "title": "English SDH", "external": false });
+        st.on_message(prop("current-tracks/sub", sdh.clone())).await; // nothing playing
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
+            .await;
+        st.on_message(prop("current-tracks/sub", sdh.clone())).await; // tracks not set yet
+        st.on_message(prop("sid", json!("no"))).await;
+        assert_eq!(st.pref_sub, None);
+        st.on_message(json!({ "event": "file-loaded" })).await;
+        st.on_message(prop("current-tracks/sub", Value::Null)).await; // unloading
+        assert_eq!(st.pref_sub, None);
+        st.on_message(prop("current-tracks/audio", json!({ "lang": "eng" })))
+            .await;
+        st.on_message(prop("current-tracks/sub", sdh)).await;
+        st.on_message(prop("sid", json!("auto"))).await; // not "off"
+        assert!(matches!(&st.pref_sub, Some(Pref::Pick { title, .. }) if title == "English SDH"));
+        assert!(matches!(&st.pref_audio, Some(Pref::Pick { lang, .. }) if lang == "eng"));
+        st.on_message(json!({ "event": "end-file", "playlist_entry_id": 7, "reason": "eof" }))
+            .await;
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 8 }))
+            .await;
+        st.on_message(json!({ "event": "file-loaded" })).await;
+        st.on_message(prop("sid", json!(false))).await;
+        assert_eq!(st.pref_sub, Some(Pref::Off));
+        let set: Vec<Value> = commands(st, mpv)
+            .await
+            .into_iter()
+            .filter(|c| c[0] == "sub-add" || c[0] == "set_property")
+            .collect();
+        assert_eq!(
+            set,
+            [
+                json!(["sub-add", "https://h.example/sub", "auto", "简中", "chi"]),
+                json!(["set_property", "aid", 1]),
+                json!(["set_property", "sid", 2]),
+            ]
+        );
+    }
+
+    /// The cache keeps this episode and the next one already in mpv's playlist, nothing else; the upstream speed
+    /// goes to the top bar.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cache_keeps_current_and_next() {
+        let dir = std::env::temp_dir().join(format!("embymini-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut st, mpv, _ev) = offline_state(3);
+        st.stream = Stream::start(&dir, false);
+        let v = dir.join("video");
+        for k in 0..3 {
+            st.queue[k].ready = Some(ready_for(&format!("e{k}")));
+            std::fs::create_dir_all(v.join(format!("e{k}"))).unwrap();
+        }
+        st.cur = Some(1);
+        st.queue[2].loaded = true;
+        st.keep_cache();
+        for _ in 0..60 {
+            if !v.join("e0").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!v.join("e0").exists());
+        assert!(v.join("e1").exists() && v.join("e2").exists());
+        st.send_speed().await;
+        assert_eq!(
+            commands(st, mpv).await,
+            [json!(["script-message", SPEED_MSG, "0"])]
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// An entry that errors out after it started still reports Stopped; going back to a failed entry

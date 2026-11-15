@@ -2,6 +2,7 @@
      The top draws at once from the item already seen in a list (peek); detail, seasons and episodes load in parallel and fill in place.
      With several versions (1080p, 4K…) the tech line becomes a version dropdown; play and media info follow the chosen version. -->
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { Check, Heart, Link, Play, RotateCcw, User } from '@lucide/svelte'
   import Dropdown from '../lib/Dropdown.svelte'
@@ -38,8 +39,8 @@
             get<Page>('/Shows/NextUp', { SeriesId: id, UserId: u, Limit: 1, Fields: DETAIL_FIELDS }),
           ])
         : undefined,
-      // Similar titles are decoration: a failure (upstream 429…) leaves the row out instead of failing the page
-      similar: get<Page>(`/Items/${id}/Similar`, { UserId: u, Limit: 16, Fields: LIST_FIELDS }).catch((): Page => ({ Items: [], TotalRecordCount: 0 })),
+      // Similar titles are decoration: a failure (upstream 429…) keeps what is shown, or leaves the row out, instead of failing the page
+      similar: get<Page>(`/Items/${id}/Similar`, { UserId: u, Limit: 16, Fields: LIST_FIELDS }).then((p): Item[] => p.Items, (): Item[] => untrack(() => q.data?.similar) ?? []),
     }
   }
 
@@ -57,11 +58,12 @@
       season = item.SeasonId // opened from an episode: show its series with that season selected
       item = await itemDetail(item.SeriesId)
     }
-    const r = early && guessSeries === item.Id ? early : related(item.Id, item.Type === 'Series')
+    const series = item.Type === 'Series'
+    const r = early && series && guessSeries === item.Id ? early : related(item.Id, series)
     const [extras, similar] = await Promise.all([r.extras, r.similar])
     const [seasons, nextUp] = extras ?? []
     const next = nextUp?.Items[0]
-    return { item, seasons: seasons?.Items ?? [], next, similar: similar.Items, season: season ?? next?.SeasonId ?? seasons?.Items[0]?.Id }
+    return { item, seasons: seasons?.Items ?? [], next, similar, season: season ?? next?.SeasonId ?? seasons?.Items[0]?.Id }
   }
 
   // A refresh (manual or after playback) keeps the current content; new data replaces it in place
@@ -83,6 +85,8 @@
   let epsLoading = $state(true)
   /** Episode fetch failed: say so rather than "no episodes yet". */
   let epsError = $state('')
+  /** Bumped by the row's retry button: refetch just the episodes, not the whole page. */
+  let epsTry = $state(0)
   let epsKey = ''
   const seasonId = $derived(pickedSeason ?? loaded?.season)
   $effect(() => {
@@ -90,13 +94,14 @@
     const season = seasonId
     const key = `${seriesId}|${season}`
     const snap = snapKey(`eps:${key}`)
+    void epsTry
     if (key !== epsKey) {
       epsKey = key
-      const cached = readSnap<Item[]>(snap) ?? [] // not from eps: reading it here would rerun this effect whenever a fetch writes it
-      eps = cached
-      epsLoading = !cached.length
+      eps = readSnap<Item[]>(snap) ?? []
     }
     epsError = ''
+    // eps untracked: this effect writes it when the fetch lands, which must not rerun it
+    epsLoading = !!seriesId && !!season && !untrack(() => eps.length)
     if (!seriesId || !season) return
     let alive = true
     get<Page>(`/Shows/${seriesId}/Episodes`, { UserId: uid(), SeasonId: season, Fields: EP_FIELDS })
@@ -197,7 +202,7 @@
           {#each eps as ep (ep.Id)}
             <Episode {ep} fallback={bd} selected={ep.Id === t?.Id} />
           {:else}
-            {#if epsLoading}{#each { length: 5 } as _, k (k)}<div class="skeleton ep"></div>{/each}{:else if epsError}<LoadError error={epsError} what="单集加载失败" inline />{:else}<span class="muted">这一季还没有剧集</span>{/if}
+            {#if epsLoading}{#each { length: 5 } as _, k (k)}<div class="skeleton ep"></div>{/each}{:else if epsError}<LoadError error={epsError} what="单集加载失败" inline retry={() => epsTry++} />{:else}<span class="muted">这一季还没有剧集</span>{/if}
           {/each}
         </Row>
       {/if}

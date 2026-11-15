@@ -1,5 +1,6 @@
 <!-- A failed load: the reason plus a retry button (a manual refresh unless the page passes its own retry).
-     `inline` fits it into a row (e.g. the detail page's episode row) instead of a centered page message. -->
+     `inline` fits it into a row (e.g. the detail page's episode row) instead of a centered page message;
+     such a caller should pass a retry for just that row, since the default refreshes every page's data. -->
 <script lang="ts">
   import { errText, refresh } from './api.svelte'
 

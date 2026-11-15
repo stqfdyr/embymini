@@ -1,4 +1,4 @@
-// release 下不弹控制台窗口，不要删。
+// No console window in release builds: keep this.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
@@ -48,8 +48,8 @@ pub(crate) fn exit_mark(phase: &str) {
     }
 }
 
-/// 运行标记（数据目录下的 `running`，内容是版本号）：启动时写、正常退出（含自动更新）时删。
-/// 启动时它还在 = 上次崩溃、被结束进程或关机时被杀。
+/// Running marker (`running` in the data dir, holding the version): written at start, removed on a clean exit
+/// (auto-update included). Still there at start = the last run crashed or was killed.
 const RUNNING: &str = "running";
 
 pub(crate) fn set_running(root: &std::path::Path, on: bool) {
@@ -65,28 +65,28 @@ struct App {
     path: PathBuf,
     cfg: Mutex<Config>,
     http: reqwest::Client,
-    /// 资源目录里的 mpv 自带配置（ModernZ 等）；打包时若附带了 mpv.exe 也在这里。
+    /// Bundled mpv config in the resource dir (ModernZ etc.); also holds mpv.exe when the package ships one.
     mpv_dir: Option<PathBuf>,
-    /// mpv 的缓存目录：数据目录下的 `mpv-cache`，卸载时勾选「删除应用程序数据」会一起删掉。
+    /// mpv's cache dir, `mpv-cache` under the data dir, so uninstalling with "delete app data" removes it.
     mpv_cache: Option<PathBuf>,
     player: Mutex<Option<Player>>,
-    /// 海报、背景图的磁盘缓存（`emby-img` 协议）。
+    /// Disk cache for posters and backdrops (the `emby-img` protocol).
     images: std::sync::Arc<images::Images>,
-    /// 本地缓存代理（视频、字幕）；起不来时为 None，播放直连。
+    /// Local caching proxy (video, subtitles); None when it failed to start, then playback goes direct.
     stream: Option<stream::Stream>,
-    /// 弹幕缓存目录（数据目录下的 `cache/danmaku`），缓存管理里算在「字幕和弹幕」。
+    /// Danmaku cache dir (`cache/danmaku`), counted under subtitles in cache management.
     danmaku_dir: PathBuf,
-    /// 每次点播放加一；起播要等几秒，完成时若已不是最新一次点击，就作废自己。
+    /// Bumped on every play click; a start that finishes after a newer click discards itself.
     play_seq: AtomicU64,
-    /// 程序要退出了：起播中的 `play` 收到后放弃起播（见 [`App::unless_quit`]）。
+    /// The program is exiting: a starting `play` gives up (see [`App::unless_quit`]).
     quit: watch::Sender<bool>,
-    /// 还没返回的 `play` 个数（[`Starting`]），退出时等它们收尾。
+    /// `play` calls not yet returned ([`Starting`]); exit waits for them.
     starting: AtomicUsize,
-    /// 已叫停、还在收尾（回传 Stopped）的播放任务，退出时等它们（见 [`App::begin_shutdown`]）。
+    /// Players told to quit that are still reporting Stopped; exit waits for them (see [`App::retire`]).
     closing: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
 }
 
-/// 进入 `play` 时加一、离开时减一。
+/// Counts `play` calls in progress: up on entry, down when dropped.
 struct Starting<'a>(&'a AtomicUsize);
 
 impl<'a> Starting<'a> {
@@ -102,18 +102,18 @@ impl Drop for Starting<'_> {
     }
 }
 
-/// 正在进行的一次播放：发控制命令的通道 + 转发播放事件的任务（会话结束后才结束）。
+/// The current playback: its control channel and the event-forwarding task (ends after the session).
 struct Player {
     ctl: mpsc::UnboundedSender<player::Ctl>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
-/// 设置里填的 mpv 路径：去掉首尾空白和引号（资源管理器「复制为路径」会带双引号）。
+/// The mpv path from settings without surrounding blanks and quotes (Explorer's "Copy as path" adds them).
 fn clean_path(p: &str) -> &str {
     p.trim().trim_matches('"').trim()
 }
 
-/// 锁中毒（持锁时 panic）也照常取用：这里的数据都是整体替换，不会停在半改状态。
+/// Ignores lock poisoning: the data here is replaced whole, never left half-updated by a panic.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -154,19 +154,19 @@ impl App {
         closing.push(p.task);
     }
 
-    /// 起播要等几秒（取 PlaybackInfo、连 IPC），这期间 mpv 窗口已经开着。程序退出时丢掉起播的 future，
-    /// mpv 随 `Child` 一起被杀（`kill_on_drop`），不留一个没人管的空窗口。
+    /// Starting takes seconds (PlaybackInfo, IPC) with the mpv window already open. On exit the start future is
+    /// dropped and mpv dies with its `Child` (`kill_on_drop`), leaving no orphaned empty window.
     async fn unless_quit<F: Future>(&self, f: F) -> Option<F::Output> {
         let mut quit = self.quit.subscribe();
         tokio::select! {
-            biased; // 已经在退出时，即使 f 也就绪了也放弃
+            biased; // already exiting: give up even if f is ready too
             _ = quit.wait_for(|q| *q) => None,
             r = f => Some(r),
         }
     }
 
-    /// 退出的第一步，点关闭时就做（不等窗口销毁、`RunEvent::Exit`）：叫停起播中的 `play`，
-    /// 让正在播的 mpv 立刻退出；它的回传任务留给 [`App::shutdown`] 去等。可重复调用。
+    /// First exit step, run as soon as close is clicked (before window teardown and `RunEvent::Exit`): stops
+    /// starting `play` calls and tells mpv to quit; [`App::shutdown`] waits for the reports. Repeatable.
     fn begin_shutdown(&self) {
         self.quit.send_replace(true);
         if self.stop_player() {
@@ -174,9 +174,9 @@ impl App {
         }
     }
 
-    /// 程序退出前调用：mpv 是独立进程，不会跟着 EmbyMini 退出，而回传进度的任务会随进程消失，
-    /// 续播点就丢了。所以先叫停起播中的 `play` 并等它们返回（否则可能刚起播完又登记一个播放器），
-    /// 再让正在播的 mpv 退出、等回传 Stopped。总共最多等 `wait`。
+    /// Call before exiting: mpv is a separate process that outlives us, while the report tasks die with us and the
+    /// resume point is lost. So stop starting `play` calls and wait for them (or one may register a player right
+    /// after), then quit mpv and wait for the Stopped reports. Waits `wait` at most in total.
     fn shutdown(&self, wait: Duration) {
         exit_start();
         self.begin_shutdown();
@@ -186,7 +186,7 @@ impl App {
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            self.begin_shutdown(); // 等的这段时间里刚起播完登记的播放器
+            self.begin_shutdown(); // a player registered while we waited
             let tasks = std::mem::take(&mut *lock(&self.closing));
             for task in tasks {
                 if tokio::time::timeout_at(deadline, task).await.is_err() {
@@ -1082,7 +1082,7 @@ mod tests {
             mpv_dir: None,
             mpv_cache: None,
             player: Mutex::new(player),
-            // 这些测试不取图：空路径不建目录，不在临时目录留东西
+            // these tests fetch no images: an empty path creates no dirs and leaves nothing in temp
             images: images::Images::new(PathBuf::new(), images::CAP, reqwest::Client::new()),
             stream: None,
             danmaku_dir: PathBuf::new(),
@@ -1093,7 +1093,7 @@ mod tests {
         }
     }
 
-    /// 起播中退出：起播被放弃（mpv 随之被杀），shutdown 等到 play 返回，不白等满 wait。
+    /// Exit while starting: the start is dropped (killing mpv) and shutdown waits only until play returns.
     #[test]
     fn shutdown_cancels_starting_play() {
         let app = std::sync::Arc::new(test_app(None));
@@ -1110,16 +1110,16 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(1));
         assert_eq!(app.starting.load(Ordering::SeqCst), 0);
         assert!(tauri::async_runtime::block_on(task).unwrap().is_none());
-        // 已经在退出：再点播放直接放弃
+        // already exiting: a new play gives up at once
         let late = tauri::async_runtime::block_on(app.unless_quit(async { 1 }));
         assert_eq!(late, None);
     }
 
-    /// 退出时要等播放任务收尾（回传 Stopped），但不能无限等。
+    /// Exit waits for the player to finish reporting Stopped, but not forever.
     #[test]
     fn shutdown_waits_for_player_then_gives_up() {
         let app = |task, ctl| test_app(Some(Player { ctl, task }));
-        // 收到 Quit 后 200ms 才收尾：shutdown 应等到它结束
+        // finishes 200 ms after Quit: shutdown waits for it
         let (tx, mut rx) = mpsc::unbounded_channel();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d = done.clone();
@@ -1131,7 +1131,7 @@ mod tests {
         app(task, tx).shutdown(Duration::from_secs(3));
         assert!(done.load(std::sync::atomic::Ordering::SeqCst));
 
-        // 卡住不收尾：最多等 wait
+        // never finishes: wait at most `wait`
         let (tx, _rx) = mpsc::unbounded_channel();
         let task = tauri::async_runtime::spawn(std::future::pending::<()>());
         let t0 = std::time::Instant::now();

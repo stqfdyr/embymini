@@ -17,34 +17,26 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 use tokio::sync::{mpsc, watch};
 
-/// When closing started (close clicked or exit begun): each close phase logs its time since, to find where
-/// "closing hangs for a moment" is spent.
-static CLOSE_T0: Mutex<Option<Instant>> = Mutex::new(None);
+/// When the user closed the window (or the process began exiting): each close phase logs its time since, to find
+/// where "closing hangs for a moment" is spent. Only the window events start it, never [`App::shutdown`], so an
+/// update whose installer fails to start leaves no stale start behind.
+static CLOSE_T0: OnceLock<Instant> = OnceLock::new();
 
 /// Starts the timer; later calls keep the first start.
 fn exit_start() {
-    lock(&CLOSE_T0).get_or_insert_with(Instant::now);
+    CLOSE_T0.get_or_init(Instant::now);
 }
 
-/// The exit was called off (the installer did not start): the next close times from scratch.
-fn exit_cancel() {
-    *lock(&CLOSE_T0) = None;
-}
-
-fn exit_elapsed() -> Option<Duration> {
-    lock(&CLOSE_T0).map(|t0| t0.elapsed())
-}
-
-/// Logs a close phase; does nothing when not closing (e.g. mpv closed during normal use).
+/// Logs a close phase; does nothing when not closing (e.g. mpv closed during normal use or for an update).
 pub(crate) fn exit_mark(phase: &str) {
-    if let Some(t) = exit_elapsed() {
-        log::info!("关闭耗时 {phase}：{} ms", t.as_millis());
+    if let Some(t0) = CLOSE_T0.get() {
+        log::info!("关闭耗时 {phase}：{} ms", t0.elapsed().as_millis());
     }
 }
 
@@ -142,8 +134,19 @@ impl App {
 
     /// Tells the running mpv to quit; false when there is none.
     fn stop_player(&self) -> bool {
-        let p = lock(&self.player).take();
-        p.map(|p| self.retire(p)).is_some()
+        let Some(p) = lock(&self.player).take() else {
+            return false;
+        };
+        self.retire(p);
+        true
+    }
+
+    /// Saves the volume a player ended with, unless a newer `play` was clicked since `seq`: exit also waits for
+    /// the switched-away player, whose late `Ended` must not overwrite the current title's volume.
+    fn save_volume(&self, seq: u64, volume: f64) {
+        if self.play_seq.load(Ordering::SeqCst) == seq {
+            self.remember(|c| c.volume = Some(volume));
+        }
     }
 
     /// Sends Quit and keeps the task: it still reports Stopped, and [`App::shutdown`] waits for it.
@@ -178,7 +181,6 @@ impl App {
     /// resume point is lost. So stop starting `play` calls and wait for them (or one may register a player right
     /// after), then quit mpv and wait for the Stopped reports. Waits `wait` at most in total.
     fn shutdown(&self, wait: Duration) {
-        exit_start();
         self.begin_shutdown();
         tauri::async_runtime::block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
@@ -701,7 +703,7 @@ async fn play(
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     tauri::async_runtime::spawn(session.run(ctl_rx, ev_tx));
-    let task = tauri::async_runtime::spawn(forward_events(handle, ev_rx));
+    let task = tauri::async_runtime::spawn(forward_events(handle, seq, ev_rx));
     // Just in case another player got registered meanwhile: close it rather than leave an orphaned mpv
     let old = lock(&app.player).replace(Player { ctl: ctl_tx, task });
     if let Some(old) = old {
@@ -714,14 +716,13 @@ async fn play(
 /// drops its sender then), so waiting on it at exit also waits for the reports and the saved volume.
 async fn forward_events(
     handle: tauri::AppHandle,
+    seq: u64,
     mut events: mpsc::UnboundedReceiver<player::Event>,
 ) {
     while let Some(ev) = events.recv().await {
         let app = handle.state::<App>();
         match ev {
-            player::Event::Ended { volume: Some(v) } => {
-                app.remember(|c| c.volume = Some(v));
-            }
+            player::Event::Ended { volume: Some(v) } => app.save_volume(seq, v),
             // Danmaku panel changes only go to the config; the UI does not need them
             player::Event::DanmakuStyle { style } => {
                 app.remember(|c| c.danmaku.style = style);
@@ -934,14 +935,23 @@ fn on_run_event(handle: &AppHandle, ev: &tauri::RunEvent, root: &std::path::Path
 mod tests {
     use super::*;
 
-    /// A cancelled exit (installer failed to start) restarts the close timer instead of counting from that attempt.
+    /// The updater calls shutdown without exiting when the installer fails: that must not start the close timer.
+    /// (No test calls `exit_start`, so the global stays unset.)
     #[test]
-    fn cancelled_exit_restarts_the_timer() {
-        exit_start();
-        std::thread::sleep(Duration::from_millis(200));
-        exit_cancel();
-        exit_start();
-        assert!(exit_elapsed().unwrap() < Duration::from_millis(200));
+    fn shutdown_does_not_start_the_close_timer() {
+        test_app(None).shutdown(Duration::ZERO);
+        assert!(CLOSE_T0.get().is_none());
+    }
+
+    /// Only the newest play's volume is saved; a switched-away player ending late is ignored.
+    #[test]
+    fn only_the_newest_play_saves_its_volume() {
+        let app = test_app(None);
+        app.play_seq.store(2, Ordering::SeqCst);
+        app.save_volume(1, 30.0);
+        assert_eq!(app.cfg().volume, None);
+        app.save_volume(2, 40.0);
+        assert_eq!(app.cfg().volume, Some(40.0));
     }
 
     #[test]

@@ -200,7 +200,6 @@ fn judge(code: u16, json: Option<Value>) -> Result<Value, Fail> {
     let text = |m: Option<String>| format!("弹幕接口：{}", m.unwrap_or_else(fallback));
     match (class, json) {
         (Class::Ok, Some(v)) if v.is_object() && v["success"] != false => Ok(v),
-        (Class::Ok, Some(_)) => Err(Fail::Other(text(msg))),
         (Class::Auth | Class::Denied, _) => Err(Fail::Setup(format!(
             "弹幕接口拒绝访问（{code}），令牌可能已失效，请在设置里检查弹幕接口地址"
         ))),
@@ -210,6 +209,7 @@ fn judge(code: u16, json: Option<Value>) -> Result<Value, Fail> {
             "弹幕接口地址不对或被拦截（{code}，回的不是 JSON），请在设置里检查弹幕接口地址"
         ))),
         (Class::Busy | Class::Failed, _) | (_, None) => Err(Fail::Busy(text(msg))),
+        // `success:false`, or another status the API answered in JSON
         _ => Err(Fail::Other(text(msg))),
     }
 }

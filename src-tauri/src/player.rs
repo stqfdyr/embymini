@@ -1998,12 +1998,28 @@ mod tests {
         st.cur = Some(0);
         assert!(st.dm_ready());
         let key = danmaku::key(&st.emby.tag, &st.queue[0].item);
+        let seq = |st: &State| st.dm.as_ref().unwrap().seq;
+        // Switching on loads the current episode once
+        for (on, loads) in [(false, 0), (true, 1), (true, 1), (false, 1), (true, 1)] {
+            let style =
+                json!({ "on": on, "opacity": if loads == 1 { 0.5 } else { 0.8 } }).to_string();
+            st.on_danmaku(&json!(["embymini-danmaku-style", style]))
+                .await;
+            assert_eq!(seq(&st), loads, "on = {on}");
+        }
+        while ev.try_recv().is_ok() {} // the DanmakuStyle saves
+        // Unchanged words are not resent
+        let api = st.dm.as_ref().unwrap().ctx.api.clone();
+        st.dm_settings(api, Vec::new()).await;
         let mut ask = async |st: &mut State, msg: Value| {
             st.on_danmaku(&msg).await;
-            let DmMsg::Reply(name, v) = rx.recv().await.unwrap() else {
-                panic!("expected a reply")
-            };
-            (name, v)
+            loop {
+                let m = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+                match m.expect("a reply within 5 s").unwrap() {
+                    DmMsg::Reply(name, v) => return (name, v),
+                    DmMsg::Loaded(..) => {} // the load from switching on
+                }
+            }
         };
         let (name, v) = ask(&mut st, json!(["embymini-danmaku-search", "某剧"])).await;
         assert_eq!((name, v[0]["id"].clone()), ("search", json!(7)));
@@ -2041,8 +2057,8 @@ mod tests {
         assert!(
             matches!(ev.try_recv(), Ok(Event::DanmakuPick { pick, .. }) if pick == danmaku::Pick { anime: 7, offset: -2 })
         );
-        let seq = st.dm.as_ref().unwrap().seq;
-        assert_eq!(seq, 1, "the pick reloads");
+        let seq = seq(&st);
+        assert_eq!(seq, 2, "the pick reloads");
 
         // One pop-up per playback: a success in between does not re-arm it
         for r in [
@@ -2063,8 +2079,9 @@ mod tests {
         st.dm_load(0).await;
         assert_eq!(st.dm.as_ref().unwrap().seq, seq);
 
-        let status: Vec<Value> = commands(st, mpv)
-            .await
+        let cmds = commands(st, mpv).await;
+        assert!(!cmds.iter().any(|c| c[2] == "init"), "init is not resent");
+        let status: Vec<Value> = cmds
             .into_iter()
             .filter(|c| c[2] == "status")
             .map(|c| serde_json::from_str(c[3].as_str().unwrap()).unwrap())
@@ -2077,12 +2094,13 @@ mod tests {
             brief,
             [
                 ("loading", None),
+                ("loading", None),
                 ("none", Some(true)),
                 ("none", Some(false)),
                 ("setup", None)
             ]
         );
-        assert_eq!(status[3]["text"], "地址不对");
+        assert_eq!(status[4]["text"], "地址不对");
     }
 
     /// Every loadfile command the State wrote to mpv: (url, mode).

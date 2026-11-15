@@ -780,29 +780,29 @@ fn crash_message(item: &Item, status: &std::io::Result<ExitStatus>) -> Option<St
     ))
 }
 
-/// 弹幕的会话状态。
+/// Danmaku state for one playback.
 struct Dm {
     ctx: danmaku::Ctx,
-    /// 后台取数的结果送回 run 的循环（[`State::on_dm_result`]）。
+    /// Background results go back to the run loop ([`State::on_dm_result`]).
     tx: mpsc::UnboundedSender<DmMsg>,
-    /// 已经为哪一集发起过加载（避免重复取）。
+    /// Episode last loaded for the script; switching danmaku on loads the current one only if it is not this.
     shown: Option<usize>,
-    /// 地址或令牌不对（[`DmFail::Setup`]）：这次播放不再请求，面板里显示原因。
+    /// Wrong address or token ([`DmFail::Setup`]): no more requests this playback; the panel shows why.
     dead: Option<String>,
-    /// 已经弹过一次提示（没匹配上、取不到）：一次播放只提示一次，不每集都弹。
+    /// A problem (no match, unavailable) has popped up once; later ones only show in the panel.
     told: bool,
-    /// 已把设置发给脚本。
+    /// Settings already sent to the script.
     init: bool,
     /// Bumped by every load meant for the script; a result from an older one is dropped, so a slow
     /// auto match finishing after a manual pick cannot replace it (the script only checks the item).
     seq: u64,
 }
 
-/// 后台弹幕任务的结果。
+/// Results of background danmaku tasks.
 enum DmMsg {
     /// (episode index, [`Dm::seq`] of the load, result).
     Loaded(usize, u64, Result<Option<danmaku::Loaded>, DmFail>),
-    /// 回给脚本的消息（名字, JSON）：搜索结果、集列表。
+    /// A reply for the script (name, JSON): search results, an episode list.
     Reply(&'static str, Value),
 }
 
@@ -1816,9 +1816,9 @@ mod tests {
             .collect()
     }
 
-    /// 弹幕：第一集先下发设置；没填接口时说明原因、不取数；面板改设置、手动匹配会存配置；
-    /// 取到的弹幕整集发给脚本（带 item，脚本丢掉对不上的）；换集后到的旧结果丢掉；地址不对之后不再请求；
-    /// 设置页改了屏蔽词重新下发。
+    /// Danmaku: settings go first; without an API it says why and fetches nothing; panel settings and manual picks
+    /// are saved; a loaded episode goes whole to the script (tagged with its item); results for another episode are
+    /// dropped; nothing more is fetched after a bad address; changed blocked words are resent.
     #[tokio::test]
     async fn danmaku_messages() {
         let (mut st, mpv, mut ev) = offline_state(2);
@@ -1840,7 +1840,7 @@ mod tests {
         });
         st.cur = Some(0);
         st.dm_show(0).await;
-        st.dm_show(0).await; // init 只发一次
+        st.dm_show(0).await; // init goes once
         let style = json!({ "on": true, "opacity": 5, "speed": 4 }).to_string();
         st.on_message(
             json!({ "event": "client-message", "args": ["embymini-danmaku-style", style] }),
@@ -1856,15 +1856,15 @@ mod tests {
             manual: true,
             stale: false,
         };
-        st.on_dm_result(DmMsg::Loaded(1, 0, Ok(None))).await; // 不是当前集：丢掉
+        st.on_dm_result(DmMsg::Loaded(1, 0, Ok(None))).await; // not the current episode: dropped
         st.on_dm_result(DmMsg::Loaded(0, 0, Ok(Some(loaded)))).await;
         st.on_dm_result(DmMsg::Loaded(0, 0, Err(DmFail::Setup("地址不对".into()))))
             .await;
         assert!(!st.dm_ready());
-        st.dm_settings(None, vec!["剧透".into()]).await; // 设置页改了屏蔽词：重新下发
+        st.dm_settings(None, vec!["剧透".into()]).await; // blocked words changed on the settings page: resent
         assert!(
             st.dm.as_ref().unwrap().dead.is_none(),
-            "改了设置就不再认定地址不对"
+            "new settings clear the bad-address verdict"
         );
         let id0 = st.queue[0].item.id.clone();
 
@@ -1890,14 +1890,14 @@ mod tests {
                 "init", "status", "status", "status", "load", "status", "init"
             ]
         );
-        assert_eq!(cmds[1].1["kind"], "setup"); // 没填接口
+        assert_eq!(cmds[1].1["kind"], "setup"); // no API set
         assert_eq!(
             (&cmds[1].1["start"], &cmds[1].1["item"]),
             (&json!(true), &json!(id0))
         );
         assert_eq!(
             cmds[4].1["item"], id0,
-            "脚本按 item 丢掉换集前发出的晚到结果"
+            "the script drops late results by item"
         );
         assert_eq!(cmds[6].1["words"], json!(["剧透"]));
         assert_eq!(cmds[4].1["list"][0][3], "好");
@@ -3479,9 +3479,10 @@ mod tests {
         );
     }
 
-    /// 弹幕端到端：真服 + 真弹幕接口（`DANMU_API`），起播后弹幕自动匹配、加载进脚本；给了 SHOT_DIR 就截弹幕和设置面板两张图。
-    /// 选片用 `EMBY_TEST_ITEM`（最好是国产剧 / 动画，能匹配上），不给就随便挑一集（可能匹配不上，只验证流程不出错）。
-    /// 无显示器时同 [`e2e_ui_shots`]。
+    /// Danmaku end to end: real server + real danmaku API (`DANMU_API`); after start the episode is matched and loaded
+    /// into the script; with SHOT_DIR it screenshots the danmaku and the settings panel.
+    /// `EMBY_TEST_ITEM` picks the episode (a Chinese drama or anime matches best); without it any episode is used,
+    /// which may not match and then only checks nothing fails. Headless setup as in [`e2e_ui_shots`].
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "需要真服账号、弹幕接口、DISPLAY 和 PATH 里的 mpv"]
     async fn e2e_danmaku() {

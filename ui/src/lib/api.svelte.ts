@@ -22,24 +22,23 @@ export const errText = (e: unknown) => String((e as { message?: unknown } | null
 export const LIST_FIELDS = 'ProductionYear,EndDate,CommunityRating,UserData,PrimaryImageAspectRatio,RunTimeTicks,Overview,Genres,OfficialRating,RecursiveItemCount'
 export const DETAIL_FIELDS = `${LIST_FIELDS},People,ExternalUrls,ProviderIds,MediaSources,Studios,PremiereDate,Status`
 /** Fields episode cards need. */
+export const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'
 /** Library types browsable as movies / series (music, live TV and playlists stay off the home page and the library wall). */
 const BROWSABLE = new Set(['movies', 'tvshows', 'homevideos', 'boxsets', 'mixed', undefined])
 export const browsable = (views: Item[]) => views.filter((v) => BROWSABLE.has(v.CollectionType))
-/** Continue watching for the home row: the first 16 and the real count. Some servers report the number returned as the
- *  total; for them a lean second request counts the list (shortcut: up to 1000, shown as "1000+", far beyond real lists).
- *  If that count fails the row still shows, with "16+". */
+/** Continue watching for the home row: the first 16 and their count. `exact` is false when the count may be short: the
+ *  server reported only the number returned as the total (some do), so `resumeCount` counts the list afterwards. */
 export async function resumeHome() {
-  const u = uid()
-  const p = await get<Page>(`/Users/${u}/Items/Resume`, { Limit: 16, MediaTypes: 'Video', Fields: LIST_FIELDS })
+  const p = await get<Page>(`/Users/${uid()}/Items/Resume`, { Limit: 16, MediaTypes: 'Video', Fields: LIST_FIELDS })
   const n = p.Items.length
-  if (p.TotalRecordCount > n || n < 16) return { items: p.Items, count: String(Math.max(p.TotalRecordCount, n)) }
-  const count = await get<Page>(`/Users/${u}/Items/Resume`, { Limit: 1000, MediaTypes: 'Video', EnableImages: false, EnableUserData: false }).then(
-    (all) => (all.Items.length >= 1000 ? '1000+' : String(all.Items.length)),
-    () => `${n}+`,
-  )
-  return { items: p.Items, count }
+  return { items: p.Items, total: Math.max(p.TotalRecordCount, n), exact: p.TotalRecordCount > n || n < 16 }
 }
-export const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'
+/** Counts continue watching with a lean request, after the home row is up (shortcut: up to 1000, shown as "1000+",
+ *  far beyond real lists). */
+export const resumeCount = () =>
+  get<Page>(`/Users/${uid()}/Items/Resume`, { Limit: 1000, MediaTypes: 'Video', EnableImages: false, EnableUserData: false }).then((all) =>
+    all.Items.length >= 1000 ? '1000+' : String(all.Items.length),
+  )
 
 /** Bottom-right notice (playback failed etc.); gone after TOAST_MS or on click, may carry one button (e.g. undo). */
 type Toast = { id: number; text: string; action?: { label: string; run: () => unknown } }
@@ -234,11 +233,12 @@ export function itemMenu(it: Item, open?: () => void): MenuItem[] {
  * does nothing until `retry()`, a new query or a refresh, so the grid cannot retry in a loop. Call during component init.
  *
  * Servers that misreport totals or ignore StartIndex are handled by the rules in page.ts; once StartIndex is found
- * ignored, each page asks from 0 for one page more and keeps the tail.
+ * ignored, each page asks from 0 for one page more and keeps the tail (transfer grows with the list, fine for the
+ * lists this hits; a server that also caps Limit cannot be read past its cap by any request, so the list ends there).
  */
 export function pager(query: () => Record<string, unknown>, sub = 'Items') {
   const size = 60
-  const s = $state({ items: [] as Item[], total: 0, busy: false, error: '', loaded: false, done: false })
+  const s = $state({ items: [] as Item[], total: 0, exact: false, busy: false, error: '', loaded: false, done: false })
   let gen = 0
   let q: Record<string, unknown> = {}
   /** Showing the first-page snapshot (snap.ts): the next fetch starts at 0 and replaces it. */
@@ -263,13 +263,13 @@ export function pager(query: () => Record<string, unknown>, sub = 'Items') {
         p = await fetchPage(start)
         if (mine !== gen) return
       }
-      const { fresh, done, total } = merge(shown, p, size, grow ? start : 0)
+      const { fresh, done, total, exact } = merge(shown, p, size, grow ? start : 0)
       if (start === 0) {
         s.items = fresh
         fromSnap = false
       } else s.items.push(...fresh)
-      Object.assign(s, { done, total })
-      if (start === 0) writeSnap(key(), { items: s.items, total: s.total, done: s.done })
+      Object.assign(s, { done, total, exact })
+      if (start === 0) writeSnap(key(), { items: s.items, total: s.total, exact, done })
       s.loaded = true
       s.error = ''
     } catch (e) {
@@ -285,11 +285,11 @@ export function pager(query: () => Record<string, unknown>, sub = 'Items') {
     void session.refresh
     q = query()
     gen++
-    const snap = readSnap<{ items: Item[]; total: number; done?: boolean }>(key())
+    const snap = readSnap<{ items: Item[]; total: number; exact?: boolean; done?: boolean }>(key())
     fromSnap = !!snap
     failed = false
     grow = false
-    Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap, done: !!snap?.done })
+    Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap, done: !!snap?.done, exact: !!snap?.exact })
     untrack(more)
   })
   const retry = () => ((failed = false), more())

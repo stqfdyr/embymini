@@ -10,18 +10,18 @@ const page = (it: Item[], total: number): Page => ({ Items: it, TotalRecordCount
 
 test('honest total: shows it while paging, ends on a full last page without an extra request', () => {
   const first = merge([], page(items(0, 3), 6), 3)
-  assert.deepEqual([first.done, first.total], [false, 6])
+  assert.deepEqual([first.done, first.total, first.exact], [false, 6, true])
   const last = merge(items(0, 3), page(items(3, 3), 6), 3)
   assert.deepEqual([last.fresh.map((i) => i.Id), last.done, last.total], [['3', '4', '5'], true, 6])
 })
 
 test('total = number returned: a full page is not the end, the count grows, a short page ends it exactly', () => {
   const first = merge([], page(items(0, 3), 3), 3)
-  assert.deepEqual([first.done, first.total], [false, 3])
+  assert.deepEqual([first.done, first.total, first.exact], [false, 3, false])
   const second = merge(items(0, 3), page(items(3, 3), 3), 3)
   assert.deepEqual([second.done, second.total], [false, 6])
   const last = merge(items(0, 6), page(items(6, 2), 2), 3)
-  assert.deepEqual([last.done, last.total], [true, 8])
+  assert.deepEqual([last.done, last.total, last.exact], [true, 8, true])
   assert.equal(merge(items(0, 6), page([], 0), 3).done, true)
 })
 

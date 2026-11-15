@@ -27,7 +27,6 @@
   let tab = $state(session.cfg?.servers.length ? lastTab : 'server')
   function pick(id: string) {
     tab = lastTab = id
-    msg = null // a result belongs to the tab it came from
   }
   /** Up / down (and Home / End) move between tabs, as in a native tab list; focus follows the selection. */
   function tabKey(e: KeyboardEvent) {
@@ -51,7 +50,8 @@
   let relogin = $state<{ id: string; password: string } | null>(null)
   /** Changes in flight; a count, as a save on blur can overlap a button click. */
   let busy = $state(0)
-  let msg = $state<{ text: string; ok: boolean } | null>(null)
+  /** Result of the last change, shown only on the tab it was made from. */
+  let msg = $state<{ text: string; ok: boolean; tab: string } | null>(null)
   let mpvPath = $state(session.cfg?.mpvPath ?? '')
   let preload = $state(session.cfg?.preloadPercent ?? 80)
   let updateProxy = $state(session.cfg?.updateProxy ?? '')
@@ -66,15 +66,16 @@
   /** Apply a change, then reload the config (other pages are unmounted here and refetch when shown).
    *  Resolves to whether it worked; a failure shows the backend's reason and leaves the inputs as typed. */
   async function run(f: () => Promise<unknown>, ok?: string) {
+    const from = tab
     busy++
     msg = null
     try {
       await f()
       await loadConfig()
-      if (ok) msg = { text: ok, ok: true }
+      if (ok) msg = { text: ok, ok: true, tab: from }
       return true
     } catch (e) {
-      msg = { text: errText(e), ok: false }
+      msg = { text: errText(e), ok: false, tab: from }
       return false
     } finally {
       busy--
@@ -346,7 +347,7 @@
         </div>
       {/if}
 
-      {#if msg}<p class="msg" class:err={!msg.ok}>{msg.text}</p>{/if}
+      {#if msg?.tab === tab}<p class="msg" class:err={!msg.ok}>{msg.text}</p>{/if}
     </div>
   </div>
 </div>

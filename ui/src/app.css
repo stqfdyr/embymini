@@ -99,9 +99,9 @@ img { display: block; }
 h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 h2 { font-size: 18px; }
 
-/* Focus ring only for keyboard use: a soft accent halo, as on macOS */
+/* Focus ring only for keyboard use: solid accent with a gap, readable on any fill (text fields add a halo of their own) */
 :focus { outline: none; }
-:focus-visible { outline: 3px solid var(--ring); outline-offset: 1px; border-radius: var(--radius-s); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-s); }
 
 /* Thin rounded scrollbars that thicken on hover (macOS style) */
 ::-webkit-scrollbar { width: 12px; height: 12px; }

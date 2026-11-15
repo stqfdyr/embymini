@@ -5,7 +5,7 @@
   import Grid from '../lib/Grid.svelte'
   import LoadError from '../lib/LoadError.svelte'
   import Wide from '../lib/Wide.svelte'
-  import { LIST_FIELDS, browsable, get, img, loader, pager, play, prefetch, resumeMenu, uid, wideImg } from '../lib/api.svelte'
+  import { LIST_FIELDS, browsable, get, img, loader, pager, play, prefetch, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
   import { openMenu } from '../lib/menu.svelte'
   import { clock, episodeLabel } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
@@ -14,10 +14,23 @@
   let { kind }: { kind: 'views' | 'resume' } = $props()
   const fixed = untrack(() => kind) // keyed by route in App, so it never changes
 
-  const views = fixed === 'views' ? loader(() => get<Page>(`/Users/${uid()}/Views`).then((p) => browsable(p.Items)), () => 'shelf:views') : null
-  const resume = fixed === 'resume' ? pager(() => ({ MediaTypes: 'Video', Fields: LIST_FIELDS }), 'Items/Resume') : null
+  const views =
+    fixed === 'views'
+      ? loader(() => {
+          void session.refresh
+          return get<Page>(`/Users/${uid()}/Views`).then((p) => browsable(p.Items))
+        }, () => 'shelf:views')
+      : null
+  // Quiet reloads too (pager itself follows only manual ones): removing, marking played or playing changes this list
+  const resume =
+    fixed === 'resume'
+      ? pager(() => {
+          void session.quiet
+          return { MediaTypes: 'Video', Fields: LIST_FIELDS }
+        }, 'Items/Resume')
+      : null
   restoreScrollWhen(() => views?.data ?? resume?.s.loaded)
-  const count = $derived(views?.data ? `${views.data.length} 个` : resume?.s.loaded ? `${resume.s.total}${resume.s.done ? '' : '+'} 部` : '')
+  const count = $derived(views?.data ? `${views.data.length} 个` : resume?.s.loaded ? `${resume.s.total}${resume.s.exact ? '' : '+'} 部` : '')
 </script>
 
 {#snippet library(v: Item)}

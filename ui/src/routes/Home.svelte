@@ -5,7 +5,7 @@
   import LoadError from '../lib/LoadError.svelte'
   import Row from '../lib/Row.svelte'
   import Wide from '../lib/Wide.svelte'
-  import { LIST_FIELDS, browsable, get, img, loader, play, prefetch, resumeHome, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
+  import { LIST_FIELDS, browsable, get, img, loader, play, prefetch, resumeCount, resumeHome, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
   import { openMenu } from '../lib/menu.svelte'
   import { clock, episodeLabel } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
@@ -22,8 +22,10 @@
     return Promise.all([
       get<Page>(`/Users/${u}/Views`),
       resumeHome(),
-    ]).then(([views, resume]) => ({ views: browsable(views.Items), resume: resume.items, resumeCount: resume.count }))
+    ]).then(([views, resume]) => ({ views: browsable(views.Items), resume }))
   }, () => 'home')
+  // The real count when the server's may be short; until it arrives (or if it fails) the row shows "16+"
+  const counted = loader(() => (q.data && !q.data.resume.exact ? resumeCount() : Promise.resolve(null)))
   restoreScrollWhen(() => q.data)
 </script>
 
@@ -37,9 +39,9 @@
     {/each}
   </Row>
 
-  {#if d.resume.length}
-    <Row title="继续观看" count={d.resumeCount} href="#/resume">
-      {#each d.resume as it (it.Id)}
+  {#if d.resume.items.length}
+    <Row title="继续观看" count={d.resume.exact ? d.resume.total : (counted.data ?? `${d.resume.total}+`)} href="#/resume">
+      {#each d.resume.items as it (it.Id)}
         <Wide
           src={wideImg(it, 300)}
           title={it.SeriesName ?? it.Name}

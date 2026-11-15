@@ -3074,6 +3074,45 @@ mod tests {
         assert!(line.contains(emby::UA), "UA 被个人配置改掉了：{line}");
     }
 
+    /// The danmaku script (layout, merging, escaping, panel, message handling) inside a real mpv against a fake `mp`:
+    /// `testdata/danmaku_test.lua` loads `mpv/scripts/danmaku.lua`, drives it and quits with 1 on any failed check.
+    #[test]
+    #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
+    fn danmaku_script() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mpv = if cfg!(windows) {
+            dir.join("mpv").join("mpv.exe")
+        } else {
+            "mpv".into()
+        };
+        let out = std::process::Command::new(mpv)
+            .args([
+                "--no-config",
+                "--idle=yes",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+                &format!(
+                    "--script={}",
+                    dir.join("testdata").join("danmaku_test.lua").display()
+                ),
+                &format!(
+                    "--script-opts=dmtest-src={}",
+                    dir.join("mpv")
+                        .join("scripts")
+                        .join("danmaku.lua")
+                        .display()
+                ),
+            ])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && text.contains("danmaku_test: ok"),
+            "{text}"
+        );
+    }
+
     /// Copies the bundled config directory to `to` (as if installed elsewhere).
     fn copy_dir(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();

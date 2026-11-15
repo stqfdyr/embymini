@@ -390,17 +390,18 @@ fn strip_key(url: String) -> String {
     u.into()
 }
 
-/// File extension for a subtitle codec; letters and digits only, since the codec name comes from the server.
+/// File extension for a subtitle codec; letters, digits and `_` only (`mov_text`), since the codec name comes from the server.
 pub fn subtitle_ext(codec: Option<&str>) -> String {
     let c: String = codec
         .unwrap_or_default()
         .chars()
-        .filter(char::is_ascii_alphanumeric)
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .map(|c| c.to_ascii_lowercase())
         .collect();
-    match c.to_ascii_lowercase().as_str() {
+    match c.as_str() {
         "" | "subrip" => "srt".into(),
         "pgssub" => "sup".into(),
-        c => c.to_owned(),
+        _ => c,
     }
 }
 
@@ -612,6 +613,7 @@ pub(crate) mod tests {
         assert_eq!(subtitle_ext(Some("PGSSUB")), "sup");
         assert_eq!(subtitle_ext(Some("ass")), "ass");
         assert_eq!(subtitle_ext(Some("../x/y")), "xy");
+        assert_eq!(subtitle_ext(Some("mov_text")), "mov_text");
         assert_eq!(subtitle_ext(Some("./")), "srt");
     }
 

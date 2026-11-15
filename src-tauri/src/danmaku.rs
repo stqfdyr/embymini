@@ -147,7 +147,7 @@ pub fn match_name(item: &Item) -> String {
 /// Emby 集号对应的接口集序号（从 0 起，未加偏移）。电影等没有集号的算第 0 集。
 pub fn index(item: &Item) -> i32 {
     match item.kind.as_str() {
-        "Episode" => item.index_number.unwrap_or(1) - 1,
+        "Episode" => item.index_number.unwrap_or(1).saturating_sub(1),
         _ => 0,
     }
 }
@@ -409,7 +409,7 @@ pub struct Loaded {
 pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fail> {
     let ep = match &w.pick {
         Some(p) => {
-            let i = w.index + p.offset;
+            let i = w.index.saturating_add(p.offset);
             let eps = api.episodes(p.anime).await?;
             usize::try_from(i).ok().and_then(|i| eps.into_iter().nth(i))
         }
@@ -429,7 +429,9 @@ pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fai
             Ok(v) => {
                 prune(dir);
                 let text = Value::Array(v).to_string();
-                write(&path, &text).map_err(Fail::Other)?;
+                if let Err(e) = write(&path, &text) {
+                    log::warn!("{e}");
+                }
                 list = Some(text);
             }
             Err(e @ (Fail::Busy(_) | Fail::Other(_))) if path.is_file() => {
@@ -520,6 +522,8 @@ mod tests {
         assert_eq!(match_name(&movie), "沙丘2 (2024)");
         assert_eq!(key("t", &movie), "t:9");
         assert_eq!(index(&movie), 0);
+        let odd = item("Episode", Some("某番"), None, Some(i32::MIN));
+        assert_eq!(index(&odd), i32::MIN, "a bogus episode number saturates");
     }
 
     #[test]
@@ -642,6 +646,100 @@ mod tests {
             .collect();
         assert!(ts.into_iter().all(|t| t.join().unwrap()));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "不留临时文件");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn age(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Behaviour of `comment/101` on the fake API: 0 = comments, 1 = "no such episode", 2 = 401.
+    static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    fn route(path: &str) -> (&'static str, String) {
+        let ok = |v: Value| ("200 OK", v.to_string());
+        let comments = |m: &str| ok(json!({"comments":[{"p":"1.5,1,16777215","m":m}]}));
+        let gone = || ("404 Not Found", json!({"success":false,"errorMessage":"没有这一集"}).to_string());
+        match path.trim_start_matches("/x/tok/api/v2/") {
+            "match" => ok(json!({"matches":[{"episodeId":101,"animeTitle":"某剧","episodeTitle":"第3集"}]})),
+            "bangumi/7" => ok(json!({"bangumi":{"animeTitle":"某剧","episodes":[
+                {"episodeId":1,"episodeTitle":"第1集"},{"episodeId":2},{"episodeId":3,"episodeTitle":"第3集"}]}})),
+            "comment/101" => match MODE.load(Ordering::SeqCst) {
+                0 => comments("好"),
+                1 => gone(),
+                _ => ("401 Unauthorized", String::new()),
+            },
+            "comment/3" => comments("三"),
+            _ => gone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_matches_caches_and_falls_back() {
+        let (port, heads) = emby::tests::fake(route).await;
+        let api = Api::new(
+            emby::http_client().unwrap(),
+            &format!("http://127.0.0.1:{port}/x/tok/"),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("embymini-dm-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, recent) = (dir.join("old.json"), dir.join("recent.json"));
+        std::fs::write(&old, "[]").unwrap();
+        std::fs::write(&recent, "[]").unwrap();
+        age(&old, 8 * 24 * 3600);
+        age(&recent, 6 * 24 * 3600);
+        let auto = Want {
+            name: "某剧 S01E03".into(),
+            index: 2,
+            pick: None,
+        };
+        let list = |l: &Loaded| serde_json::from_str::<Value>(&l.list).unwrap()[0][3].clone();
+
+        let l = load(&api, &dir, &auto).await.unwrap().unwrap();
+        assert_eq!((l.title.as_str(), l.manual, l.stale), ("某剧 第3集", false, false));
+        assert_eq!(list(&l), "好");
+        let cached = dir.join(format!("{}-101.json", crate::config::server_tag(&api.base)));
+        assert!(cached.is_file());
+        assert!(!old.exists() && recent.exists(), "a successful fetch prunes week-old files only");
+
+        let n = heads.lock().unwrap().len();
+        assert!(load(&api, &dir, &auto).await.unwrap().is_some());
+        let sent = heads.lock().unwrap()[n..].to_vec();
+        assert_eq!(sent.len(), 1, "a fresh cache only re-matches: {sent:?}");
+
+        // Stale cache: used when the API fails softly, not when the address is wrong.
+        age(&cached, 2 * 24 * 3600);
+        MODE.store(1, Ordering::SeqCst);
+        let l = load(&api, &dir, &auto).await.unwrap().unwrap();
+        assert!(l.stale);
+        assert_eq!(list(&l), "好");
+        MODE.store(2, Ordering::SeqCst);
+        assert!(matches!(load(&api, &dir, &auto).await, Err(Fail::Setup(_))));
+
+        // Manual pick: API index = Emby index + offset.
+        let pick = |offset| Want {
+            pick: Some(Pick { anime: 7, offset }),
+            index: 1,
+            ..auto.clone()
+        };
+        let l = load(&api, &dir, &pick(1)).await.unwrap().unwrap();
+        assert_eq!((l.title.as_str(), l.manual), ("某剧 第3集", true));
+        assert_eq!(list(&l), "三");
+        assert_eq!(load(&api, &dir, &pick(5)).await, Ok(None));
+        assert_eq!(load(&api, &dir, &pick(i32::MAX)).await, Ok(None));
+        // No cache to fall back on: the API's own error comes through.
+        assert_eq!(
+            load(&api, &dir, &pick(-1)).await,
+            Err(Fail::Other("弹幕接口：没有这一集".into()))
+        );
+
+        // An unwritable cache still shows the danmaku.
+        MODE.store(0, Ordering::SeqCst);
+        let l = load(&api, &recent, &auto).await.unwrap().unwrap();
+        assert_eq!(list(&l), "好");
         let _ = std::fs::remove_dir_all(dir);
     }
 

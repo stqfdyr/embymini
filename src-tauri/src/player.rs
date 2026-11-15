@@ -1506,7 +1506,8 @@ impl State {
                         let r = api.episodes(anime).await.map(|l| {
                             // 默认选中：按已有的匹配偏移或集号算出的那一集
                             let off = pick.filter(|p| p.anime == anime).map_or(0, |p| p.offset);
-                            let at = (danmaku::index(&item) + off)
+                            let at = danmaku::index(&item)
+                                .saturating_add(off)
                                 .clamp(0, l.len().saturating_sub(1) as i32);
                             json!({ "anime": anime, "list": l, "at": at })
                         });
@@ -1522,7 +1523,7 @@ impl State {
                 };
                 let pick = danmaku::Pick {
                     anime,
-                    offset: at - danmaku::index(&item),
+                    offset: at.saturating_sub(danmaku::index(&item)),
                 };
                 d.ctx.cfg.picks.insert(key.clone(), pick.clone());
                 d.dead = None;

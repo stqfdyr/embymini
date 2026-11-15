@@ -292,7 +292,11 @@ fn title(item: &Item) -> String {
 /// Why an entry failed to load: the upstream status when there is one, else mpv's own error.
 fn fail_reason(status: Option<u16>, mpv_error: &str) -> String {
     match status {
-        Some(s) if !(200..300).contains(&s) => crate::status::describe(s, ""),
+        Some(s) if crate::status::classify(s) != crate::status::Class::Ok => {
+            crate::status::describe(s, "")
+        }
+        // A 3xx the proxy could not follow: describe() would call it a success
+        Some(s) if !(200..300).contains(&s) => format!("拉流返回 HTTP {s}"),
         _ => format!("mpv 无法打开（{mpv_error}）"),
     }
 }
@@ -953,7 +957,10 @@ impl State {
             None => self.on_reply(&v).await,
             Some("property-change") => self.on_property(&v),
             Some("client-message") => self.on_client_message(&v["args"]).await,
-            Some(ev) => self.on_file_event(ev, &v).await,
+            Some(ev @ ("start-file" | "file-loaded" | "end-file")) => {
+                self.on_file_event(ev, &v).await
+            }
+            Some(_) => {}
         }
     }
 
@@ -976,11 +983,8 @@ impl State {
         }
     }
 
-    /// start-file / file-loaded / end-file; other events are ignored.
+    /// start-file / file-loaded / end-file.
     async fn on_file_event(&mut self, ev: &str, v: &Value) {
-        if !matches!(ev, "start-file" | "file-loaded" | "end-file") {
-            return;
-        }
         let entry = self.index_of(v["playlist_entry_id"].as_i64());
         // These lines rebuild mpv's timeline when chasing a failed switch or load; file-loaded has no entry id
         let id = entry
@@ -1024,8 +1028,7 @@ impl State {
             }
             ("end-file", Some(i)) => {
                 if v["reason"] == "error" {
-                    self.fail(i, v["file_error"].as_str().unwrap_or("未知错误"))
-                        .await;
+                    self.fail(i, v["file_error"].as_str().unwrap_or("未知错误"));
                 } else {
                     self.stop(i);
                 }
@@ -1184,31 +1187,32 @@ impl State {
         self.applied = Some(i);
     }
 
-    /// Load failed: gets the upstream status (the cache proxy has it; without the proxy, probes the link once) and
-    /// tells the UI why.
-    async fn fail(&mut self, i: usize, mpv_error: &str) {
-        let status = match (&self.queue[i].ready, &self.stream) {
-            (Some(r), Some(s)) => s.fail_status(&r.name),
-            (Some(r), None) => self.emby.probe(&r.url).await,
-            (None, _) => None,
+    /// Load failed: reports Stopped if it had started, and tells the UI why. The upstream status comes from the cache
+    /// proxy; without one, from a probe of the link, done off the event loop (a stuck upstream must not stall mpv).
+    fn fail(&mut self, i: usize, mpv_error: &str) {
+        let e = &self.queue[i];
+        let (known, probe) = match (&e.ready, &self.stream) {
+            (Some(r), Some(s)) => (s.fail_status(&r.name), None),
+            (Some(r), None) => (None, Some(r.url.clone())),
+            (None, _) => (None, None),
         };
-        self.stop(i); // reports Stopped if it had started
-        let e = &mut self.queue[i];
-        // Its play session is spent either way: going back fetches a fresh PlaybackInfo. `ready` stays,
-        // so the end of the session still stops its download.
-        e.stopped = true;
-        let message = format!(
-            "无法播放「{}」：{}",
-            title(&e.item),
-            fail_reason(status, mpv_error)
-        );
-        log::warn!("{message}（条目 {}）", e.item.id);
-        let item_id = e.item.id.clone();
-        if self.cur == Some(i) {
-            self.cur = None;
-        }
+        let (name, item_id) = (title(&e.item), e.item.id.clone());
+        self.stop(i);
+        // Its play session is spent: going back fetches a fresh PlaybackInfo, never replays it from the playlist.
+        // `ready` stays, so the end of the session still stops its download.
+        self.queue[i].loaded = false;
         self.failed_sent = true;
-        let _ = self.events.send(Event::Failed { item_id, message });
+        let (emby, events, mpv_error) =
+            (self.emby.clone(), self.events.clone(), mpv_error.to_owned());
+        tokio::spawn(async move {
+            let status = match probe {
+                Some(url) => emby.probe(&url).await,
+                None => known,
+            };
+            let message = format!("无法播放「{name}」：{}", fail_reason(status, &mpv_error));
+            log::warn!("{message}（条目 {item_id}）");
+            let _ = events.send(Event::Failed { item_id, message });
+        });
     }
 
     /// Hands to the report task (doesn't wait). `what` is `""` / `"/Progress"` / `"/Stopped"`.
@@ -1241,15 +1245,16 @@ impl State {
         }
     }
 
+    /// This playback of entry i is over: Stopped is reported once, and only if it had started.
     fn stop(&mut self, i: usize) {
-        if !self.queue[i].started || self.queue[i].stopped {
-            return;
-        }
-        self.report(i, "/Stopped", json!({}));
-        self.queue[i].stopped = true;
         if self.cur == Some(i) {
             self.cur = None;
         }
+        let was_stopped = std::mem::replace(&mut self.queue[i].stopped, true);
+        if !self.queue[i].started || was_stopped {
+            return;
+        }
+        self.report(i, "/Stopped", json!({}));
         let _ = self.events.send(Event::Stopped {
             item_id: self.queue[i].item.id.clone(),
             position_ticks: (self.pos * TICKS_PER_SEC) as i64,
@@ -2241,45 +2246,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// An entry that errors out after it started still reports Stopped; going back to a failed entry
-    /// fetches PlaybackInfo afresh instead of reusing the old link and play session.
-    #[tokio::test]
+    /// Events until the Failed one (sent from a background task).
+    async fn until_failed(ev: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
+        let mut got = Vec::new();
+        while let Ok(Some(e)) = tokio::time::timeout(Duration::from_secs(5), ev.recv()).await {
+            let done = matches!(e, Event::Failed { .. });
+            got.push(e);
+            if done {
+                break;
+            }
+        }
+        got
+    }
+
+    /// An entry that errors out after it started still reports Stopped; a failed entry leaves the playlist and
+    /// going back to it fetches PlaybackInfo afresh instead of reusing the old link and play session.
+    #[tokio::test(flavor = "multi_thread")]
     async fn failed_entry_stops_and_refetches() {
+        let dir = std::env::temp_dir().join(format!("embymini-fail-{}", std::process::id()));
         let (mut st, _mpv, mut ev) = offline_state(2);
-        let mut r = ready_for("e0");
-        r.url = "http://127.0.0.1:1/e0".into(); // probe is refused: no status
-        st.queue[0].ready = Some(r);
-        st.queue[0].entry_id = Some(7);
+        st.stream = Stream::start(&dir, false); // knows no status for these: no network involved
+        for (k, e) in st.queue.iter_mut().enumerate() {
+            e.ready = Some(ready_for(&format!("e{k}")));
+            e.entry_id = Some(7 + k as i64);
+            e.loaded = true;
+        }
         st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
             .await;
         st.on_message(json!({ "event": "file-loaded" })).await;
         st.on_message(json!({ "event": "end-file", "playlist_entry_id": 7, "reason": "error", "file_error": "boom" }))
             .await;
-        let mut got = Vec::new();
-        while let Ok(e) = ev.try_recv() {
-            got.push(e);
-        }
+        let got = until_failed(&mut ev).await;
         assert!(
             got.iter().any(|e| matches!(e, Event::Stopped { .. })),
             "{got:?}"
         );
         assert!(
-            got.iter().any(|e| matches!(e, Event::Failed { message, .. } if message.contains("mpv 无法打开（boom）"))),
+            matches!(got.last(), Some(Event::Failed { message, .. }) if message.contains("mpv 无法打开（boom）")),
             "{got:?}"
         );
         assert_eq!(st.cur, None);
+        assert!(!st.queue[0].loaded, "not replayed from mpv's playlist");
         st.jump(0).await;
         assert_eq!(st.want, Some(0), "a failed entry must be prepared again");
 
         // Never loaded at all: nothing to report, but its session is spent too
-        let mut r = ready_for("e1");
-        r.url = "http://127.0.0.1:1/e1".into();
-        st.queue[1].ready = Some(r);
-        st.queue[1].entry_id = Some(8);
         st.on_message(json!({ "event": "start-file", "playlist_entry_id": 8 }))
             .await;
         st.on_message(json!({ "event": "end-file", "playlist_entry_id": 8, "reason": "error", "file_error": "boom" }))
             .await;
+        let got = until_failed(&mut ev).await;
+        assert!(
+            !got.iter().any(|e| matches!(e, Event::Stopped { .. })),
+            "{got:?}"
+        );
         assert!(
             st.queue[1].ready.is_some(),
             "kept: the session end stops its download"
@@ -2287,6 +2307,35 @@ mod tests {
         assert_eq!(st.cur, None);
         st.jump(1).await;
         assert_eq!(st.want, Some(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Without the cache proxy a failure probes the link; a stuck upstream must not hold up mpv's event handling.
+    #[tokio::test]
+    async fn failure_probe_does_not_block() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        let (mut st, _mpv, _ev) = offline_state(1);
+        let mut r = ready_for("e0");
+        r.url = format!("http://127.0.0.1:{port}/e0");
+        st.queue[0].ready = Some(r);
+        st.queue[0].entry_id = Some(7);
+        st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
+            .await;
+        let end = st
+            .on_message(json!({ "event": "end-file", "playlist_entry_id": 7, "reason": "error" }));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), end)
+                .await
+                .is_ok(),
+            "fail() waited for the probe"
+        );
     }
 
     #[test]
@@ -2298,6 +2347,7 @@ mod tests {
             "服务器暂时不可用，稍后再试（502）"
         );
         assert_eq!(fail_reason(Some(206), "x"), "mpv 无法打开（x）");
+        assert_eq!(fail_reason(Some(304), "x"), "拉流返回 HTTP 304");
         assert_eq!(fail_reason(None, "x"), "mpv 无法打开（x）");
     }
 

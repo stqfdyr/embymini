@@ -148,15 +148,15 @@ pub enum Event {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Track {
-    /// 服务端没给，交给 mpv 按 slang / alang 自己选。
+    /// The server gave none: mpv picks by slang / alang.
     Auto,
     Off,
-    /// mpv 的轨道号（从 1 开始）。
+    /// mpv's track id (1-based).
     Id(usize),
 }
 
-/// 把 Emby 的默认轨（流的 `Index`）换成 mpv 轨道号：
-/// 内嵌轨按 Index 排序后的序号；外挂字幕在内嵌之后，按 `sub-add` 顺序（同样按 Index 排序）编号。
+/// Maps Emby's default track (a stream `Index`) to mpv's track id: embedded tracks number by sorted Index;
+/// external subtitles follow them, in `sub-add` order (also sorted by Index).
 fn mpv_track(streams: &[MediaStream], kind: &str, default: Option<i32>) -> Track {
     let Some(want) = default else {
         return Track::Auto;
@@ -178,7 +178,7 @@ fn mpv_track(streams: &[MediaStream], kind: &str, default: Option<i32>) -> Track
         return Track::Id(p + 1);
     }
     if kind != "Subtitle" {
-        return Track::Auto; // 外挂音轨不挂载
+        return Track::Auto; // external audio is never added
     }
     sorted(true)
         .iter()
@@ -186,7 +186,7 @@ fn mpv_track(streams: &[MediaStream], kind: &str, default: Option<i32>) -> Track
         .map_or(Track::Auto, |p| Track::Id(internal.len() + p + 1))
 }
 
-/// mpv 里显示的轨道标题：外挂字幕用 `sub-add` 时传的标题，内嵌轨就是容器里的轨道名。
+/// The track title mpv shows: the title passed to `sub-add` for external subtitles, the container's name otherwise.
 fn stream_title(s: &MediaStream) -> Option<&str> {
     if s.is_external {
         s.display_title.as_deref().or(s.title.as_deref())
@@ -195,7 +195,7 @@ fn stream_title(s: &MediaStream) -> Option<&str> {
     }
 }
 
-/// 用户在上一集选的轨（取自 mpv 的 `current-tracks/*`），换集时按它挑同一条。
+/// The track the user picked last episode (from mpv's `current-tracks/*`); the next episode picks the same one.
 #[derive(Debug, Clone, PartialEq)]
 enum Pref {
     Off,
@@ -217,8 +217,9 @@ impl Pref {
     }
 }
 
-/// 语言码归一：mpv 报的是容器里的 BCP 47（`en`、`zh-CN`），Emby 多是 ISO 639-2（`eng`、`chi`）。
-// ponytail: 只列常见语言，其他三字母码原样比较；匹配不上会退回服务端默认轨，不会选错
+/// Normalises a language code: mpv reports the container's BCP 47 (`en`, `zh-CN`), Emby mostly ISO 639-2 (`eng`, `chi`).
+// shortcut: common languages only, other codes compare as-is; a miss falls back to the server default, never a wrong
+// track. Add codes when one misses.
 fn lang_key(s: &str) -> String {
     let p = s
         .split(['-', '_'])
@@ -242,7 +243,8 @@ fn lang_key(s: &str) -> String {
     .to_owned()
 }
 
-/// 在新一集里找和偏好最像的轨：语言必须相同，再看标题、内嵌 / 外挂。找不到返回 None（用服务端默认）。
+/// The new episode's track most like the preference: same language required, then title, then embedded /
+/// external. None when nothing matches (the server default applies).
 fn match_pref(streams: &[MediaStream], kind: &str, pref: &Pref) -> Option<Track> {
     let Pref::Pick {
         lang,
@@ -268,7 +270,7 @@ fn match_pref(streams: &[MediaStream], kind: &str, pref: &Pref) -> Option<Track>
         .filter(|t| *t != Track::Auto)
 }
 
-/// 选集菜单里的一行：剧名在窗口标题里已经有了，这里只要集号和集名。
+/// A row in the episode menu: the series name is already in the window title.
 fn episode_label(item: &Item) -> String {
     match (item.parent_index_number, item.index_number) {
         (Some(s), Some(e)) => format!("S{s:02}E{e:02} {}", item.name),
@@ -295,7 +297,7 @@ fn fail_reason(status: Option<u16>, mpv_error: &str) -> String {
     }
 }
 
-/// `loadfile` 的选项串。标题用 mpv 的 `%字节数%` 写法，里面有逗号、等号也不会被拆开。
+/// `loadfile` options. The title uses mpv's `%bytes%` form, so commas and equals signs in it stay intact.
 fn loadfile_opts(title: &str, start: f64) -> String {
     let mut o = format!("force-media-title=%{}%{title}", title.len());
     if start > 0.0 {
@@ -306,7 +308,7 @@ fn loadfile_opts(title: &str, start: f64) -> String {
 
 struct Sub {
     url: String,
-    /// 字幕缓存里的文件名。
+    /// File name in the subtitle cache.
     file: String,
     title: String,
     lang: String,
@@ -735,34 +737,35 @@ struct State {
     wr: WriteHalf<Box<dyn Io>>,
     events: mpsc::UnboundedSender<Event>,
     preload: f64,
-    /// 正在播放的队列下标（start-file 到 end-file 之间）。
+    /// Queue index playing now (between start-file and end-file).
     cur: Option<usize>,
     pos: f64,
     dur: f64,
     paused: bool,
     volume: Option<f64>,
-    /// 已按偏好 / 默认选好轨的那一集；之后的轨道变化才算用户的选择，记进 pref_*。
+    /// The episode whose tracks are set (preference or default); only later track changes are the user's choice
+    /// (pref_*).
     applied: Option<usize>,
     pref_audio: Option<Pref>,
     pref_sub: Option<Pref>,
     rid: u64,
-    /// loadfile 的 request_id → 队列下标，用回复里的 playlist_entry_id 对上号。
+    /// loadfile request_id → queue index, matched to the reply's playlist_entry_id.
     pending: HashMap<u64, usize>,
-    /// 交给回传任务的 (路径, 请求体)，见 [`spawn_reporter`]。
+    /// (path, body) for the report task, see [`spawn_reporter`].
     reports: mpsc::UnboundedSender<(String, Value)>,
-    /// 后台准备结果送回 run 的循环。
+    /// Background preparation results back to the run loop.
     prepared: mpsc::UnboundedSender<Prepared>,
-    /// 用户最近一次要切去的集（还在后台准备）；更早的切集结果到了就丢掉。
+    /// The episode the user last switched to (still preparing); earlier switch results are dropped.
     want: Option<usize>,
-    /// 上次告诉 ModernZ 的「下一集已就绪」，见 [`State::sync_next_ready`]。
+    /// What ModernZ was last told about "next episode ready", see [`State::sync_next_ready`].
     next_ready: bool,
-    /// IPC 写失败过（mpv 已退出、管道断了）：只记一次日志，后面的命令照样丢弃。
+    /// An IPC write failed (mpv gone, pipe broken): logged once, later commands are dropped all the same.
     pipe_broken: bool,
-    /// 已经给界面发过 Failed（起播没成、mpv 退出时就不再补发「意外退出」）。
+    /// Failed was already sent to the UI (no extra "unexpected exit" when mpv quits).
     failed_sent: bool,
     stream: Option<Stream>,
     dm: Option<Dm>,
-    /// 上次看到的缓存代理上游总字节（顶栏网速按它算差）。
+    /// Upstream bytes the cache proxy had last time (the top-bar speed is the difference).
     up_seen: u64,
 }
 
@@ -815,8 +818,8 @@ impl State {
         self.rid
     }
 
-    /// 下一集已追加进 mpv 列表（PlaybackInfo、直链、轨道都已就绪，点下一集立即切换）时让 ModernZ 的
-    /// 下一集按钮变绿带闪电；换集、追加失败时恢复。状态变了才发。
+    /// Turns ModernZ's next button green with a bolt once the next episode is in mpv's playlist (PlaybackInfo, link
+    /// and tracks ready, so next switches at once); back on a switch or a refused append. Sent only on change.
     async fn sync_next_ready(&mut self) {
         let ready = self
             .cur
@@ -829,7 +832,7 @@ impl State {
         }
     }
 
-    /// 每秒把缓存代理的上游下载速度发给 ModernZ 的顶栏。
+    /// Sends the cache proxy's upstream speed to ModernZ's top bar, once a second.
     async fn send_speed(&mut self) {
         let Some(up) = self.stream.as_ref().map(Stream::up_bytes) else {
             return;
@@ -839,7 +842,7 @@ impl State {
             .await;
     }
 
-    /// 缓存只留当前集和已追加进 mpv 列表的下一集，其余的删掉（同主流播放器「保留最后一次播放的缓存」）。
+    /// The cache keeps only this episode and the next one already in mpv's playlist ("keep the last playback's cache").
     fn keep_cache(&self) {
         let (Some(s), Some(i)) = (&self.stream, self.cur) else {
             return;
@@ -861,8 +864,9 @@ impl State {
         entry_id.and_then(|id| self.queue.iter().position(|e| e.entry_id == Some(id)))
     }
 
-    /// 把已准备好的一集交给 mpv：`append-play` 追加到列表（空闲时立即播放），`replace` 清空列表立即播放。
-    /// 有缓存代理时这时才登记、给 mpv 本地地址（登记得早了，换集时的 retain 可能把它当成别的片子删掉）。
+    /// Hands a prepared episode to mpv: `append-play` appends (plays at once when idle), `replace` clears and plays.
+    /// Registered with the cache proxy only now: earlier, a retain on an episode switch could delete it as someone
+    /// else's.
     async fn load(&mut self, i: usize, mode: &str) {
         let e = &self.queue[i];
         let Some(r) = &e.ready else { return };
@@ -882,7 +886,8 @@ impl State {
         self.queue[i].loaded = true;
     }
 
-    /// 在后台取第 i 集的 PlaybackInfo，结果回到 run 的循环里由 [`Self::on_prepared`] 处理，等待期间 mpv 照常响应。
+    /// Fetches episode i's PlaybackInfo in the background; [`Self::on_prepared`] takes the result, mpv stays
+    /// responsive meanwhile.
     fn prepare_later(&mut self, i: usize, after: After) {
         self.queue[i].preparing = true;
         let (emby, item, tx) = (
@@ -896,13 +901,14 @@ impl State {
         });
     }
 
-    /// 后台准备完成。准备期间用户可能已经切走，所以先确认结果还用得上。
+    /// Background preparation done. The user may have moved on meanwhile, so check the result still applies.
     async fn on_prepared(&mut self, i: usize, after: After, r: Result<Ready, Error>) {
         self.queue[i].preparing = false;
         let id = self.queue[i].item.id.clone();
         match (after, r) {
             (After::Append, Ok(r)) => {
-                // 切集会替换整个列表：已不在上一集时再追加，就排到错误的位置了
+                // A switch replaces the whole playlist: appending after the user left the previous episode would land
+                // it in the wrong place
                 if self.queue[i].loaded || self.want.is_some() || self.cur != i.checked_sub(1) {
                     log::info!("下一集 {id} 准备好时已不在上一集，不追加");
                     return;
@@ -922,7 +928,7 @@ impl State {
             }
             (After::Append, Err(err)) => {
                 log::warn!("下一集 {id} 准备失败：{err}");
-                self.queue[i].failed = true; // 不在每次进度更新时重试，手动切过去时会再试
+                self.queue[i].failed = true; // no retry on every progress update; a manual switch tries again
                 self.osd(&format!("下一集加载失败：{err}")).await;
             }
             (After::Play, _) if self.want != Some(i) => {
@@ -1065,7 +1071,7 @@ impl State {
             }
             (Some("duration"), d) => self.dur = d.as_f64().unwrap_or(0.0),
             (Some("volume"), d) => self.volume = d.as_f64().or(self.volume),
-            // 只记「选好轨之后」的变化；换集卸载时的 null 不算（关字幕看 sid=no）
+            // Only changes after the tracks are set; the null while switching doesn't count (subs off shows as sid=no)
             (Some("current-tracks/audio"), d) if self.tracking() && d.is_object() => {
                 self.pref_audio = Some(Pref::from_track(d));
             }
@@ -1089,7 +1095,8 @@ impl State {
         self.cur.is_some() && self.applied == self.cur
     }
 
-    /// 手动下一集：已预加载就直接切（mpv 可能已预读好），否则交给 [`Self::jump`]（后台准备好再切）。
+    /// Manual next: switch at once when preloaded (mpv may have read ahead), else [`Self::jump`] (switch once
+    /// prepared).
     async fn next(&mut self) {
         let Some(i) = self.cur else { return };
         if i + 1 >= self.queue.len() {
@@ -1111,12 +1118,13 @@ impl State {
         }
     }
 
-    /// 跳到第 i 集：已准备好就立刻切，否则后台取 PlaybackInfo，到了再切（见 [`Self::on_prepared`]）。
+    /// Goes to episode i: at once when prepared, else fetches PlaybackInfo in the background and switches then
+    /// ([`Self::on_prepared`]).
     async fn jump(&mut self, i: usize) {
         self.osd(&format!("正在打开：{}", title(&self.queue[i].item)))
             .await;
         let e = &self.queue[i];
-        // 播过的集要重新取：一次播放对应一个 PlaySessionId
+        // A played episode is fetched again: one PlaySessionId per playback
         if e.ready.is_some() && !e.stopped {
             self.want = None;
             self.play_now(i).await;
@@ -1126,7 +1134,7 @@ impl State {
         }
     }
 
-    /// 替换 mpv 列表，从头播第 i 集（之前追加进列表的集随之清掉）。
+    /// Replaces mpv's playlist and plays episode i from the start (anything appended goes with it).
     async fn play_now(&mut self, i: usize) {
         for e in &mut self.queue {
             e.loaded = false;
@@ -1136,7 +1144,8 @@ impl State {
         self.load(i, "replace").await;
     }
 
-    /// 挂外挂字幕，选音轨、字幕：优先沿用上一集用户选的（按语言、标题匹配），否则用服务端默认轨。
+    /// Adds external subtitles and picks audio / subtitle: the user's choice from last episode (by language, title),
+    /// else the server default.
     async fn apply_tracks(&mut self, i: usize) {
         let Some(r) = &self.queue[i].ready else {
             return;
@@ -1175,7 +1184,8 @@ impl State {
         self.applied = Some(i);
     }
 
-    /// 加载失败：拿到上游的状态码（缓存代理记着；没有代理时探测一次直链），换成能看懂的原因发给界面。
+    /// Load failed: gets the upstream status (the cache proxy has it; without the proxy, probes the link once) and
+    /// tells the UI why.
     async fn fail(&mut self, i: usize, mpv_error: &str) {
         let status = match (&self.queue[i].ready, &self.stream) {
             (Some(r), Some(s)) => s.fail_status(&r.name),
@@ -1201,7 +1211,7 @@ impl State {
         let _ = self.events.send(Event::Failed { item_id, message });
     }
 
-    /// 交给回传任务（不等结果）。`what` 是 `""` / `"/Progress"` / `"/Stopped"`。
+    /// Hands to the report task (doesn't wait). `what` is `""` / `"/Progress"` / `"/Stopped"`.
     fn report(&self, i: usize, what: &str, extra: Value) {
         let e = &self.queue[i];
         let Some(r) = &e.ready else { return };
@@ -1504,7 +1514,7 @@ mod tests {
 
     #[test]
     fn tracks_from_real_playbackinfo() {
-        // 实测：视频 0、音频 1、内嵌字幕 2/3/4、外挂中文 ass 5；服务端默认音轨 1、字幕 5。
+        // Measured: video 0, audio 1, embedded subs 2/3/4, external Chinese ass 5; server default audio 1, subtitle 5.
         let pi: PlaybackInfo = fixture("playbackinfo.json");
         let s: &MediaSource = &pi.media_sources[0];
         assert_eq!(
@@ -1536,7 +1546,7 @@ mod tests {
 
     #[test]
     fn track_prefs_carry_over_by_language_and_title() {
-        // 同一份实测流：音频 1(eng)、内嵌字幕 2 English / 3 English SDH / 4 SDH(PGS)、外挂 5 zh-CN
+        // The same measured streams: audio 1 (eng), embedded subs 2 English / 3 English SDH / 4 SDH (PGS), external 5 zh-CN
         let pi: PlaybackInfo = fixture("playbackinfo.json");
         let st = &pi.media_sources[0].media_streams;
         let pick = |lang: &str, title: &str, external| Pref::Pick {
@@ -1544,7 +1554,7 @@ mod tests {
             title: title.into(),
             external,
         };
-        // mpv 报 en，Emby 记 eng；标题相同的那条胜出
+        // mpv says en, Emby says eng; the one with the same title wins
         assert_eq!(
             match_pref(st, "Subtitle", &pick("en", "English SDH", false)),
             Some(Track::Id(2))
@@ -1557,7 +1567,7 @@ mod tests {
             ),
             Some(Track::Id(4))
         );
-        // 下一集标题变了：同语言里优先内嵌 / 外挂一致、序号小的
+        // The next episode's titles changed: within the language, prefer same embedded / external, then the lower index
         assert_eq!(
             match_pref(st, "Subtitle", &pick("eng", "别的标题", false)),
             Some(Track::Id(1))
@@ -1605,7 +1615,7 @@ mod tests {
         assert_eq!(title(&movie), "沙丘");
     }
 
-    /// 一个不连 mpv 的 State：写给 mpv 的命令从返回的管道另一端读出来。
+    /// A State not connected to mpv: the commands it writes are read from the other end of the returned pipe.
     fn offline_state(
         n: usize,
     ) -> (
@@ -1659,7 +1669,7 @@ mod tests {
         }
     }
 
-    /// 读出 State 写给 mpv 的全部命令。
+    /// Every command the State wrote to mpv.
     async fn commands(st: State, mut mpv: tokio::io::DuplexStream) -> Vec<Value> {
         drop(st);
         let mut out = String::new();
@@ -1761,7 +1771,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 读出 State 写给 mpv 的全部 loadfile 命令：(url, 模式)。
+    /// Every loadfile command the State wrote to mpv: (url, mode).
     async fn loadfiles(st: State, mpv: tokio::io::DuplexStream) -> Vec<(String, String)> {
         commands(st, mpv)
             .await
@@ -1776,10 +1786,10 @@ mod tests {
             .collect()
     }
 
-    /// 后台准备的结果回来时，用户可能已经切走：过时的结果不能追加 / 切过去。
+    /// A background result may arrive after the user moved on: a stale one must not append or switch.
     #[tokio::test]
     async fn prepared_results_respect_where_the_user_is() {
-        // 仍在第 0 集：第 1 集的预加载结果追加到列表
+        // Still on episode 0: episode 1's preload is appended
         let (mut st, mpv, mut ev) = offline_state(3);
         st.cur = Some(0);
         st.on_prepared(1, After::Append, Ok(ready_for("e1"))).await;
@@ -1794,7 +1804,7 @@ mod tests {
             [("https://h.example/e1".into(), "append-play".into())]
         );
 
-        // 已经切到第 2 集：第 1 集的预加载结果作废；准备失败只标记，不追加
+        // Already on episode 2: episode 1's preload is dropped; a failed preparation is only marked, not appended
         let (mut st, mpv, _ev) = offline_state(3);
         st.cur = Some(2);
         st.on_prepared(1, After::Append, Ok(ready_for("e1"))).await;
@@ -1804,7 +1814,7 @@ mod tests {
         assert!(st.queue[1].failed && !st.queue[1].loaded);
         assert!(loadfiles(st, mpv).await.is_empty());
 
-        // 先选第 1 集、又改选第 2 集：第 1 集的结果丢掉，只切到第 2 集
+        // Picked episode 1, then changed to 2: episode 1's result is dropped, only 2 is played
         let (mut st, mpv, _ev) = offline_state(3);
         st.cur = Some(0);
         st.jump(1).await;
@@ -1818,19 +1828,20 @@ mod tests {
         );
     }
 
-    /// 下一集追加进列表后按钮变绿（yes），换到下一集或追加失败后恢复（no），状态没变不重复发。
+    /// The next button turns green (yes) once the next episode is appended, back (no) on switching to it or a refused
+    /// append; no repeats.
     #[tokio::test]
     async fn next_ready_follows_the_queue() {
         let (mut st, mpv, _ev) = offline_state(3);
         st.cur = Some(0);
         st.on_prepared(1, After::Append, Ok(ready_for("e1"))).await;
-        let rid = st.rid - 1; // loadfile 之后紧跟 script-message
+        let rid = st.rid - 1; // script-message follows loadfile
         st.on_message(json!({ "request_id": rid, "data": { "playlist_entry_id": 7 } }))
             .await;
         st.on_message(json!({ "event": "start-file", "playlist_entry_id": 7 }))
             .await;
         assert_eq!(st.cur, Some(1));
-        // 第 2 集的追加被 mpv 拒绝：仍是 no，且不再当作在列表里
+        // mpv refuses episode 2's append: still no, and it no longer counts as in the playlist
         st.on_prepared(2, After::Append, Ok(ready_for("e2"))).await;
         let rid = st.rid - 1;
         st.on_message(json!({ "request_id": rid, "error": "x" }))
@@ -1845,12 +1856,12 @@ mod tests {
         assert_eq!(ready, ["yes", "no", "yes", "no"]);
     }
 
-    /// 上游卡死（连上了但不回数据）时，后台预加载不能卡住 mpv 事件处理：关闭播放器要立刻送到 mpv。
-    /// 如果预加载在事件循环里同步等 PlaybackInfo，这里要等满 30 秒的请求超时。
+    /// A stuck upstream (connects, never answers) must not block mpv's event handling in the background preload:
+    /// closing the player reaches mpv at once. Preparing synchronously in the loop would wait the 30-second timeout.
     #[cfg(unix)]
     #[tokio::test]
     async fn slow_upstream_does_not_block_controls() {
-        // 只接受连接、永不回应的「上游」
+        // An "upstream" that accepts connections and never answers
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -1880,7 +1891,7 @@ mod tests {
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let run = tokio::spawn(session.run(ctl_rx, ev_tx));
 
-        // 假 mpv：回 loadfile、报开播，进度到 95% 触发预加载（打到卡死的上游）
+        // Fake mpv: answers loadfile, reports start, and progress at 95% triggers a preload (to the stuck upstream)
         let (rd, mut wr) = tokio::io::split(theirs);
         let mut lines = BufReader::new(rd).lines();
         let mut say = async |v: Value| wr.write_all(format!("{v}\n").as_bytes()).await.unwrap();
@@ -1895,7 +1906,7 @@ mod tests {
         say(json!({ "event": "start-file", "playlist_entry_id": 1 })).await;
         say(json!({ "event": "property-change", "name": "duration", "data": 100.0 })).await;
         say(json!({ "event": "property-change", "name": "time-pos", "data": 95.0 })).await;
-        tokio::time::sleep(Duration::from_millis(300)).await; // 让预加载请求发出去、挂住
+        tokio::time::sleep(Duration::from_millis(300)).await; // let the preload request go out and hang
 
         let t0 = std::time::Instant::now();
         ctl.send(Ctl::Quit).unwrap();
@@ -1911,7 +1922,7 @@ mod tests {
         assert_eq!(got_quit, Ok(true), "上游卡住时，关闭播放器没有及时送到 mpv");
         eprintln!("quit 送达用时 {:?}", t0.elapsed());
 
-        drop(lines); // 假 mpv 退出、管道关闭
+        drop(lines); // the fake mpv quits, the pipe closes
         drop(wr);
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -1920,7 +1931,7 @@ mod tests {
         assert!(matches!(ev_rx.recv().await, Some(Event::Ended { .. })));
     }
 
-    /// mpv 把播完的一集再播一遍（列表循环）时，第二遍也要回传开播和停止。
+    /// When mpv plays a finished episode again (playlist loop), the second time reports start and stop too.
     #[tokio::test]
     async fn replayed_entry_reports_again() {
         let (mut st, _mpv, mut ev) = offline_state(1);

@@ -17,24 +17,34 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 use tokio::sync::{mpsc, watch};
 
-/// 从点关闭（或开始退出）算起的时刻；关闭各阶段耗时写日志，查「关闭时卡一下」卡在哪一段。
-static CLOSE_T0: OnceLock<Instant> = OnceLock::new();
+/// When closing started (close clicked or exit begun): each close phase logs its time since, to find where
+/// "closing hangs for a moment" is spent.
+static CLOSE_T0: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// 开始计时（重复调用以第一次为准）。
+/// Starts the timer; later calls keep the first start.
 fn exit_start() {
-    CLOSE_T0.get_or_init(Instant::now);
+    lock(&CLOSE_T0).get_or_insert_with(Instant::now);
 }
 
-/// 记一个关闭阶段；还没开始关闭时（例如平时关掉 mpv）什么都不做。
+/// The exit was called off (the installer did not start): the next close times from scratch.
+fn exit_cancel() {
+    *lock(&CLOSE_T0) = None;
+}
+
+fn exit_elapsed() -> Option<Duration> {
+    lock(&CLOSE_T0).map(|t0| t0.elapsed())
+}
+
+/// Logs a close phase; does nothing when not closing (e.g. mpv closed during normal use).
 pub(crate) fn exit_mark(phase: &str) {
-    if let Some(t0) = CLOSE_T0.get() {
-        log::info!("关闭耗时 {phase}：{} ms", t0.elapsed().as_millis());
+    if let Some(t) = exit_elapsed() {
+        log::info!("关闭耗时 {phase}：{} ms", t.as_millis());
     }
 }
 
@@ -909,6 +919,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancelled exit (installer failed to start) restarts the close timer instead of counting from that attempt.
+    #[test]
+    fn cancelled_exit_restarts_the_timer() {
+        exit_start();
+        std::thread::sleep(Duration::from_millis(200));
+        exit_cancel();
+        exit_start();
+        assert!(exit_elapsed().unwrap() < Duration::from_millis(200));
+    }
 
     #[test]
     fn clean_path_strips_quotes() {

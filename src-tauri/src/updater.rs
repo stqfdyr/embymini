@@ -137,8 +137,9 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
     // On Windows this starts the installer and exits the process: it only returns on failure.
     if let Err(e) = u.install(bytes) {
         crate::set_running(root, true);
-        // The program stays in use: clear the quit flag, or every later play is dropped as "quitting".
+        // The program stays in use: clear the quit flag (or every later play is dropped as "quitting") and the close timer.
         app.quit.send_replace(false);
+        crate::exit_cancel();
         return Err(fail(INSTALL_FAILED)(e));
     }
     handle.restart()

@@ -1333,21 +1333,29 @@ impl State {
     }
 }
 
-/// 弹幕：取数、和脚本（`mpv/scripts/danmaku.lua`，脚本名 `danmaku`）往来。
+/// Danmaku: fetching, and messages to and from the script (`mpv/scripts/danmaku.lua`, script name `danmaku`).
 impl State {
     async fn dm_send(&mut self, name: &str, v: Value) {
         self.send(json!(["script-message-to", "danmaku", name, v.to_string()]))
             .await;
     }
 
-    /// 开着弹幕、填了接口、这次播放没判定地址不对。
+    /// Sends the display settings and blocked words to the script.
+    async fn dm_init(&mut self) {
+        let Some(d) = &self.dm else { return };
+        let msg = json!({ "style": d.ctx.cfg.style, "words": d.ctx.cfg.words });
+        self.dm_send("init", msg).await;
+    }
+
+    /// Danmaku on, an API configured, and not judged misconfigured during this playback.
     fn dm_ready(&self) -> bool {
         self.dm
             .as_ref()
             .is_some_and(|d| d.ctx.cfg.style.on && d.ctx.api.is_some() && d.dead.is_none())
     }
 
-    /// 在后台取第 i 集的弹幕；`deliver` = 取完交给脚本（当前集），否则只是预取进缓存（下一集）。
+    /// Fetches episode `i` in the background; `deliver` hands the result to the script (current episode),
+    /// otherwise it only warms the cache (next episode).
     fn dm_fetch(&mut self, i: usize, deliver: bool) {
         let Some(d) = &mut self.dm else { return };
         let Some(api) = d.ctx.api.clone() else { return };
@@ -1377,25 +1385,23 @@ impl State {
         });
     }
 
-    /// 第 i 集开播：第一次先把设置发给脚本，再按需取弹幕。
+    /// Episode `i` started: settings go to the script once per playback, then its danmaku.
     async fn dm_show(&mut self, i: usize) {
         let Some(d) = &mut self.dm else { return };
-        let init = !std::mem::replace(&mut d.init, true);
-        let msg = json!({ "style": d.ctx.cfg.style, "words": d.ctx.cfg.words });
-        if init {
-            self.dm_send("init", msg).await;
+        if !std::mem::replace(&mut d.init, true) {
+            self.dm_init().await;
         }
         self.dm_load(i).await;
     }
 
-    /// 给脚本加载第 i 集：取数，或说明为什么没有。
+    /// Loads episode `i` for the script, or tells it why there is none.
     async fn dm_load(&mut self, i: usize) {
         let Some(d) = &mut self.dm else { return };
         if !d.ctx.cfg.style.on {
-            return; // 关着就不取，打开时再取（见 on_danmaku 的 style）
+            return; // fetched when switched on (the "style" message)
         }
         d.shown = Some(i);
-        let status = match (&d.ctx.api, &d.dead) {
+        let mut status = match (&d.ctx.api, &d.dead) {
             (None, _) => {
                 json!({ "kind": "setup", "text": "还没有填弹幕接口：在 EmbyMini 的设置里填写" })
             }
@@ -1403,8 +1409,7 @@ impl State {
             _ => json!({ "kind": "loading", "text": "正在加载弹幕…" }),
         };
         let go = status["kind"] == "loading";
-        // 每集第一条消息：脚本据此认定当前是哪一集，之后 item 对不上的（换集前发出的晚到结果）丢掉
-        let mut status = status;
+        // The episode's first message: the script adopts this item and drops later ones for any other
         status["start"] = true.into();
         status["item"] = self.queue[i].item.id.clone().into();
         self.dm_send("status", status).await;
@@ -1423,13 +1428,12 @@ impl State {
         if self.cur != Some(i) || seq != d.seq {
             return; // moved to another episode, or a newer load for this one is under way
         }
-        // 没匹配上、取不到时提示一次（之后的集只在面板里显示），地址不对时也只提示一次
-        let toast = !std::mem::replace(&mut d.told, true);
-        let status = match r {
+        // Problems pop up once per playback; later episodes only show them in the panel
+        let toast = !d.told;
+        let mut status = match r {
             Ok(Some(l)) => {
-                d.told = !toast; // 成功不算提示过
-                // 弹幕本身经 IPC 发给脚本，不让脚本读文件：Windows 上 mpv 内置 Lua 的 io.open 走 ANSI 代码页，
-                // 数据目录带中文时打不开。`l.list` 是缓存文件的原文（JSON 数组），原样拼进去，不再解析一遍
+                // Sent over IPC rather than read by the script: mpv's Lua `io.open` uses the ANSI code page on
+                // Windows and fails on non-ASCII data dirs. `l.list` is already a JSON array; spliced in unparsed.
                 let head =
                     json!({ "item": item, "title": l.title, "manual": l.manual, "stale": l.stale })
                         .to_string();
@@ -1451,12 +1455,13 @@ impl State {
                 json!({ "kind": "error", "text": format!("{e}（可在弹幕设置里重试）"), "toast": toast })
             }
         };
-        let mut status = status;
+        d.told = true;
         status["item"] = item.into();
         self.dm_send("status", status).await;
     }
 
-    /// 设置页改了接口地址或屏蔽词（[`Ctl::Danmaku`]）：换掉本次播放的接口，屏蔽词重新下发给脚本。
+    /// The settings page changed the API or blocked words ([`Ctl::Danmaku`]): swap the API for this playback and
+    /// resend changed words to the script.
     async fn dm_settings(&mut self, api: Option<danmaku::Api>, words: Vec<String>) {
         let Some(d) = &mut self.dm else { return };
         d.ctx.api = api;
@@ -1464,12 +1469,11 @@ impl State {
         let changed = d.ctx.cfg.words != words;
         d.ctx.cfg.words = words;
         if changed && d.init {
-            let msg = json!({ "style": d.ctx.cfg.style, "words": d.ctx.cfg.words });
-            self.dm_send("init", msg).await;
+            self.dm_init().await;
         }
     }
 
-    /// 脚本发来的消息：`args[0]` = `embymini-danmaku-<动作>`，后面是参数。
+    /// A message from the script: `args[0]` = `embymini-danmaku-<action>`, then its arguments.
     async fn on_danmaku(&mut self, args: &Value) {
         let (Some(cur), Some(d)) = (self.cur, &mut self.dm) else {
             return;
@@ -1479,9 +1483,8 @@ impl State {
             .unwrap_or_default()
             .trim_start_matches(DM_MSG);
         let arg = |k: usize| args[k].as_str().unwrap_or_default().to_owned();
-        let (api, tx) = (d.ctx.api.clone(), d.tx.clone());
-        let item = self.queue[cur].item.clone();
-        let key = danmaku::key(&self.emby.tag, &item);
+        let item = &self.queue[cur].item;
+        let (key, index) = (danmaku::key(&self.emby.tag, item), danmaku::index(item));
         match what {
             "style" => {
                 let Ok(style) = serde_json::from_str::<danmaku::Style>(&arg(1)) else {
@@ -1498,31 +1501,13 @@ impl State {
                 }
             }
             "reload" => {
-                d.dead = None; // 可能刚在设置里改好了地址（新地址已由 Ctl::Danmaku 换上）
+                d.dead = None; // the address may just have been fixed (already swapped in by Ctl::Danmaku)
                 self.dm_load(cur).await;
             }
-            "search" | "episodes" => {
-                let Some(api) = api else { return };
-                let (kw, pick) = (arg(1), d.ctx.cfg.picks.get(&key).cloned());
-                let search = what == "search";
-                tokio::spawn(async move {
-                    let (name, v) = if search {
-                        ("search", api.search(&kw).await.map(|l| json!(l)))
-                    } else {
-                        let anime = kw.parse().unwrap_or(0);
-                        let r = api.episodes(anime).await.map(|l| {
-                            // 默认选中：按已有的匹配偏移或集号算出的那一集
-                            let off = pick.filter(|p| p.anime == anime).map_or(0, |p| p.offset);
-                            let at = danmaku::index(&item)
-                                .saturating_add(off)
-                                .clamp(0, l.len().saturating_sub(1) as i32);
-                            json!({ "anime": anime, "list": l, "at": at })
-                        });
-                        ("episodes", r)
-                    };
-                    let v = v.unwrap_or_else(|e| json!({ "error": e.to_string() }));
-                    let _ = tx.send(DmMsg::Reply(name, v));
-                });
+            "search" => self.dm_lookup(arg(1), None),
+            "episodes" => {
+                let pick = d.ctx.cfg.picks.get(&key).cloned();
+                self.dm_lookup(arg(1), Some((index, pick)));
             }
             "pick" => {
                 let (Ok(anime), Ok(at)) = (arg(1).parse::<i64>(), arg(2).parse::<i32>()) else {
@@ -1530,7 +1515,7 @@ impl State {
                 };
                 let pick = danmaku::Pick {
                     anime,
-                    offset: at.saturating_sub(danmaku::index(&item)),
+                    offset: at.saturating_sub(index),
                 };
                 d.ctx.cfg.picks.insert(key.clone(), pick.clone());
                 d.dead = None;
@@ -1539,6 +1524,31 @@ impl State {
             }
             _ => {}
         }
+    }
+
+    /// Manual match lookups for the panel, answered via [`DmMsg::Reply`]: `episodes` = None searches shows by
+    /// keyword `arg`; Some((Emby index, saved pick)) lists show `arg`'s episodes with the expected one preselected.
+    fn dm_lookup(&self, arg: String, episodes: Option<(i32, Option<danmaku::Pick>)>) {
+        let Some(d) = &self.dm else { return };
+        let Some(api) = d.ctx.api.clone() else { return };
+        let tx = d.tx.clone();
+        tokio::spawn(async move {
+            let (name, v) = match episodes {
+                None => ("search", api.search(&arg).await.map(|l| json!(l))),
+                Some((index, pick)) => {
+                    let anime = arg.parse().unwrap_or(0);
+                    let r = api.episodes(anime).await.map(|l| {
+                        let off = pick.filter(|p| p.anime == anime).map_or(0, |p| p.offset);
+                        let last = i32::try_from(l.len().saturating_sub(1)).unwrap_or(i32::MAX);
+                        let at = index.saturating_add(off).clamp(0, last);
+                        json!({ "anime": anime, "list": l, "at": at })
+                    });
+                    ("episodes", r)
+                }
+            };
+            let v = v.unwrap_or_else(|e| json!({ "error": e.to_string() }));
+            let _ = tx.send(DmMsg::Reply(name, v));
+        });
     }
 }
 
@@ -1942,6 +1952,137 @@ mod tests {
             .collect();
         assert_eq!(loads.len(), 1, "{loads:?}");
         assert_eq!(loads[0]["title"], "new");
+    }
+
+    /// Panel lookups for a manual match, the preselected episode, saving a pick, and when problems pop up.
+    #[tokio::test]
+    async fn danmaku_lookups() {
+        let (port, _) = emby::tests::fake(|path| {
+            let ok = |v: Value| ("200 OK", v.to_string());
+            match path {
+                "/api/v2/search/anime" => {
+                    ok(json!({"animes":[{"animeId":7,"animeTitle":"某剧","episodeCount":3}]}))
+                }
+                "/api/v2/bangumi/7" => ok(json!({"bangumi":{"episodes":[
+                    {"episodeId":1},{"episodeId":2},{"episodeId":3}]}})),
+                _ => ("404 Not Found", "{}".into()),
+            }
+        })
+        .await;
+        let (mut st, mpv, mut ev) = offline_state(1);
+        st.queue[0].item = Item {
+            id: "e0".into(),
+            kind: "Episode".into(),
+            series_id: Some("77".into()),
+            series_name: Some("某剧".into()),
+            index_number: Some(3),
+            ..Default::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        st.dm = Some(Dm {
+            ctx: danmaku::Ctx {
+                api: danmaku::Api::new(
+                    emby::http_client().unwrap(),
+                    &format!("http://127.0.0.1:{port}"),
+                ),
+                dir: std::env::temp_dir().join(format!("embymini-dm-look-{}", std::process::id())),
+                cfg: danmaku::Config::default(),
+            },
+            tx,
+            shown: None,
+            dead: None,
+            told: false,
+            init: true,
+            seq: 0,
+        });
+        st.cur = Some(0);
+        assert!(st.dm_ready());
+        let key = danmaku::key(&st.emby.tag, &st.queue[0].item);
+        let mut ask = async |st: &mut State, msg: Value| {
+            st.on_danmaku(&msg).await;
+            let DmMsg::Reply(name, v) = rx.recv().await.unwrap() else {
+                panic!("expected a reply")
+            };
+            (name, v)
+        };
+        let (name, v) = ask(&mut st, json!(["embymini-danmaku-search", "某剧"])).await;
+        assert_eq!((name, v[0]["id"].clone()), ("search", json!(7)));
+        let mut at = async |st: &mut State, pick: Option<(i64, i32)>| {
+            let picks = &mut st.dm.as_mut().unwrap().ctx.cfg.picks;
+            picks.clear();
+            if let Some((anime, offset)) = pick {
+                picks.insert(key.clone(), danmaku::Pick { anime, offset });
+            }
+            let (name, v) = ask(st, json!(["embymini-danmaku-episodes", "7"])).await;
+            assert_eq!((name, v["anime"].clone()), ("episodes", json!(7)));
+            v["at"].as_i64().unwrap()
+        };
+        assert_eq!(at(&mut st, None).await, 2, "episode 3 is index 2");
+        assert_eq!(
+            at(&mut st, Some((7, -1))).await,
+            1,
+            "a saved offset applies"
+        );
+        assert_eq!(
+            at(&mut st, Some((8, -1))).await,
+            2,
+            "another show's offset does not"
+        );
+        assert_eq!(
+            at(&mut st, Some((7, 10))).await,
+            2,
+            "clamped to the last episode"
+        );
+        let (_, v) = ask(&mut st, json!(["embymini-danmaku-episodes", "9"])).await;
+        assert!(v["error"].as_str().unwrap().contains("404"), "{v}");
+
+        st.on_danmaku(&json!(["embymini-danmaku-pick", "7", "0"]))
+            .await;
+        assert!(
+            matches!(ev.try_recv(), Ok(Event::DanmakuPick { pick, .. }) if pick == danmaku::Pick { anime: 7, offset: -2 })
+        );
+        let seq = st.dm.as_ref().unwrap().seq;
+        assert_eq!(seq, 1, "the pick reloads");
+
+        // One pop-up per playback: a success in between does not re-arm it
+        for r in [
+            Ok(None),
+            Ok(Some(danmaku::Loaded {
+                list: "[]".into(),
+                title: String::new(),
+                manual: true,
+                stale: false,
+            })),
+            Ok(None),
+        ] {
+            st.on_dm_result(DmMsg::Loaded(0, seq, r)).await;
+        }
+        // Misconfigured: says why and does not fetch
+        st.dm.as_mut().unwrap().dead = Some("地址不对".into());
+        assert!(!st.dm_ready());
+        st.dm_load(0).await;
+        assert_eq!(st.dm.as_ref().unwrap().seq, seq);
+
+        let status: Vec<Value> = commands(st, mpv)
+            .await
+            .into_iter()
+            .filter(|c| c[2] == "status")
+            .map(|c| serde_json::from_str(c[3].as_str().unwrap()).unwrap())
+            .collect();
+        let brief: Vec<_> = status
+            .iter()
+            .map(|v| (v["kind"].as_str().unwrap(), v["toast"].as_bool()))
+            .collect();
+        assert_eq!(
+            brief,
+            [
+                ("loading", None),
+                ("none", Some(true)),
+                ("none", Some(false)),
+                ("setup", None)
+            ]
+        );
+        assert_eq!(status[3]["text"], "地址不对");
     }
 
     /// Every loadfile command the State wrote to mpv: (url, mode).

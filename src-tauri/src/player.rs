@@ -2035,8 +2035,8 @@ mod tests {
     async fn script_messages_switch_episodes() {
         let msg = |args: Value| json!({ "event": "client-message", "args": args });
         let (mut st, mpv, _ev) = offline_state(3);
-        for k in 0..3 {
-            st.queue[k].ready = Some(ready_for(&format!("e{k}")));
+        for (k, e) in st.queue.iter_mut().enumerate() {
+            e.ready = Some(ready_for(&format!("e{k}")));
         }
         st.cur = Some(1);
         st.queue[2].loaded = true;
@@ -2157,11 +2157,11 @@ mod tests {
         let pi: PlaybackInfo = fixture("playbackinfo.json");
         let streams = &pi.media_sources[0].media_streams;
         let (mut st, mpv, _ev) = offline_state(2);
-        for k in 0..2 {
+        for (k, e) in st.queue.iter_mut().enumerate() {
             let mut r = ready_for(&format!("e{k}"));
             r.streams = streams.clone();
-            st.queue[k].ready = Some(r);
-            st.queue[k].entry_id = Some(7 + k as i64);
+            e.ready = Some(r);
+            e.entry_id = Some(7 + k as i64);
         }
         st.queue[1].ready.as_mut().unwrap().subs.push(Sub {
             url: "https://h.example/sub".into(),
@@ -2218,8 +2218,8 @@ mod tests {
         let (mut st, mpv, _ev) = offline_state(3);
         st.stream = Stream::start(&dir, false);
         let v = dir.join("video");
-        for k in 0..3 {
-            st.queue[k].ready = Some(ready_for(&format!("e{k}")));
+        for (k, e) in st.queue.iter_mut().enumerate() {
+            e.ready = Some(ready_for(&format!("e{k}")));
             std::fs::create_dir_all(v.join(format!("e{k}"))).unwrap();
         }
         st.cur = Some(1);

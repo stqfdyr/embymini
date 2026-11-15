@@ -1,9 +1,7 @@
-/**
- * 图片加载完再淡入（而不是逐行蹦出来），并让解码不卡主线程。用法：<img use:fade …>
- * 只有从网络来的图才淡入（同 Coil 等图片库的做法）：已经在缓存里、很快就加载完的直接显示，不然看着像在加载。
- */
+/** Loads faster than this count as cached and show at once; fading them in would look like loading. */
 const CACHED_MS = 50
 
+/** `<img use:fade>`: decode off the main thread and fade in once loaded, only for images that came from the network. */
 export function fade(img: HTMLImageElement) {
   img.decoding = 'async'
   if (img.complete && img.naturalWidth) return

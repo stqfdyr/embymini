@@ -42,6 +42,8 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 |---|---|
 | 后端单测 | `cargo test --manifest-path src-tauri/Cargo.toml` |
 | 前端类型检查 | `npm --prefix ui run check`（看退出码：svelte-check 与 tsc 两段） |
+| 前端单测 | `npm --prefix ui test` |
+| 没人用的导出、文件、依赖 | `npm --prefix ui run knip` |
 | 浏览器里开发界面 | 导出 `EMBY_SERVER` / `PORT` / `EMBY_USER` / `EMBY_PASS` 后 `cd ui && npx vite`，打开 http://127.0.0.1:5173 |
 | 桌面版开发（Windows） | `ui\node_modules\.bin\tauri dev` |
 | 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_real_server -- --ignored --nocapture` |

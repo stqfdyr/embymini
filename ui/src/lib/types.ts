@@ -1,6 +1,6 @@
-// Emby 回包里界面用到的字段（以真实回包为准，都可能缺失）。
+// Fields of Emby responses the UI reads (declared from real responses; any of them may be missing).
 
-export interface UserData {
+interface UserData {
   PlaybackPositionTicks?: number
   PlayedPercentage?: number
   Played?: boolean
@@ -8,7 +8,7 @@ export interface UserData {
   UnplayedItemCount?: number
 }
 
-export interface Person {
+interface Person {
   Id: string
   Name: string
   Role?: string | null
@@ -47,7 +47,6 @@ export interface MediaSource {
   Name?: string
   Container?: string
   Size?: number
-  Bitrate?: number
   Path?: string
   MediaStreams?: MediaStream[]
 }
@@ -65,10 +64,10 @@ export interface Item {
   ProductionYear?: number
   PremiereDate?: string
   EndDate?: string | null
-  /** 人物：出生地。 */
+  /** Person: birthplace. */
   ProductionLocations?: string[]
   Status?: string
-  /** 剧集：总集数（不含季）。 */
+  /** Series: episode count (seasons not counted). */
   RecursiveItemCount?: number
   CommunityRating?: number | null
   OfficialRating?: string | null
@@ -79,9 +78,6 @@ export interface Item {
   BackdropImageTags?: string[]
   ParentBackdropItemId?: string
   ParentBackdropImageTags?: string[]
-  ParentLogoItemId?: string
-  ParentLogoImageTag?: string
-  SeriesPrimaryImageTag?: string
   UserData?: UserData
   People?: Person[]
   ExternalUrls?: { Name: string; Url: string }[]

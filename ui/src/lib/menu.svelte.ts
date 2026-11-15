@@ -1,4 +1,4 @@
-// 全局右键菜单的状态：任何地方 `openMenu(e, items)`，App 里的 <ContextMenu /> 负责显示。
+// Global context menu state: call `openMenu(e, items)` anywhere; <ContextMenu /> in App renders it.
 import type { Component } from 'svelte'
 
 export type MenuItem = { label: string; icon?: Component; danger?: boolean; action: () => unknown } | 'sep'

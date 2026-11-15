@@ -49,10 +49,11 @@
 <style>
   .box {
     display: flex; align-items: center; gap: 10px; margin: 12px auto 30px; width: min(600px, 90%); height: 44px;
-    padding: 0 8px 0 16px; border-radius: 22px; background: var(--bg-raised); box-shadow: inset 0 0 0 1px var(--stroke); color: var(--text-2);
-    transition: box-shadow 0.15s;
+    padding: 0 8px 0 16px; border-radius: 22px; background: var(--field-bg); border: 1px solid var(--field-border);
+    box-shadow: var(--field-shade); color: var(--text-2); transition: border-color 0.15s, box-shadow 0.15s;
   }
-  .box:focus-within { box-shadow: inset 0 0 0 2px var(--accent); }
+  .box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3.5px var(--ring); }
+  input::placeholder { color: var(--text-3); }
   input { flex: 1; border: 0; outline: 0; background: none; font-size: 15px; color: var(--text); }
   .clear { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: var(--fill); }
   .clear:hover { background: var(--fill-hover); }

@@ -1,6 +1,7 @@
 /*
  * Design tokens and global styles. Colors, radii and spacing are defined only here and follow the system light / dark theme.
- * Aim: a desktop app, not a web page: flat controls, hairlines instead of shadows, press feedback, arrow cursor, unselectable UI text.
+ * Aim: a desktop app, not a web page, styled after macOS: push buttons and fields with a hairline edge and soft shade, accent-highlighted
+ * menu items, focus halos, press feedback, arrow cursor, unselectable UI text.
  * Performance: no large backdrop-filter / mask (recomputed every frame while scrolling); animate only transform / opacity.
  */
 :root {
@@ -23,6 +24,17 @@
   --flyout-bg: #ffffff;
   --flyout-shadow: 0 10px 32px rgba(0, 0, 0, 0.16), 0 0 0 1px rgba(0, 0, 0, 0.07);
   --scrim: linear-gradient(to bottom, rgba(245, 245, 247, 0) 0%, rgba(245, 245, 247, 0.55) 55%, var(--bg) 100%);
+  /* Text fields (macOS style): solid fill, visible border, soft top shade; focus = accent border + halo */
+  --field-bg: #ffffff;
+  --field-border: rgba(0, 0, 0, 0.18);
+  --field-shade: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+  --ring: rgba(10, 124, 255, 0.32);
+  /* Push buttons (macOS style): solid face, hairline edge, a touch of drop shadow */
+  --btn-bg: #ffffff;
+  --btn-hover: #f2f2f4;
+  --btn-press: #e6e6ea;
+  --btn-edge: 0 0 0 0.5px rgba(0, 0, 0, 0.14), 0 1px 1.5px rgba(0, 0, 0, 0.08);
+  --track: rgba(0, 0, 0, 0.12);
 
   --radius-s: 6px;
   --radius: 8px;
@@ -59,6 +71,15 @@
     --flyout-bg: #2b2b2f;
     --flyout-shadow: 0 10px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.08);
     --scrim: linear-gradient(to bottom, rgba(22, 22, 24, 0) 0%, rgba(22, 22, 24, 0.6) 55%, var(--bg) 100%);
+    --field-bg: #1f1f22;
+    --field-border: rgba(255, 255, 255, 0.16);
+    --field-shade: inset 0 1px 2px rgba(0, 0, 0, 0.3);
+    --ring: rgba(59, 149, 255, 0.45);
+    --btn-bg: rgba(255, 255, 255, 0.12);
+    --btn-hover: rgba(255, 255, 255, 0.17);
+    --btn-press: rgba(255, 255, 255, 0.22);
+    --btn-edge: inset 0 0.5px 0 rgba(255, 255, 255, 0.1), 0 0 0 0.5px rgba(0, 0, 0, 0.4), 0 1px 1.5px rgba(0, 0, 0, 0.25);
+    --track: rgba(255, 255, 255, 0.2);
     color-scheme: dark;
   }
 }
@@ -78,11 +99,11 @@ img { display: block; }
 h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 h2 { font-size: 18px; }
 
-/* Focus ring only for keyboard use */
+/* Focus ring only for keyboard use: a soft accent halo, as on macOS */
 :focus { outline: none; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-s); }
+:focus-visible { outline: 3px solid var(--ring); outline-offset: 1px; border-radius: var(--radius-s); }
 
-/* Thin scrollbars (Windows 11 style) */
+/* Thin rounded scrollbars that thicken on hover (macOS style) */
 ::-webkit-scrollbar { width: 12px; height: 12px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--stroke-strong); border-radius: 6px; border: 4px solid transparent; background-clip: content-box; }
@@ -94,19 +115,24 @@ img.fade { opacity: 0; transition: opacity 0.25s var(--ease); }
 img.fade.in { opacity: 1; }
 img.fade.instant { opacity: 1; transition: none; }
 
-/* Flat buttons: light fill on hover, darker and slightly smaller when pressed */
+/* Push buttons (macOS style): solid face with a hairline edge; darker and slightly smaller when pressed.
+   Ghost buttons stay flat (toolbar style). */
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  height: 32px; padding: 0 12px; border-radius: var(--radius-s);
-  background: var(--fill); white-space: nowrap;
+  height: 32px; padding: 0 14px; border-radius: 7px;
+  background: var(--btn-bg); box-shadow: var(--btn-edge); white-space: nowrap;
   transition: background 0.12s, transform 0.12s var(--ease);
 }
-.btn:hover { background: var(--fill-hover); }
-.btn:active { background: var(--fill-press); transform: scale(0.97); }
+.btn:hover { background: var(--btn-hover); }
+.btn:active { background: var(--btn-press); transform: scale(0.97); }
 .btn:disabled { opacity: 0.45; pointer-events: none; }
-.btn.primary { background: var(--accent); color: var(--accent-text); }
-.btn.primary:hover { filter: brightness(1.08); }
-.btn.ghost { background: transparent; }
+.btn.primary {
+  background: linear-gradient(rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0)) var(--accent); color: var(--accent-text);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.14);
+}
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.primary:active { filter: brightness(0.94); }
+.btn.ghost { background: transparent; box-shadow: none; }
 .btn.ghost:hover { background: var(--fill-hover); }
 .btn.icon { width: 32px; padding: 0; }
 .btn.danger { color: var(--danger); }

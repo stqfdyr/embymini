@@ -1,4 +1,4 @@
-// Hash routes: #/, #/item/<id>, #/library/<id>, #/person/<id>, #/season/<series id>/<season id>, #/search, #/favorites, #/settings.
+// Hash routes: #/, #/item/<id>, #/library/<id>, #/person/<id>, #/season/<series id>/<season id>, #/views, #/resume, #/search, #/favorites, #/settings.
 // The scroll position is saved on leaving a page and restored on coming back.
 
 export const route = $state({ name: 'home', id: '', sub: '', hash: '#/' })

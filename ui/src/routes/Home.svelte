@@ -1,18 +1,15 @@
-<!-- Home: carousel → my media → continue watching → latest of each library. -->
+<!-- Home: carousel → my media → continue watching → latest of each library. The counts of the first two open their walls (Shelf). -->
 <script lang="ts">
   import Hero from '../lib/Hero.svelte'
   import LibraryRow from '../lib/LibraryRow.svelte'
   import LoadError from '../lib/LoadError.svelte'
   import Row from '../lib/Row.svelte'
   import Wide from '../lib/Wide.svelte'
-  import { LIST_FIELDS, get, img, loader, play, prefetch, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
+  import { LIST_FIELDS, browsable, get, img, loader, play, prefetch, resumeHome, resumeMenu, session, uid, wideImg } from '../lib/api.svelte'
   import { openMenu } from '../lib/menu.svelte'
   import { clock, episodeLabel } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
   import type { Page } from '../lib/types'
-
-  /** Library types browsable as movies / series (music, live TV and playlists stay off the home page). */
-  const BROWSABLE = new Set(['movies', 'tvshows', 'homevideos', 'boxsets', 'mixed', undefined])
 
   // The carousel is random, so only a manual refresh changes it; background refreshes update the rows below
   const hero = loader(() => {
@@ -24,8 +21,8 @@
     const u = uid()
     return Promise.all([
       get<Page>(`/Users/${u}/Views`),
-      get<Page>(`/Users/${u}/Items/Resume`, { Limit: 16, MediaTypes: 'Video', Fields: LIST_FIELDS }),
-    ]).then(([views, resume]) => ({ views: views.Items.filter((v) => BROWSABLE.has(v.CollectionType)), resume: resume.Items }))
+      resumeHome(),
+    ]).then(([views, resume]) => ({ views: browsable(views.Items), resume: resume.items, resumeCount: resume.count }))
   }, () => 'home')
   restoreScrollWhen(() => q.data)
 </script>
@@ -34,14 +31,14 @@
   {@const d = q.data}
   <Hero items={hero.data?.Items ?? []} />
 
-  <Row title="我的媒体" count={d.views.length}>
+  <Row title="我的媒体" count={d.views.length} href="#/views">
     {#each d.views as v (v.Id)}
       <Wide src={img(v.Id, 'Primary', v.ImageTags?.Primary, 260)} title={v.Name} href={`#/library/${v.Id}`} width={260} />
     {/each}
   </Row>
 
   {#if d.resume.length}
-    <Row title="继续观看" count={d.resume.length}>
+    <Row title="继续观看" count={d.resumeCount} href="#/resume">
       {#each d.resume as it (it.Id)}
         <Wide
           src={wideImg(it, 300)}

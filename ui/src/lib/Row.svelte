@@ -3,7 +3,7 @@
   import type { Snippet } from 'svelte'
   import { ChevronLeft, ChevronRight } from '@lucide/svelte'
 
-  let { title = '', count, href, head, children }: { title?: string; count?: number; href?: string; head?: Snippet; children: Snippet } = $props()
+  let { title = '', count, href, head, children }: { title?: string; count?: number | string; href?: string; head?: Snippet; children: Snippet } = $props()
   let el: HTMLDivElement
   let atStart = $state(true)
   let atEnd = $state(false)

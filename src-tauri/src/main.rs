@@ -1105,6 +1105,10 @@ mod tests {
         while app.starting.load(Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
+        assert_eq!(
+            tauri::async_runtime::block_on(app.unless_quit(async { 1 })),
+            Some(1)
+        );
         let t0 = std::time::Instant::now();
         app.shutdown(Duration::from_secs(3));
         assert!(t0.elapsed() < Duration::from_secs(1));
@@ -1113,6 +1117,45 @@ mod tests {
         // already exiting: a new play gives up at once
         let late = tauri::async_runtime::block_on(app.unless_quit(async { 1 }));
         assert_eq!(late, None);
+    }
+
+    /// A `play` that registers its player while shutdown waits for it: shutdown quits that player too and
+    /// waits for its report, instead of leaving a running mpv behind.
+    #[test]
+    fn shutdown_quits_a_player_registered_while_waiting() {
+        let app = std::sync::Arc::new(test_app(None));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, d) = (app.clone(), done.clone());
+        let _play = tauri::async_runtime::spawn(async move {
+            let _g = Starting::enter(&a.starting);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (ctl, mut rx) = mpsc::unbounded_channel();
+            let task = tauri::async_runtime::spawn(async move {
+                assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
+                d.store(true, Ordering::SeqCst);
+            });
+            *lock(&a.player) = Some(Player { ctl, task });
+        });
+        while app.starting.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        app.shutdown(Duration::from_secs(3));
+        assert!(done.load(Ordering::SeqCst));
+        assert!(lock(&app.player).is_none());
+    }
+
+    #[test]
+    fn running_marker_holds_the_version() {
+        let dir = std::env::temp_dir().join(format!("embymini-running-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        set_running(&dir, true);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(RUNNING)).unwrap(),
+            emby::VERSION
+        );
+        set_running(&dir, false);
+        assert!(!dir.join(RUNNING).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Exit waits for the player to finish reporting Stopped, but not forever.

@@ -15,7 +15,8 @@
   /** Id of the server being edited; shares `form` with adding. */
   let editing = $state<string | null>(null)
   let relogin = $state<{ id: string; password: string } | null>(null)
-  let busy = $state(false)
+  /** Changes in flight; a count, as a save on blur can overlap a button click. */
+  let busy = $state(0)
   let msg = $state<{ text: string; ok: boolean } | null>(null)
   let mpvPath = $state(session.cfg?.mpvPath ?? '')
   let preload = $state(session.cfg?.preloadPercent ?? 80)
@@ -31,7 +32,7 @@
   /** Apply a change, then reload the config (other pages are unmounted here and refetch when shown).
    *  Resolves to whether it worked; a failure shows the backend's reason and leaves the inputs as typed. */
   async function run(f: () => Promise<unknown>, ok?: string) {
-    busy = true
+    busy++
     msg = null
     try {
       await f()
@@ -42,7 +43,7 @@
       msg = { text: errText(e), ok: false }
       return false
     } finally {
-      busy = false
+      busy--
     }
   }
 
@@ -60,9 +61,11 @@
   }
   // Go home only once the new config is loaded, or Home would mount against the previous server first
   async function add() {
-    if (!(await run(() => invoke('server_add', { url: form.url, port: formPort(), user: form.user, password: form.password })))) return
-    form = { ...blank }
-    go('/')
+    const added = run(async () => {
+      await invoke('server_add', { url: form.url, port: formPort(), user: form.user, password: form.password })
+      form = { ...blank } // saved now, even if reloading the config fails: submitting again would add it twice
+    })
+    if (await added) go('/')
   }
   function startEdit(s: { id: string; url: string; port: number; user: string }) {
     form = { url: s.url, port: String(s.port), user: s.user, password: '' }
@@ -148,7 +151,7 @@
         <input placeholder="用户名" bind:value={form.user} required autocomplete="username" spellcheck="false" />
         <input type="password" placeholder={pwHint} bind:value={form.password} autocomplete="current-password" />
         <div class="btns">
-          <button class="btn primary" disabled={busy}>{label}</button>
+          <button class="btn primary" disabled={busy > 0}>{label}</button>
           {#if cancel}<button type="button" class="btn ghost" onclick={cancel}>取消</button>{/if}
         </div>
       </form>
@@ -165,13 +168,13 @@
         {#if relogin?.id === s.id}
           <!-- svelte-ignore a11y_autofocus -->
           <input type="password" placeholder="密码" bind:value={relogin.password} autofocus onkeydown={(e) => (e.key === 'Enter' && login(), e.key === 'Escape' && (relogin = null))} />
-          <button class="btn primary" disabled={busy} onclick={login}>登录</button>
+          <button class="btn primary" disabled={busy > 0} onclick={login}>登录</button>
           <button class="btn ghost" onclick={() => (relogin = null)}>取消</button>
         {:else}
-          {#if s.id !== session.cfg?.active}<button class="btn" disabled={busy} onclick={() => use(s.id)}><Check size={15} /> 使用</button>{/if}
-          <button class="btn" disabled={busy} onclick={() => startEdit(s)}><Pencil size={15} /> 编辑</button>
-          <button class="btn" disabled={busy} onclick={() => ((relogin = { id: s.id, password: '' }), (editing = null))}><LogIn size={15} /> 重新登录</button>
-          <button class="btn icon danger" title="删除" disabled={busy} onclick={() => remove(s.id, s.name)}><Trash2 size={15} /></button>
+          {#if s.id !== session.cfg?.active}<button class="btn" disabled={busy > 0} onclick={() => use(s.id)}><Check size={15} /> 使用</button>{/if}
+          <button class="btn" disabled={busy > 0} onclick={() => startEdit(s)}><Pencil size={15} /> 编辑</button>
+          <button class="btn" disabled={busy > 0} onclick={() => ((relogin = { id: s.id, password: '' }), (editing = null))}><LogIn size={15} /> 重新登录</button>
+          <button class="btn icon danger" title="删除" disabled={busy > 0} onclick={() => remove(s.id, s.name)}><Trash2 size={15} /></button>
         {/if}
       </div>
       {/if}
@@ -288,7 +291,8 @@
     box-shadow: inset 0 -1px 0 var(--stroke-strong); transition: box-shadow 0.12s, background 0.12s;
   }
   input:not([type='range']) { height: 32px; }
-  input:not([type='range']):focus, textarea:focus { background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
+  /* Windows text boxes: the accent underline is the focus cue, no ring */
+  input:not([type='range']):focus, textarea:focus { outline: none; background: var(--bg); box-shadow: inset 0 -2px 0 var(--accent); }
   input[type='range'], input[type='checkbox'] { accent-color: var(--accent); }
   input[type='checkbox'] { width: 18px; height: 18px; }
   .form { display: grid; grid-template-columns: 170px 1fr 1fr; gap: 10px; }
@@ -301,5 +305,5 @@
   .notes { white-space: pre-wrap; max-height: 160px; overflow: auto; margin-top: 6px; }
   input.wide { width: 100%; }
   .line { display: flex; gap: 8px; align-items: center; }
-  textarea { width: 100%; resize: vertical; padding: 6px 10px; font: inherit; color: inherit; }
+  textarea { width: 100%; resize: vertical; padding: 6px 10px; }
 </style>

@@ -72,7 +72,7 @@ img, a { -webkit-user-drag: none; }
 .selectable, input, textarea { user-select: text; -webkit-user-select: text; }
 
 button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: default; }
-input, select { font: inherit; color: inherit; }
+input, select, textarea { font: inherit; color: inherit; }
 a { color: inherit; text-decoration: none; cursor: default; }
 img { display: block; }
 h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }

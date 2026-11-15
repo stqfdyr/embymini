@@ -28,7 +28,7 @@
 
   $effect(() => {
     setUnauthorizedHandler(() => loadConfig().then(() => go('/settings')))
-    loadConfig().then(() => !session.server?.loggedIn && go('/settings'))
+    loadConfig()
     // Notify playback failures; refresh quietly once a whole playback session ends (not on `stopped` between episodes)
     const off = listen<{ type: string; message?: string }>('player', (e) => {
       if (e.payload.type === 'failed') notify(e.payload.message ?? '播放失败')
@@ -41,6 +41,12 @@
       void off.then((f) => f())
       void offResize.then((f) => f())
     }
+  })
+
+  // Signed out, Settings shows whatever the route; pin the route to it as well (a tab clicked meanwhile, startup), so
+  // the moment a server is signed in nothing stale mounts against it before Settings navigates home
+  $effect(() => {
+    if (session.cfg && !session.server?.loggedIn && route.name !== 'settings') location.replace('#/settings')
   })
 
   // Desktop habits: no web context menu, F5 reloads data not the page, mouse side buttons / Alt+← go back, Ctrl+F searches
@@ -166,7 +172,7 @@
   .win button:active { background: var(--fill-press); }
   .win .close:hover { background: #c42b1c; color: #fff; }
   .win .close:active { background: #b22a1d; color: #fff; }
-  .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 40; display: flex; flex-direction: column; gap: 10px; max-width: 420px; }
+  .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 46; /* above .modal: dialogs raise toasts (copied) */ display: flex; flex-direction: column; gap: 10px; max-width: 420px; }
   .toast { display: flex; align-items: center; gap: 12px; padding: 12px 16px; line-height: 1.5; }
   .toast span { flex: 1; }
   .toast .btn { flex: none; color: var(--accent); }

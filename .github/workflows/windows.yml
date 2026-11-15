@@ -59,7 +59,7 @@ jobs:
       - run: npm run knip
         working-directory: ui
 
-      # Before the slow test build so a lint failure costs a minute, not five
+      # Before the test build so a lint failure stops the run early
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: 下载 mpv.exe 到 src-tauri/mpv/

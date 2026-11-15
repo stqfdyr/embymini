@@ -655,7 +655,7 @@ async fn play(
     let _starting = Starting::enter(&app.starting);
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    app.stop_player(); // switching titles: the old mpv quits and reports on its own, no need to wait
+    app.stop_player(); // switching titles: the old mpv quits and reports on its own; only exit waits for it
     let (preload_percent, volume, dm) = {
         let c = app.cfg();
         (f64::from(c.preload_percent), c.volume, c.danmaku.clone())

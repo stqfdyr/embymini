@@ -230,11 +230,13 @@ impl App {
         Ok((s.id.clone(), Emby::new(self.http.clone(), s, &c.device_id)))
     }
 
-    /// 个人 mpv 配置文件：和 config.json 同在数据目录，升级不覆盖。由用户自己创建，存在才加载。
+    /// The personal mpv config: next to config.json in the data dir, so updates leave it alone. Users create it
+    /// themselves; it is loaded only if it exists.
     fn user_mpv_conf(&self) -> PathBuf {
         self.path.with_file_name("mpv.conf")
     }
 
+    /// mpv to run: the path set in settings, else the bundled one, else whatever PATH finds.
     fn mpv_path(&self) -> PathBuf {
         if let Some(p) = self
             .cfg()
@@ -606,6 +608,7 @@ async fn emby(
     r
 }
 
+/// Plays `item_id` in a new mpv, closing the current player; a later click while this one starts wins.
 #[tauri::command]
 async fn play(
     handle: tauri::AppHandle,
@@ -617,7 +620,7 @@ async fn play(
     let _starting = Starting::enter(&app.starting);
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let _ = app.stop_player(); // 换片：旧的 mpv 自己退出、回传，不用等
+    let _ = app.stop_player(); // switching titles: the old mpv quits and reports on its own, no need to wait
     let (preload_percent, volume, dm) = {
         let c = app.cfg();
         (f64::from(c.preload_percent), c.volume, c.danmaku.clone())
@@ -661,37 +664,43 @@ async fn play(
         return Ok(());
     }
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     tauri::async_runtime::spawn(session.run(ctl_rx, ev_tx));
-    // 转发播放事件；会话结束（Ended 发出、通道关闭）后它才结束，所以退出时等它就等到了回传和保存音量
-    let task = tauri::async_runtime::spawn(async move {
-        while let Some(ev) = ev_rx.recv().await {
-            let app = handle.state::<App>();
-            match ev {
-                player::Event::Ended { volume: Some(v) } => {
-                    app.remember(|c| c.volume = Some(v));
-                }
-                // 弹幕面板里的改动：存进配置，界面不用知道
-                player::Event::DanmakuStyle { style } => {
-                    app.remember(|c| c.danmaku.style = style);
-                    continue;
-                }
-                player::Event::DanmakuPick { key, pick } => {
-                    app.remember(|c| {
-                        c.danmaku.picks.insert(key, pick);
-                    });
-                    continue;
-                }
-                _ => {}
-            }
-            let _ = handle.emit("player", &ev);
-        }
-    });
-    // 保险：万一这时已有别的播放器登记着，关掉它，不留一个没人管的 mpv
+    let task = tauri::async_runtime::spawn(forward_events(handle, ev_rx));
+    // Just in case another player got registered meanwhile: close it rather than leave an orphaned mpv
     if let Some(old) = lock(&app.player).replace(Player { ctl: ctl_tx, task }) {
         let _ = old.ctl.send(player::Ctl::Quit);
     }
     Ok(())
+}
+
+/// Passes playback events to the UI and saves what belongs in the config. Ends only after `Ended` (the session
+/// drops its sender then), so waiting on it at exit also waits for the reports and the saved volume.
+async fn forward_events(
+    handle: tauri::AppHandle,
+    mut events: mpsc::UnboundedReceiver<player::Event>,
+) {
+    while let Some(ev) = events.recv().await {
+        let app = handle.state::<App>();
+        match ev {
+            player::Event::Ended { volume: Some(v) } => {
+                app.remember(|c| c.volume = Some(v));
+            }
+            // Danmaku panel changes only go to the config; the UI does not need them
+            player::Event::DanmakuStyle { style } => {
+                app.remember(|c| c.danmaku.style = style);
+                continue;
+            }
+            player::Event::DanmakuPick { key, pick } => {
+                app.remember(|c| {
+                    c.danmaku.picks.insert(key, pick);
+                });
+                continue;
+            }
+            _ => {}
+        }
+        let _ = handle.emit("player", &ev);
+    }
 }
 
 fn main() {

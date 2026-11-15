@@ -40,9 +40,12 @@
 
 <style>
   .ctx { position: fixed; z-index: 50; min-width: 200px; padding: 5px; display: flex; flex-direction: column; }
-  button { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 14px 0 8px; border-radius: var(--radius-s); text-align: left; }
-  button:hover { background: var(--fill-hover); }
+  button { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 14px 0 8px; border-radius: 5px; text-align: left; }
+  /* macOS menus: the highlighted item turns accent with white text and icon */
+  button:hover { background: var(--accent); color: var(--accent-text); }
   button.danger { color: var(--danger); }
+  button.danger:hover { background: var(--danger); color: var(--accent-text); }
   .ic { width: 18px; display: grid; place-items: center; color: var(--text-2); }
+  button:hover .ic { color: inherit; }
   .sep { height: 1px; background: var(--stroke); margin: 4px 6px; }
 </style>

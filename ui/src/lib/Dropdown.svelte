@@ -74,19 +74,21 @@
   .dd { position: relative; display: inline-block; }
   .trigger {
     display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 10px; border-radius: var(--radius-s);
-    background: var(--fill); transition: background 0.12s;
+    background: var(--btn-bg); box-shadow: var(--btn-edge); transition: background 0.12s;
   }
-  .trigger:hover, .trigger.open { background: var(--fill-hover); }
+  .trigger:hover, .trigger.open { background: var(--btn-hover); }
   .trigger :global(svg) { color: var(--text-2); transition: transform 0.15s var(--ease); }
   .trigger.open :global(svg) { transform: rotate(180deg); }
-  .trigger.big { background: none; padding: 0 8px 0 0; font-size: 20px; font-weight: 600; height: 36px; }
+  .trigger.big { background: none; box-shadow: none; padding: 0 8px 0 0; font-size: 20px; font-weight: 600; height: 36px; }
   .trigger.big:hover, .trigger.big.open { background: none; color: var(--accent); }
   .list {
     position: absolute; top: calc(100% + 6px); left: 0; z-index: 30; min-width: max(100%, 180px); max-height: 360px; overflow-y: auto;
     padding: 5px; display: flex; flex-direction: column;
   }
-  .list button { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 12px 0 6px; border-radius: var(--radius-s); text-align: left; white-space: nowrap; }
-  .list button.active { background: var(--fill-hover); }
+  .list button { display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px 0 6px; border-radius: 5px; text-align: left; white-space: nowrap; }
+  /* macOS menus: the highlighted item turns accent with white text, check and hint */
+  .list button.active { background: var(--accent); color: var(--accent-text); }
+  .list button.active .check, .list button.active .hint { color: inherit; }
   .check { width: 20px; display: grid; place-items: center; color: var(--accent); flex: none; }
   .label { flex: 1; }
   .hint { color: var(--text-3); font-size: 12px; margin-left: 16px; }

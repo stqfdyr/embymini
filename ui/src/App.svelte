@@ -17,6 +17,7 @@
   import Person from './routes/Person.svelte'
   import Search from './routes/Search.svelte'
   import Season from './routes/Season.svelte'
+  import Shelf from './routes/Shelf.svelte'
   import Settings from './routes/Settings.svelte'
 
   const TABS = [['home', '/', '媒体'], ['search', '/search', '搜索'], ['favorites', '/favorites', '收藏']] as const
@@ -136,6 +137,8 @@
         {#key route.hash}<Season seriesId={route.id} seasonId={route.sub} />{/key}
       {:else if route.name === 'library'}
         {#key route.id}<Library id={route.id} />{/key}
+      {:else if route.name === 'views' || route.name === 'resume'}
+        {#key route.name}<Shelf kind={route.name} />{/key}
       {:else if route.name === 'search'}
         <Search />
       {:else if route.name === 'favorites'}

@@ -3,6 +3,7 @@ import { untrack } from 'svelte'
 import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { Check, Circle, EyeOff, Heart, HeartOff, Play, RotateCcw } from '@lucide/svelte'
 import type { MenuItem } from './menu.svelte'
+import { ignoredStart, merge } from './page'
 import { readSnap, writeSnap } from './snap'
 import type { Item, Page } from './types'
 
@@ -22,6 +23,22 @@ export const LIST_FIELDS = 'ProductionYear,EndDate,CommunityRating,UserData,Prim
 export const DETAIL_FIELDS = `${LIST_FIELDS},People,ExternalUrls,ProviderIds,MediaSources,Studios,PremiereDate,Status`
 /** Fields episode cards need. */
 export const EP_FIELDS = 'Overview,MediaSources,UserData,CommunityRating,PremiereDate,RunTimeTicks'
+/** Library types browsable as movies / series (music, live TV and playlists stay off the home page and the library wall). */
+const BROWSABLE = new Set(['movies', 'tvshows', 'homevideos', 'boxsets', 'mixed', undefined])
+export const browsable = (views: Item[]) => views.filter((v) => BROWSABLE.has(v.CollectionType))
+/** Continue watching for the home row: the first 16 and their count. `exact` is false when the count may be short: the
+ *  server reported only the number returned as the total (some do), so `resumeCount` counts the list afterwards. */
+export async function resumeHome() {
+  const p = await get<Page>(`/Users/${uid()}/Items/Resume`, { Limit: 16, MediaTypes: 'Video', Fields: LIST_FIELDS })
+  const n = p.Items.length
+  return { items: p.Items, total: Math.max(p.TotalRecordCount, n), exact: p.TotalRecordCount > n || n < 16 }
+}
+/** Counts continue watching with a lean request, after the home row is up (shortcut: up to 1000, shown as "1000+",
+ *  far beyond real lists). */
+export const resumeCount = () =>
+  get<Page>(`/Users/${uid()}/Items/Resume`, { Limit: 1000, MediaTypes: 'Video', EnableImages: false, EnableUserData: false }).then((all) =>
+    all.Items.length >= 1000 ? '1000+' : String(all.Items.length),
+  )
 
 /** Bottom-right notice (playback failed etc.); gone after TOAST_MS or on click, may carry one button (e.g. undo). */
 type Toast = { id: number; text: string; action?: { label: string; run: () => unknown } }
@@ -210,34 +227,49 @@ export function itemMenu(it: Item, open?: () => void): MenuItem[] {
 }
 
 /**
- * Paged list (library, person's works): `more()` fetches the next page (called when the grid nears its end).
- * Starts over from page one when reactive values read in `query()` (sort, filter, id) or a manual reload change;
- * late results of older requests are dropped by generation. After a failure `more()` does nothing until `retry()`,
- * a new query or a refresh, so the grid cannot retry in a loop. Call during component init.
+ * Paged list (library, person's works, continue watching): `more()` fetches the next page (called when the grid nears
+ * its end) from `/Users/{uid}/<sub>`. Starts over from page one when reactive values read in `query()` (sort, filter,
+ * id) or a manual reload change; late results of older requests are dropped by generation. After a failure `more()`
+ * does nothing until `retry()`, a new query or a refresh, so the grid cannot retry in a loop. Call during component init.
+ *
+ * Servers that misreport totals or ignore StartIndex are handled by the rules in page.ts; once StartIndex is found
+ * ignored, each page asks from 0 for one page more and keeps the tail (transfer grows with the list, fine for the
+ * lists this hits; a server that also caps Limit cannot be read past its cap by any request, so the list ends there).
  */
-export function pager(query: () => Record<string, unknown>, size = 60) {
-  const s = $state({ items: [] as Item[], total: 0, busy: false, error: '', loaded: false })
+export function pager(query: () => Record<string, unknown>, sub = 'Items') {
+  const size = 60
+  const s = $state({ items: [] as Item[], total: 0, exact: false, busy: false, error: '', loaded: false, done: false })
   let gen = 0
   let q: Record<string, unknown> = {}
   /** Showing the first-page snapshot (snap.ts): the next fetch starts at 0 and replaces it. */
   let fromSnap = false
-  const key = () => snapKey(`pager|${JSON.stringify(q)}`)
+  /** The server ignores StartIndex for this query. */
+  let grow = false
+  const key = () => snapKey(`pager|${sub}|${JSON.stringify(q)}`)
   let failed = false
+  const fetchPage = (start: number) => get<Page>(`/Users/${uid()}/${sub}`, { ...q, StartIndex: grow ? 0 : start, Limit: grow ? start + size : size })
   async function more() {
-    if (failed || s.busy || (s.loaded && !fromSnap && s.items.length >= s.total)) return
+    if (failed || s.busy || (s.loaded && !fromSnap && s.done)) return
     s.busy = true
     s.error = ''
     const mine = gen
     const start = fromSnap ? 0 : s.items.length
     try {
-      const p = await get<Page>(`/Users/${uid()}/Items`, { ...q, StartIndex: start, Limit: size })
+      let p = await fetchPage(start)
       if (mine !== gen) return
+      const shown = start ? s.items : []
+      if (start && !grow && ignoredStart(shown, p)) {
+        grow = true
+        p = await fetchPage(start)
+        if (mine !== gen) return
+      }
+      const { fresh, done, total, exact } = merge(shown, p, size, grow ? start : 0)
       if (start === 0) {
-        s.items = p.Items
+        s.items = fresh
         fromSnap = false
-        writeSnap(key(), { items: p.Items, total: p.TotalRecordCount })
-      } else s.items.push(...p.Items)
-      s.total = p.TotalRecordCount
+      } else s.items.push(...fresh)
+      Object.assign(s, { done, total, exact })
+      if (start === 0) writeSnap(key(), { items: s.items, total: s.total, exact, done })
       s.loaded = true
       s.error = ''
     } catch (e) {
@@ -253,10 +285,11 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
     void session.refresh
     q = query()
     gen++
-    const snap = readSnap<{ items: Item[]; total: number }>(key())
+    const snap = readSnap<{ items: Item[]; total: number; exact?: boolean; done?: boolean }>(key())
     fromSnap = !!snap
     failed = false
-    Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap })
+    grow = false
+    Object.assign(s, { items: snap?.items ?? [], total: snap?.total ?? 0, busy: false, error: '', loaded: !!snap, done: !!snap?.done, exact: !!snap?.exact })
     untrack(more)
   })
   const retry = () => ((failed = false), more())
@@ -265,7 +298,8 @@ export function pager(query: () => Record<string, unknown>, size = 60) {
 
 /** Width tiers: DPR-scaled widths round up to one, so zoom levels and card sizes share cached images. */
 const WIDTHS = [120, 160, 240, 320, 480, 640, 960, 1280, 1600, 1920, 2560, 3840]
-const IN_TAURI = '__TAURI_INTERNALS__' in globalThis
+// Not just the global's presence: the dev bridge installs a stand-in, which a hot reload of this module would mistake for Tauri
+const IN_TAURI = typeof (globalThis as { __TAURI_INTERNALS__?: { convertFileSrc?: unknown } }).__TAURI_INTERNALS__?.convertFileSrc === 'function'
 
 /**
  * Image URL (`index`: which image of that type, e.g. which backdrop); empty without a tag.

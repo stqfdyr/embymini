@@ -1,0 +1,34 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /src-tauri
+    schedule:
+      interval: monthly
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      # Tauri's Rust crates and npm packages must share major.minor; bump those together by hand
+      - dependency-name: "tauri*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: monthly
+    groups:
+      npm:
+        patterns: ["*"]
+    ignore:
+      # Tauri's Rust crates and npm packages must share major.minor; bump those together by hand
+      - dependency-name: "@tauri-apps/*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # The Rust version is pinned on purpose and bumped by hand together with the local toolchain
+      - dependency-name: dtolnay/rust-toolchain

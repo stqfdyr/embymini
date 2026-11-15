@@ -10,7 +10,7 @@
 //! | [`Class::Failed`] | other 5xx | no | the server itself failed; an immediate retry likely fails the same way |
 //! | [`Class::Rejected`] | other 4xx | no | the request itself is refused |
 //!
-//! Retries: at most [`RETRIES`], waiting 0.5 s then 1.5 s, or the reply's `Retry-After` (seconds), capped at 5 s.
+//! Retries: at most [`RETRIES`], waiting 0.5 s then 1.5 s, or the reply's `Retry-After` (seconds or HTTP date), capped at 5 s.
 //! Unreachable (nothing sent) is retried too; timeouts, 408 and 504 are not (a whole timeout has already passed).
 //! Non-idempotent requests (POST) retry only when unreachable or on 429: otherwise the server may already have
 //! acted on them. Read-only POSTs use [`send_readonly`].
@@ -56,15 +56,17 @@ pub fn backoff(attempt: usize, retry_after: Option<Duration>) -> Duration {
     )
 }
 
-/// `Retry-After` in seconds (the rare HTTP-date form is ignored).
+/// `Retry-After` as seconds or an HTTP date (a date already past means no wait).
+/// A date is measured from the reply's `Date` when present, so a skewed local clock does not change the wait.
 pub fn retry_after(h: &reqwest::header::HeaderMap) -> Option<Duration> {
-    h.get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-        .map(Duration::from_secs)
+    let date = |name| httpdate::parse_http_date(h.get(name)?.to_str().ok()?.trim()).ok();
+    let v = h.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = v.parse() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = date(reqwest::header::RETRY_AFTER)?;
+    let now = date(reqwest::header::DATE).unwrap_or_else(std::time::SystemTime::now);
+    Some(at.duration_since(now).unwrap_or_default())
 }
 
 /// Whether this status code is worth a retry (rules in the module docs).
@@ -183,6 +185,27 @@ mod tests {
         assert_eq!(retry_after(&h), None);
         h.insert(reqwest::header::RETRY_AFTER, " 2 ".parse().unwrap());
         assert_eq!(retry_after(&h), Some(Duration::from_secs(2)));
+        let soon = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(3));
+        h.insert(reqwest::header::RETRY_AFTER, soon.parse().unwrap());
+        let d = retry_after(&h).unwrap();
+        assert!(
+            d > Duration::from_secs(1) && d <= Duration::from_secs(3),
+            "{d:?}"
+        );
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), Some(Duration::ZERO));
+        // Server clock ahead of ours: the wait counts from the reply's Date, not the local clock
+        h.insert(
+            reqwest::header::DATE,
+            "Wed, 21 Oct 2015 07:27:58 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(2)));
+        h.remove(reqwest::header::DATE);
+        h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(retry_after(&h), None);
         assert_eq!(backoff(0, None), Duration::from_millis(500));
         assert_eq!(backoff(5, None), Duration::from_millis(1500));
         assert_eq!(backoff(0, Some(Duration::from_secs(60))), MAX_WAIT);

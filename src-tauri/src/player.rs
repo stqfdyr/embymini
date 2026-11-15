@@ -1538,6 +1538,11 @@ mod tests {
             Track::Off
         );
         assert_eq!(mpv_track(&s.media_streams, "Subtitle", None), Track::Auto);
+        // Index 0 is the video: not a subtitle, and not "off" either
+        assert_eq!(
+            mpv_track(&s.media_streams, "Subtitle", Some(0)),
+            Track::Auto
+        );
         assert_eq!(
             mpv_track(&s.media_streams, "Subtitle", Some(99)),
             Track::Auto
@@ -1583,6 +1588,56 @@ mod tests {
             Pref::from_track(&json!({"lang": "zh-CN", "title": "简中", "external": true})),
             pick("zh-CN", "简中", true)
         );
+
+        // No title match: the exact language string, then embedded / external, decide
+        let sub = |index, lang: &str, external| MediaStream {
+            index,
+            kind: "Subtitle".into(),
+            language: Some(lang.into()),
+            title: Some(format!("t{index}")),
+            is_external: external,
+            ..Default::default()
+        };
+        let st = [
+            sub(2, "chi", false),
+            sub(4, "chi", true),
+            sub(3, "zh-CN", true),
+        ];
+        assert_eq!(mpv_track(&st, "Subtitle", Some(4)), Track::Id(3));
+        assert_eq!(
+            match_pref(&st, "Subtitle", &pick("chi", "x", true)),
+            Some(Track::Id(3))
+        );
+        assert_eq!(
+            match_pref(&st, "Subtitle", &pick("chi", "x", false)),
+            Some(Track::Id(1))
+        );
+    }
+
+    #[test]
+    fn language_codes() {
+        for (a, b) in [
+            ("eng", "en"),
+            ("chi", "zh"),
+            ("zho", "zh"),
+            ("jpn", "ja"),
+            ("kor", "ko"),
+            ("fre", "fr"),
+            ("fra", "fr"),
+            ("ger", "de"),
+            ("deu", "de"),
+            ("spa", "es"),
+            ("rus", "ru"),
+            ("ita", "it"),
+            ("por", "pt"),
+            ("tha", "th"),
+            ("zh-CN", "zh"),
+            ("pt_BR", "pt"),
+            ("VIE", "vie"),
+            ("", ""),
+        ] {
+            assert_eq!(lang_key(a), b, "{a}");
+        }
     }
 
     #[test]

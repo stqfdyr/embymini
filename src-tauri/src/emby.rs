@@ -679,7 +679,7 @@ pub(crate) mod tests {
     /// Local HTTP server: `route(path)` → (status line, body); the path is lowercased and the status line may carry
     /// extra header lines. Reads each whole request (head + body) before replying so the client never sees a reset.
     /// Returns its port and every request head as sent.
-    async fn fake(route: fn(&str) -> (&'static str, String)) -> (u16, Heads) {
+    pub async fn fake(route: fn(&str) -> (&'static str, String)) -> (u16, Heads) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
@@ -723,7 +723,7 @@ pub(crate) mod tests {
         (port, heads)
     }
 
-    fn local(port: u16) -> Emby {
+    pub fn local(port: u16) -> Emby {
         Emby::new(
             http_client().unwrap(),
             &server_at("http://127.0.0.1", port),

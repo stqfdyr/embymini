@@ -191,15 +191,13 @@ fn judge(code: u16, json: Option<Value>) -> Result<Value, Fail> {
         .and_then(|v| v["errorMessage"].as_str())
         .filter(|m| !m.is_empty())
         .map(str::to_owned);
-    let fallback = || {
-        if code < 300 {
-            "请求失败".to_owned()
-        } else {
-            describe(code, "")
-        }
+    let class = classify(code);
+    let fallback = || match class {
+        Class::Ok => "请求失败".to_owned(),
+        _ => describe(code, ""),
     };
     let text = |m: Option<String>| format!("弹幕接口：{}", m.unwrap_or_else(fallback));
-    match (classify(code), json) {
+    match (class, json) {
         (Class::Ok, Some(v)) if v.is_object() && v["success"] != false => Ok(v),
         (Class::Ok, Some(_)) => Err(Fail::Other(text(msg))),
         (Class::Auth | Class::Denied, _) => Err(Fail::Setup(format!(
@@ -596,7 +594,8 @@ mod tests {
             {"cid":2,"p":"3.00,5,16711680,[src2]","m":"顶部红"},
             {"cid":3,"p":"4,4,255,[x]","m":"  "},
             {"cid":4,"p":"bad,1,1","m":"坏时间"},
-            {"cid":5,"p":"5,6,99999999999","m":"怪类型"}]});
+            {"cid":5,"p":"5,6,99999999999","m":"怪类型"},
+            {"cid":6,"p":"-1,1,1","m":"负时间"}]});
         assert_eq!(
             parse_comments(&c),
             vec![
@@ -605,6 +604,11 @@ mod tests {
                 (12.35, 1, 0xFFFFFF, "后 一条".into(), 3.55),
             ]
         );
+    }
+
+    #[test]
+    fn widths() {
+        assert_eq!(em_width("a\u{e9}中😀"), 0.55 + 0.6 + 1.0 + 1.1);
     }
 
     #[test]
@@ -623,6 +627,11 @@ mod tests {
         assert!(matches!(judge(404, None), Err(Fail::Setup(_)))); // 反代的 404 页：地址不对
         assert!(matches!(judge(200, None), Err(Fail::Setup(_)))); // 防火墙验证页
         assert!(matches!(judge(502, None), Err(Fail::Busy(_))));
+        assert!(matches!(judge(500, None), Err(Fail::Busy(_))));
+        assert_eq!(
+            judge(304, Some(json!({"success": false}))),
+            Err(Fail::Other("弹幕接口：请求失败".into()))
+        );
         assert!(matches!(judge(429, None), Err(Fail::Busy(_))));
         assert_eq!(
             judge(

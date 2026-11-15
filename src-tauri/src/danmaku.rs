@@ -265,7 +265,7 @@ impl Api {
     }
 
     /// 一集的弹幕（含关联来源、转成简体），规范化成按时间排好的 `[秒, 类型, 颜色, 文字, 字宽]`（见 [`parse_comments`]）。
-    pub async fn comments(&self, episode: i64) -> Result<Vec<Value>, Fail> {
+    pub async fn comments(&self, episode: i64) -> Result<Vec<Row>, Fail> {
         let q = [("withRelated", "true"), ("chConvert", "1")];
         let v = self.get(&format!("comment/{episode}"), &q).await?;
         Ok(parse_comments(&v))
@@ -335,10 +335,13 @@ fn em_width(s: &str) -> f64 {
     (w * 100.0).round() / 100.0
 }
 
+/// One danmaku as the script takes it: `[seconds, mode, colour, text, width in em]`.
+pub type Row = (f64, u8, u32, String, f64);
+
 /// `p` = `秒,类型,颜色(十进制 RGB),[来源]`；类型 4 底部、5 顶部，其余都按滚动。
 /// 输出按时间排好的 `[秒, 类型, 颜色, 文字, 字宽(em)]`。
-fn parse_comments(v: &Value) -> Vec<Value> {
-    let mut out: Vec<(f64, Value)> = v["comments"]
+fn parse_comments(v: &Value) -> Vec<Row> {
+    let mut out: Vec<Row> = v["comments"]
         .as_array()
         .into_iter()
         .flatten()
@@ -369,11 +372,11 @@ fn parse_comments(v: &Value) -> Vec<Value> {
                 .unwrap_or(0xFF_FFFF)
                 & 0xFF_FFFF;
             let t = (t * 100.0).round() / 100.0;
-            Some((t, json!([t, mode, color, text, em_width(text)])))
+            Some((t, mode, color, text.to_owned(), em_width(text)))
         })
         .collect();
     out.sort_by(|a, b| a.0.total_cmp(&b.0));
-    out.into_iter().map(|(_, v)| v).collect()
+    out
 }
 
 /// 一次播放用到的弹幕环境（起播时从配置取一份）。
@@ -428,7 +431,8 @@ pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fai
         match api.comments(ep.id).await {
             Ok(v) => {
                 prune(dir);
-                let text = Value::Array(v).to_string();
+                // Plain numbers and strings: serializing cannot fail
+                let text = serde_json::to_string(&v).unwrap_or_else(|_| "[]".into());
                 if let Err(e) = write(&path, &text) {
                     log::warn!("{e}");
                 }
@@ -596,9 +600,9 @@ mod tests {
         assert_eq!(
             parse_comments(&c),
             vec![
-                json!([3.0, 5, 0xFF0000, "顶部红", 3.0]),
-                json!([5.0, 1, 0xFFFFFF, "怪类型", 3.0]),
-                json!([12.35, 1, 0xFFFFFF, "后 一条", 3.55]),
+                (3.0, 5, 0xFF0000, "顶部红".into(), 3.0),
+                (5.0, 1, 0xFFFFFF, "怪类型".into(), 3.0),
+                (12.35, 1, 0xFFFFFF, "后 一条".into(), 3.55),
             ]
         );
     }

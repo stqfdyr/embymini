@@ -171,6 +171,15 @@ local function run()
     fake.handlers.panel()
     send("status", { kind = "error", text = "坏\\N}", item = "A" })
     check(find(panel(), "坏＼N｝") ~= nil, "status text escaped")
+    send("status", { kind = "error", text = string.rep("长", 40), item = "A" })
+    local cut = ""
+    for _, l in ipairs(panel()) do if l.text:find("^长") then cut = l.text end end
+    check(cut:sub(-3) == "…" and #cut < 40 * 3, "long status cut to the panel: " .. cut)
+    episode("A", { { 10, 1, 16777215, "c", 0.55 } })
+    send("load", { item = "A", title = string.rep("长", 40), list = { { 10, 1, 16777215, "c", 0.55 } } })
+    cut = ""
+    for _, l in ipairs(panel()) do if l.text:find("^长") then cut = l.text end end
+    check(cut:find("… · 1 条$") ~= nil, "a long title is cut, the count kept: " .. cut)
 
     -- Manual match: only the reply to the latest lookup counts, and nothing from before an episode change
     for _, kw in ipairs({ "旧", "新" }) do

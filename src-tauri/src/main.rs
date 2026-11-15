@@ -740,7 +740,7 @@ async fn forward_events(
 }
 
 fn main() {
-    // panic 写进日志，再交给默认处理
+    // Log panics, then hand them to the default hook
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log::error!("程序出错（panic）：{info}");
@@ -756,23 +756,7 @@ fn main() {
                 let _ = w.set_focus();
             }
         }))
-        .plugin(
-            // 默认 40 KB 就整个删掉重来，排查要的记录留不住：放到 2 MB，轮换时留最近 3 份；时间用本地时间
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .max_file_size(2_000_000)
-                .rotation_strategy(RotationStrategy::KeepSome(3))
-                .timezone_strategy(TimezoneStrategy::UseLocal)
-                .clear_targets()
-                .targets([
-                    Target::new(TargetKind::Stdout),
-                    Target::new(TargetKind::Folder {
-                        path: root.join("logs"),
-                        file_name: None,
-                    }),
-                ])
-                .build(),
-        )
+        .plugin(log_plugin(root.join("logs")))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .register_asynchronous_uri_scheme_protocol(images::SCHEME, |ctx, req, responder| {
@@ -782,91 +766,7 @@ fn main() {
                 responder.respond(serve_image(&handle, &path).await);
             });
         })
-        .setup(move |app| {
-            let p = app.path();
-            let old = [
-                p.app_config_dir()?,
-                p.app_local_data_dir()?,
-                p.app_cache_dir()?,
-            ];
-            match config::migrate(&root, &old[0], &old) {
-                Ok(true) => log::info!("已把旧版本的配置搬到数据目录"),
-                Ok(false) => {}
-                Err(e) => log::warn!("搬旧版本的配置失败：{e}"),
-            }
-            // WebView2 的数据（含图片磁盘缓存）默认在 %LOCALAPPDATA%，只能在建窗口时改，所以主窗口在这里建
-            let win = app
-                .config()
-                .app
-                .windows
-                .first()
-                .cloned()
-                .ok_or("缺少主窗口配置")?;
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &win)?
-                .data_directory(root.join("webview"))
-                .build()?;
-            let path = root.join("config.json");
-            let cfg = config::load(&path)
-                .map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
-            config::save(&path, &cfg)?; // 首次启动把生成的 device_id 落盘
-            if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
-                log::warn!("上次没有正常退出（版本 {v}）");
-            }
-            set_running(&root, true);
-            // shortcut: 旧版本诊断数据留下的暂存与标记（暂存最多约 20 MB），用户大多升过几版后去掉
-            let old = root.clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                for f in ["telemetry", "last-exit.json", "running.json"] {
-                    remove_path(&old.join(f));
-                }
-            });
-            let mpv_dir = app
-                .path()
-                .resource_dir()
-                .ok()
-                .and_then(|d| player::bundled_dir(&d));
-            // CI 冒烟测试按这一行判断安装后的路径是否正确（不能带 \\?\ 前缀），改措辞要同步改 windows.yml
-            log::info!(
-                "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
-                emby::VERSION,
-                root.display(),
-                mpv_dir
-                    .as_deref()
-                    .map_or("（无）".into(), |d| d.display().to_string())
-            );
-            let mpv_cache = Some(root.join("mpv-cache"));
-            let http = emby::http_client()?;
-            let images =
-                images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
-            images.start();
-            let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
-            // The installer may still be running right after an update: wait before deleting its leftovers.
-            tauri::async_runtime::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let _ = tauri::async_runtime::spawn_blocking(|| {
-                    for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
-                        remove_path(&p);
-                    }
-                })
-                .await;
-            });
-            app.manage(App {
-                path,
-                cfg: Mutex::new(cfg),
-                http,
-                images,
-                stream,
-                danmaku_dir: root.join("cache").join("danmaku"),
-                mpv_dir,
-                mpv_cache,
-                player: Mutex::new(None),
-                play_seq: AtomicU64::new(0),
-                quit: watch::Sender::new(false),
-                starting: AtomicUsize::new(0),
-                closing: Mutex::new(Vec::new()),
-            });
-            Ok(())
-        })
+        .setup(move |app| setup(app, &root))
         .invoke_handler(tauri::generate_handler![
             config_get,
             server_add,
@@ -885,35 +785,149 @@ fn main() {
         ])
         .build(ctx)
         .unwrap_or_else(|e| panic!("EmbyMini 启动失败：{e}"))
-        .run(move |handle, ev| match ev {
-            // 点关闭：先藏窗口、让 mpv 退出，再走销毁窗口、等回传这些慢的步骤，用户看到的是立刻关掉
-            tauri::RunEvent::WindowEvent {
-                label,
-                event: tauri::WindowEvent::CloseRequested { .. },
-                ..
-            } if label == "main" => {
-                exit_start();
-                exit_mark("close_requested");
-                if let Some(w) = handle.get_webview_window("main") {
-                    let _ = w.hide();
-                }
-                exit_mark("hidden");
-                handle.state::<App>().begin_shutdown();
-                exit_mark("mpv_quit_sent");
+        .run(move |handle, ev| on_run_event(handle, &ev, &exit_root));
+}
+
+/// The default 40 KB limit deletes the whole log and starts over, losing what troubleshooting needs:
+/// 2 MB, keep the last 3 on rotation, local time.
+fn log_plugin<R: tauri::Runtime>(dir: PathBuf) -> tauri::plugin::TauriPlugin<R> {
+    tauri_plugin_log::Builder::new()
+        .level(log::LevelFilter::Info)
+        .max_file_size(2_000_000)
+        .rotation_strategy(RotationStrategy::KeepSome(3))
+        .timezone_strategy(TimezoneStrategy::UseLocal)
+        .clear_targets()
+        .targets([
+            Target::new(TargetKind::Stdout),
+            Target::new(TargetKind::Folder {
+                path: dir,
+                file_name: None,
+            }),
+        ])
+        .build()
+}
+
+/// Startup: move old config, build the main window, load the config, start the caches and register [`App`].
+fn setup(app: &mut tauri::App, root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let p = app.path();
+    let old = [
+        p.app_config_dir()?,
+        p.app_local_data_dir()?,
+        p.app_cache_dir()?,
+    ];
+    match config::migrate(root, &old[0], &old) {
+        Ok(true) => log::info!("已把旧版本的配置搬到数据目录"),
+        Ok(false) => {}
+        Err(e) => log::warn!("搬旧版本的配置失败：{e}"),
+    }
+    // WebView2 data (including its image disk cache) defaults to %LOCALAPPDATA% and can only be moved when
+    // the window is built, so the main window is built here
+    let win = app
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .ok_or("缺少主窗口配置")?;
+    tauri::WebviewWindowBuilder::from_config(app.handle(), &win)?
+        .data_directory(root.join("webview"))
+        .build()?;
+    let path = root.join("config.json");
+    let cfg =
+        config::load(&path).map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
+    config::save(&path, &cfg)?; // first start: persist the generated device_id
+    if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
+        log::warn!("上次没有正常退出（版本 {v}）");
+    }
+    set_running(root, true);
+    let mpv_dir = app
+        .path()
+        .resource_dir()
+        .ok()
+        .and_then(|d| player::bundled_dir(&d));
+    // The CI smoke test checks the installed paths with this line (no \\?\ prefix): rewording it means updating windows.yml
+    log::info!(
+        "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
+        emby::VERSION,
+        root.display(),
+        mpv_dir
+            .as_deref()
+            .map_or("（无）".into(), |d| d.display().to_string())
+    );
+    spawn_cleanups(root.to_path_buf());
+    let http = emby::http_client()?;
+    let images = images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
+    images.start();
+    let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
+    app.manage(App {
+        path,
+        cfg: Mutex::new(cfg),
+        http,
+        images,
+        stream,
+        danmaku_dir: root.join("cache").join("danmaku"),
+        mpv_dir,
+        mpv_cache: Some(root.join("mpv-cache")),
+        player: Mutex::new(None),
+        play_seq: AtomicU64::new(0),
+        quit: watch::Sender::new(false),
+        starting: AtomicUsize::new(0),
+        closing: Mutex::new(Vec::new()),
+    });
+    Ok(())
+}
+
+/// Background deletion of leftovers from older versions and from the last update.
+fn spawn_cleanups(root: PathBuf) {
+    // shortcut: staging and markers left by the old diagnostics (staging up to ~20 MB); drop once most users have upgraded a few versions
+    tauri::async_runtime::spawn_blocking(move || {
+        for f in ["telemetry", "last-exit.json", "running.json"] {
+            remove_path(&root.join(f));
+        }
+    });
+    // The installer may still be running right after an update: wait before deleting its leftovers.
+    tauri::async_runtime::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let _ = tauri::async_runtime::spawn_blocking(|| {
+            for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
+                remove_path(&p);
             }
-            tauri::RunEvent::WindowEvent {
-                event: tauri::WindowEvent::Destroyed,
-                ..
-            } => exit_mark("window_destroyed"),
-            tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
-            tauri::RunEvent::Exit => {
-                exit_start();
-                exit_mark("exit");
-                handle.state::<App>().shutdown(Duration::from_secs(3));
-                set_running(&exit_root, false);
+        })
+        .await;
+    });
+}
+
+/// Close: hide the window and tell mpv to quit at once, so the user sees it close right away; the slow parts
+/// (window teardown, waiting for the reports) happen after. Each phase is logged with [`exit_mark`].
+fn on_run_event(handle: &AppHandle, ev: &tauri::RunEvent, root: &std::path::Path) {
+    match ev {
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { .. },
+            ..
+        } if label == "main" => {
+            exit_start();
+            exit_mark("close_requested");
+            if let Some(w) = handle.get_webview_window("main") {
+                let _ = w.hide();
             }
-            _ => {}
-        });
+            exit_mark("hidden");
+            handle.state::<App>().begin_shutdown();
+            exit_mark("mpv_quit_sent");
+        }
+        tauri::RunEvent::WindowEvent {
+            event: tauri::WindowEvent::Destroyed,
+            ..
+        } => exit_mark("window_destroyed"),
+        tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
+        tauri::RunEvent::Exit => {
+            exit_start();
+            exit_mark("exit");
+            handle.state::<App>().shutdown(Duration::from_secs(3));
+            set_running(root, false);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

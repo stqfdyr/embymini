@@ -802,8 +802,9 @@ struct Dm {
 enum DmMsg {
     /// (episode index, [`Dm::seq`] of the load, result).
     Loaded(usize, u64, Result<Option<danmaku::Loaded>, DmFail>),
-    /// A reply for the script (name, JSON): search results, an episode list.
-    Reply(&'static str, Value),
+    /// A reply for the script (name, the request's argument, JSON): search results, an episode list.
+    /// The argument goes back so the script can drop a slow reply to an earlier request.
+    Reply(&'static str, String, Value),
 }
 
 struct State {
@@ -1419,7 +1420,11 @@ impl State {
 
     async fn on_dm_result(&mut self, m: DmMsg) {
         let (i, seq, r) = match m {
-            DmMsg::Reply(name, v) => return self.dm_send(name, v).await,
+            DmMsg::Reply(name, arg, v) => {
+                let msg = json!(["script-message-to", "danmaku", name, v.to_string(), arg]);
+                self.send(msg).await;
+                return;
+            }
             DmMsg::Loaded(i, seq, r) => (i, seq, r),
         };
         let Some(d) = &mut self.dm else { return };
@@ -1553,7 +1558,7 @@ impl State {
                 }
             };
             let v = v.unwrap_or_else(|e| json!({ "error": e.to_string() }));
-            let _ = tx.send(DmMsg::Reply(name, v));
+            let _ = tx.send(DmMsg::Reply(name, arg, v));
         });
     }
 }
@@ -2042,7 +2047,10 @@ mod tests {
             loop {
                 let m = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
                 match m.expect("a reply within 5 s").unwrap() {
-                    DmMsg::Reply(name, v) => return (name, v),
+                    DmMsg::Reply(name, arg, v) => {
+                        assert_eq!(json!(arg), msg[1], "the request's argument goes back");
+                        return (name, v);
+                    }
                     DmMsg::Loaded(..) => {} // the load from switching on
                 }
             }
@@ -2989,12 +2997,18 @@ mod tests {
         errors: Vec<String>,
     }
 
-    fn bundled_mpv_run(config_dir: &Path) -> MpvRun {
-        let exe = if cfg!(windows) {
-            config_dir.join("mpv.exe") // CI downloads mpv.exe into src-tauri/mpv/ before cargo test
+    /// The mpv to test with: `mpv.exe` in the bundled config dir on Windows (CI downloads it into src-tauri/mpv/
+    /// before cargo test), `mpv` from PATH elsewhere.
+    fn test_mpv(config_dir: &Path) -> PathBuf {
+        if cfg!(windows) {
+            config_dir.join("mpv.exe")
         } else {
             PathBuf::from("mpv")
-        };
+        }
+    }
+
+    fn bundled_mpv_run(config_dir: &Path) -> MpvRun {
+        let exe = test_mpv(config_dir);
         let log = std::env::temp_dir().join(format!("embymini-cfg-{}.log", std::process::id()));
         let status = std::process::Command::new(&exe)
             .arg(format!("--config-dir={}", config_dir.display()))
@@ -3033,11 +3047,7 @@ mod tests {
                 .join("mpv");
         let log = dir.join("mpv.log");
         let opts = Options {
-            mpv: if cfg!(windows) {
-                bundled.join("mpv.exe")
-            } else {
-                "mpv".into()
-            },
+            mpv: test_mpv(&bundled),
             user_conf: Some(conf),
             ..test_opts(vec![
                 "--vo=null".into(),
@@ -3072,6 +3082,62 @@ mod tests {
             "个人配置没有覆盖自带的缓冲大小：{line}"
         );
         assert!(line.contains(emby::UA), "UA 被个人配置改掉了：{line}");
+    }
+
+    /// The danmaku script (layout, merging, escaping, panel, message handling) inside a real mpv against a fake `mp`:
+    /// `testdata/danmaku_test.lua` loads `mpv/scripts/danmaku.lua` (path in `EMBYMINI_DMTEST_SRC`), drives it and quits
+    /// with 1 on any failed check.
+    #[test]
+    #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
+    fn danmaku_script() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mpv = test_mpv(&dir.join("mpv"));
+        let log = std::env::temp_dir().join(format!("embymini-dmtest-{}.log", std::process::id()));
+        let mut child = std::process::Command::new(&mpv)
+            .args([
+                "--no-config",
+                "--idle=yes",
+                "--vo=null",
+                "--ao=null",
+                "--force-window=no",
+                &format!("--log-file={}", log.display()),
+                &format!(
+                    "--script={}",
+                    dir.join("testdata").join("danmaku_test.lua").display()
+                ),
+            ])
+            // An environment variable, not --script-opts: that list splits at commas in the path
+            .env(
+                "EMBYMINI_DMTEST_SRC",
+                dir.join("mpv").join("scripts").join("danmaku.lua"),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("启动 {} 失败：{e}", mpv.display()));
+        // Only the harness quits mpv (--idle): if it never ran, give up instead of hanging
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        let lines: Vec<_> = text
+            .lines()
+            .filter(|l| l.contains("][i][danmaku_test]") || l.contains("][e]["))
+            .collect();
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "{status:?}\n{lines:#?}"
+        );
     }
 
     /// Copies the bundled config directory to `to` (as if installed elsewhere).

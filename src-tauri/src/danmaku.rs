@@ -229,6 +229,11 @@ impl Api {
             .map(|base| Self { base, http })
     }
 
+    /// The normalized address (identifies the API; may carry a token, so never log it).
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// Sends with retries on transient failures ([`crate::status`]) and judges the reply ([`judge`]).
     /// Errors carry no URL.
     async fn send(&self, build: impl Fn() -> reqwest::RequestBuilder) -> Result<Value, Fail> {

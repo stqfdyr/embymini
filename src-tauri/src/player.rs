@@ -793,8 +793,8 @@ struct Dm {
     told: bool,
     /// Settings already sent to the script.
     init: bool,
-    /// Bumped by every load meant for the script; a result from an older one is dropped, so a slow
-    /// auto match finishing after a manual pick cannot replace it (the script only checks the item).
+    /// Bumped by every [`State::dm_load`]; a result from an older one is dropped, so a slow auto match finishing
+    /// after a manual pick (or after a "set up the API" status) cannot replace it (the script only checks the item).
     seq: u64,
 }
 
@@ -1356,8 +1356,8 @@ impl State {
 
     /// Fetches episode `i` in the background; `deliver` hands the result to the script (current episode),
     /// otherwise it only warms the cache (next episode).
-    fn dm_fetch(&mut self, i: usize, deliver: bool) {
-        let Some(d) = &mut self.dm else { return };
+    fn dm_fetch(&self, i: usize, deliver: bool) {
+        let Some(d) = &self.dm else { return };
         let Some(api) = d.ctx.api.clone() else { return };
         let item = &self.queue[i].item;
         let want = danmaku::Want {
@@ -1370,9 +1370,7 @@ impl State {
                 .get(&danmaku::key(&self.emby.tag, item))
                 .cloned(),
         };
-        let (dir, tx) = (d.ctx.dir.clone(), d.tx.clone());
-        d.seq += u64::from(deliver);
-        let seq = d.seq;
+        let (dir, tx, seq) = (d.ctx.dir.clone(), d.tx.clone(), d.seq);
         tokio::spawn(async move {
             let r = danmaku::load(&api, &dir, &want).await;
             match (deliver, r) {
@@ -1401,6 +1399,7 @@ impl State {
             return; // fetched when switched on (the "style" message)
         }
         d.shown = Some(i);
+        d.seq += 1;
         let mut status = match (&d.ctx.api, &d.dead) {
             (None, _) => {
                 json!({ "kind": "setup", "text": "还没有填弹幕接口：在 EmbyMini 的设置里填写" })
@@ -1423,11 +1422,11 @@ impl State {
             DmMsg::Reply(name, v) => return self.dm_send(name, v).await,
             DmMsg::Loaded(i, seq, r) => (i, seq, r),
         };
-        let item = self.queue[i].item.id.clone();
         let Some(d) = &mut self.dm else { return };
         if self.cur != Some(i) || seq != d.seq {
             return; // moved to another episode, or a newer load for this one is under way
         }
+        let item = self.queue[i].item.id.clone();
         // Problems pop up once per playback; later episodes only show them in the panel
         let toast = !d.told;
         let mut status = match r {
@@ -1460,16 +1459,23 @@ impl State {
         self.dm_send("status", status).await;
     }
 
-    /// The settings page changed the API or blocked words ([`Ctl::Danmaku`]): swap the API for this playback and
-    /// resend changed words to the script.
+    /// The settings page changed the API or blocked words ([`Ctl::Danmaku`]): swap the API for this playback,
+    /// resend changed words to the script, and reload the current episode from a new address (which also drops
+    /// loads still running against the old one, so their failures cannot mark the new address bad).
     async fn dm_settings(&mut self, api: Option<danmaku::Api>, words: Vec<String>) {
         let Some(d) = &mut self.dm else { return };
+        let moved =
+            d.ctx.api.as_ref().map(danmaku::Api::base) != api.as_ref().map(danmaku::Api::base);
         d.ctx.api = api;
         d.dead = None;
         let changed = d.ctx.cfg.words != words;
         d.ctx.cfg.words = words;
+        let reload = self.cur.filter(|&c| moved && d.shown == Some(c));
         if changed && d.init {
             self.dm_init().await;
+        }
+        if let Some(cur) = reload {
+            self.dm_load(cur).await;
         }
     }
 
@@ -1856,9 +1862,11 @@ mod tests {
             manual: true,
             stale: false,
         };
-        st.on_dm_result(DmMsg::Loaded(1, 0, Ok(None))).await; // not the current episode: dropped
-        st.on_dm_result(DmMsg::Loaded(0, 0, Ok(Some(loaded)))).await;
-        st.on_dm_result(DmMsg::Loaded(0, 0, Err(DmFail::Setup("地址不对".into()))))
+        let seq = st.dm.as_ref().unwrap().seq;
+        st.on_dm_result(DmMsg::Loaded(1, seq, Ok(None))).await; // not the current episode: dropped
+        st.on_dm_result(DmMsg::Loaded(0, seq, Ok(Some(loaded))))
+            .await;
+        st.on_dm_result(DmMsg::Loaded(0, seq, Err(DmFail::Setup("地址不对".into()))))
             .await;
         assert!(!st.dm_ready());
         st.dm_settings(None, vec!["剧透".into()]).await; // blocked words changed on the settings page: resent
@@ -1944,6 +1952,24 @@ mod tests {
             .await;
         st.on_dm_result(DmMsg::Loaded(0, 2, Ok(Some(loaded("new")))))
             .await;
+        // A new address from the settings page reloads at once, so a late failure from the old one is dropped
+        let seq = |st: &State| st.dm.as_ref().unwrap().seq;
+        let at = |path: &str| {
+            danmaku::Api::new(
+                emby::http_client().unwrap(),
+                &format!("http://127.0.0.1:{st_port}{path}"),
+            )
+        };
+        st.dm_settings(at(""), Vec::new()).await;
+        assert_eq!(seq(&st), 2, "same address: no reload");
+        st.dm_settings(at("/v2"), Vec::new()).await;
+        assert_eq!(seq(&st), 3, "new address: reload");
+        st.on_dm_result(DmMsg::Loaded(0, 2, Err(DmFail::Setup("bad".into()))))
+            .await;
+        assert!(
+            st.dm_ready(),
+            "the old address's failure does not mark the new one bad"
+        );
         let loads: Vec<Value> = commands(st, mpv)
             .await
             .into_iter()
@@ -2073,11 +2099,11 @@ mod tests {
         ] {
             st.on_dm_result(DmMsg::Loaded(0, seq, r)).await;
         }
-        // Misconfigured: says why and does not fetch
+        // Misconfigured: says why, and a load still in flight can no longer replace that
         st.dm.as_mut().unwrap().dead = Some("地址不对".into());
         assert!(!st.dm_ready());
         st.dm_load(0).await;
-        assert_eq!(st.dm.as_ref().unwrap().seq, seq);
+        st.on_dm_result(DmMsg::Loaded(0, seq, Ok(None))).await;
 
         let cmds = commands(st, mpv).await;
         assert!(!cmds.iter().any(|c| c[2] == "init"), "init is not resent");

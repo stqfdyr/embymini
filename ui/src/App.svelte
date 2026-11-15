@@ -1,4 +1,5 @@
-<!-- 外壳：顶栏兼作标题栏（无系统标题栏，可拖动、双击最大化；右侧窗口按钮）+ 路由 + 全局快捷键与右键菜单。 -->
+<!-- Shell: the top bar doubles as the title bar (no system one; drag, double-click to maximize, window buttons on the right),
+     plus routing, global shortcuts and the context menu. -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
   import { listen } from '@tauri-apps/api/event'
@@ -22,13 +23,13 @@
   const win = getCurrentWindow()
   let maximized = $state(false)
   let scrolled = $state(false)
-  /** 有大图头部的页面：顶栏在顶部时透明，叠在图上。 */
+  /** Pages with a hero image: at the top the bar turns transparent over it. */
   const overHero = $derived((route.name === 'home' || route.name === 'item') && !scrolled)
 
   $effect(() => {
     setUnauthorizedHandler(() => loadConfig().then(() => go('/settings')))
-    loadConfig().then(() => !session.server?.loggedIn && go('/settings'))
-    // 播放失败提示；整个播放会话结束才后台静默刷新一次（切集时的 stopped 不刷）
+    loadConfig()
+    // Notify playback failures; refresh quietly once a whole playback session ends (not on `stopped` between episodes)
     const off = listen<{ type: string; message?: string }>('player', (e) => {
       if (e.payload.type === 'failed') notify(e.payload.message ?? '播放失败')
       if (e.payload.type === 'ended') refreshQuiet()
@@ -42,7 +43,13 @@
     }
   })
 
-  // 桌面应用的习惯：没有网页右键菜单、F5 不整页重载、鼠标侧键 / Alt+← 返回、Ctrl+F 搜索
+  // Signed out, Settings shows whatever the route; pin the route to it as well (a tab clicked meanwhile, startup), so
+  // the moment a server is signed in nothing stale mounts against it before Settings navigates home
+  $effect(() => {
+    if (session.cfg && !session.server?.loggedIn && route.name !== 'settings') location.replace('#/settings')
+  })
+
+  // Desktop habits: no web context menu, F5 reloads data not the page, mouse side buttons / Alt+← go back, Ctrl+F searches
   const editable = (t: EventTarget | null) => t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))
   function onKey(e: KeyboardEvent) {
     const ctrl = e.ctrlKey || e.metaKey
@@ -147,9 +154,9 @@
     background: var(--bar-bg); box-shadow: 0 1px 0 var(--stroke);
     transition: background 0.2s, box-shadow 0.2s;
   }
-  /* 叠在大图上：透明，顶部一层淡淡的底色保证文字看得清 */
+  /* Over a hero: transparent, with a faint fade at the top so text stays readable */
   .bar.clear { background: linear-gradient(to bottom, color-mix(in srgb, var(--bg) 88%, transparent), color-mix(in srgb, var(--bg) 0%, transparent)); box-shadow: none; }
-  /* 叠在亮图上时控件也要看得清：分段控件用近实色底 */
+  /* Keep the segmented control readable over bright images: near-solid base */
   .bar.clear .tabs { background: color-mix(in srgb, var(--bg) 72%, transparent); }
   .side { display: flex; align-items: center; gap: 4px; height: 100%; }
   .side.end { justify-content: flex-end; }
@@ -158,14 +165,14 @@
   .tabs a { padding: 5px 18px; border-radius: 7px; font-size: 13px; color: var(--text-2); transition: background 0.12s, color 0.12s; }
   .tabs a:hover { color: var(--text); }
   .tabs a.on { background: var(--bg-raised); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 0 0 0.5px var(--stroke); }
-  /* Windows 11 风格窗口按钮 */
+  /* Windows 11 caption buttons; the close reds are the system's own values */
   .win { display: flex; height: 100%; margin-left: 8px; }
   .win button { width: 46px; height: 100%; display: grid; place-items: center; color: var(--text); transition: background 0.1s; }
   .win button:hover { background: var(--fill-hover); }
   .win button:active { background: var(--fill-press); }
   .win .close:hover { background: #c42b1c; color: #fff; }
   .win .close:active { background: #b22a1d; color: #fff; }
-  .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 40; display: flex; flex-direction: column; gap: 10px; max-width: 420px; }
+  .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 46; /* above .modal: dialogs raise toasts (copied) */ display: flex; flex-direction: column; gap: 10px; max-width: 420px; }
   .toast { display: flex; align-items: center; gap: 12px; padding: 12px 16px; line-height: 1.5; }
   .toast span { flex: 1; }
   .toast .btn { flex: none; color: var(--accent); }

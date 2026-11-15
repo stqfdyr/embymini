@@ -1,4 +1,4 @@
-<!-- 下拉选择（替代原生 <select>）：选季、排序、切换服务器。键盘 ↑↓ / Enter / Esc，点外面关闭。 -->
+<!-- Dropdown in place of a native <select> (season, sort, server). Keys ↑↓ / Enter / Esc; closes on a click outside. -->
 <script lang="ts" generics="T extends string">
   import { Check, ChevronDown } from '@lucide/svelte'
 
@@ -32,7 +32,7 @@
     else return
     e.preventDefault()
   }
-  // 点外面、滚动页面、窗口失焦都关掉
+  // Close on a click outside, a page scroll or the window losing focus
   $effect(() => {
     if (!open) return
     const close = (e: Event) => !root.contains(e.target as Node) && (open = false)
@@ -46,7 +46,7 @@
       removeEventListener('blur', blur)
     }
   })
-  // 长列表打开时把当前项滚进视野
+  // Keep the active item in view in long lists
   $effect(() => {
     if (open && list) (list.children[active] as HTMLElement | undefined)?.scrollIntoView({ block: 'nearest' })
   })

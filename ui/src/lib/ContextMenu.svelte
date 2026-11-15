@@ -1,4 +1,4 @@
-<!-- 右键菜单：位置贴着鼠标，靠近窗口边缘时向内翻；点外面、滚动、Esc、窗口失焦都会关闭。 -->
+<!-- Context menu at the pointer, flipped inward near the window edges; closes on a click outside, scroll, Esc or window blur. -->
 <script lang="ts">
   import { closeMenu, menu } from './menu.svelte'
 

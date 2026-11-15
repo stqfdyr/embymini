@@ -4,11 +4,18 @@
 process.env.TZ = 'Asia/Shanghai'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { bytes, clock, date, episodeLabel, seriesBadge, techLine, years } from '../src/lib/fmt.ts'
+import { bytes, clock, date, episodeLabel, minutes, seriesBadge, techLine, years } from '../src/lib/fmt.ts'
 import type { Item } from '../src/lib/types.ts'
 
 const it = (o: Partial<Item>): Item => ({ Id: '1', Name: 'x', Type: 'Series', ...o })
 const TICKS = 10_000_000
+
+test('minutes: rounds, and is empty when unknown or rounds to zero', () => {
+  assert.equal(minutes(95 * 60 * TICKS), '95分钟')
+  assert.equal(minutes(90 * TICKS), '2分钟')
+  assert.equal(minutes(29 * TICKS), '')
+  assert.equal(minutes(), '')
+})
 
 test('clock: mm:ss under an hour, hh:mm:ss from an hour', () => {
   assert.equal(clock(), '00:00')

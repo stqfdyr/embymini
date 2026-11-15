@@ -1,9 +1,9 @@
-<!-- 人物：头像、姓名、出生日期 / 地点、简介（点击展开）+ 作品墙（电影 + 剧集，年份倒序，滚到底加载下一页）。 -->
+<!-- Person: photo, name, birth date / place, overview (click to expand) + filmography (movies and series, newest first, next page on scrolling to the end). -->
 <script lang="ts">
   import { User } from '@lucide/svelte'
   import Grid from '../lib/Grid.svelte'
   import LoadError from '../lib/LoadError.svelte'
-  import { LIST_FIELDS, errText, get, img, loader, pager, session, uid } from '../lib/api.svelte'
+  import { LIST_FIELDS, get, img, loader, pager, session, uid } from '../lib/api.svelte'
   import { fade } from '../lib/fade'
   import { date } from '../lib/fmt'
   import { restoreScrollWhen } from '../lib/router.svelte'
@@ -42,7 +42,7 @@
       </div>
     </header>
   {:else if p.error}
-    <div class="center-msg">加载失败：{errText(p.error)}</div>
+    <LoadError error={p.error} />
   {/if}
 
   <div class="page-title"><h2>作品</h2>{#if pg.total}<span class="muted">{pg.total} 部</span>{/if}</div>

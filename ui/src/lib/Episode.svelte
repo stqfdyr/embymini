@@ -1,4 +1,4 @@
-<!-- 单集卡：详情页的单集行和整季页共用。点图播放，点简介看全文，右键菜单。 -->
+<!-- Episode card, shared by the detail page's episode row and the season page. Click to play, click the overview for the full text, right-click menu. -->
 <script lang="ts">
   import { img, itemMenu, play } from './api.svelte'
   import { showText } from './Dialog.svelte'

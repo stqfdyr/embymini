@@ -140,16 +140,20 @@ export function get<T = unknown>(path: string, query: Record<string, unknown> = 
 /** Item detail; hover prefetch and the detail page share this request, so the page hits the cache. */
 export const itemDetail = (id: string) => get<Item>(`/Users/${uid()}/Items/${id}`, { Fields: DETAIL_FIELDS })
 
+/** Detail-page backdrop width and its blurred page tint; hover prefetch and the home hero use the same widths so they warm that cache. */
+export const BACKDROP_W = 1600
+export const BLUR_W = 320
+
 /** Hover this long on a card before prefetching its detail. */
 const HOVER_MS = 150
 let hoverTimer: ReturnType<typeof setTimeout> | undefined
 export function prefetch(id: string) {
   clearTimeout(hoverTimer)
   hoverTimer = setTimeout(() => {
-    // Also the detail page's backdrop (full size + blurred base); widths must match Item.svelte
+    // Also the detail page's backdrop (full size + blurred tint)
     itemDetail(id).then((d) => {
       const tag = d.BackdropImageTags?.[0]
-      for (const w of [1600, 320]) {
+      for (const w of [BACKDROP_W, BLUR_W]) {
         const src = img(d.Id, 'Backdrop', tag, w)
         if (src) new Image().src = src
       }

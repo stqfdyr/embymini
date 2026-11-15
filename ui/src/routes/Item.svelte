@@ -1,15 +1,18 @@
-<!-- 详情页（剧集 / 电影）：背板 + Logo + 操作 + 简介 → 季与单集 → 演职人员 → 艺术图 → 类似作品 → 链接 → 媒体信息。
-     点进来时先用列表里已有的条目画出顶部（peek），详情、季、单集并行取，到了原地补全。
-     同一部片有多个版本（1080p、4K 等）时，技术参数行换成版本下拉（标签 = 技术参数行，旁注视频编码和容器），播放和媒体信息都跟着选中的版本。 -->
+<!-- Detail page (series / movie): backdrop + logo + actions + overview → seasons and episodes → cast → artwork → similar → links → media info.
+     The top draws at once from the item already seen in a list (peek); detail, seasons and episodes load in parallel and fill in place.
+     With several versions (1080p, 4K…) the tech line becomes a version dropdown; play and media info follow the chosen version. -->
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { Check, Heart, Link, Play, RotateCcw, User } from '@lucide/svelte'
   import Dropdown from '../lib/Dropdown.svelte'
   import Episode from '../lib/Episode.svelte'
+  import LoadError from '../lib/LoadError.svelte'
   import MediaInfo from '../lib/MediaInfo.svelte'
   import Poster from '../lib/Poster.svelte'
   import Row from '../lib/Row.svelte'
-  import { DETAIL_FIELDS, EP_FIELDS, LIST_FIELDS, errText, get, img, imgOriginal, itemDetail, loader, peek, play, session, setFavorite, setPlayed, snapKey, uid } from '../lib/api.svelte'
+  import SeasonPick from '../lib/SeasonPick.svelte'
+  import { BACKDROP_W, BLUR_W, DETAIL_FIELDS, EP_FIELDS, LIST_FIELDS, errText, get, img, imgOriginal, itemDetail, loader, peek, play, session, setFavorite, setPlayed, snapKey, uid } from '../lib/api.svelte'
   import { readSnap, writeSnap } from '../lib/snap'
   import { fade } from '../lib/fade'
   import { clock, date, minutes, rating, techLine } from '../lib/fmt'
@@ -20,43 +23,50 @@
 
   const ROLE: Record<string, string> = { Actor: '演员', Director: '导演', Writer: '编剧', Producer: '制片', GuestStar: '客串', Composer: '作曲' }
 
-  /** 列表里已有的条目：从单集进来就看它所属的剧集。 */
+  /** The item already seen in a list; for an episode, its series. */
   function known(id: string) {
     const p = peek(id)
     return p?.Type === 'Episode' ? (p.SeriesId ? peek(p.SeriesId) : undefined) : p
   }
 
-  const seriesExtras = (sid: string, u: string) =>
-    Promise.all([
-      get<Page>(`/Shows/${sid}/Seasons`, { UserId: u, Fields: 'UserData' }),
-      get<Page>('/Shows/NextUp', { SeriesId: sid, UserId: u, Limit: 1, Fields: DETAIL_FIELDS }),
-    ])
+  /** Requests that go with a detail: seasons and next up (series only), and similar titles. */
+  function related(id: string, series: boolean) {
+    const u = uid()
+    return {
+      extras: series
+        ? Promise.all([
+            get<Page>(`/Shows/${id}/Seasons`, { UserId: u, Fields: 'UserData' }),
+            get<Page>('/Shows/NextUp', { SeriesId: id, UserId: u, Limit: 1, Fields: DETAIL_FIELDS }),
+          ])
+        : undefined,
+      // Similar titles are decoration: a failure (upstream 429…) keeps what is shown, or leaves the row out, instead of failing the page
+      similar: get<Page>(`/Items/${id}/Similar`, { UserId: u, Limit: 16, Fields: LIST_FIELDS }).then((p): Item[] => p.Items, (): Item[] => untrack(() => q.data?.similar) ?? []),
+    }
+  }
 
   async function load(id: string) {
-    const u = uid()
-    // 已知是剧集时，季 / 下一集 / 类似作品和详情一起发，不串行等
+    // When a list already says this is a series, send its extras along with the detail instead of after it
     const guess = peek(id)
     const guessSeries = guess?.Type === 'Series' ? guess.Id : guess?.Type === 'Episode' ? guess.SeriesId : undefined
-    const early = guessSeries ? { extras: seriesExtras(guessSeries, u), similar: get<Page>(`/Items/${guessSeries}/Similar`, { UserId: u, Limit: 16, Fields: LIST_FIELDS }) } : undefined
+    const early = guessSeries ? related(guessSeries, true) : undefined
+    // Only awaited if the guess holds; a failure of a discarded or never-reached guess must not be an unhandled rejection
+    early?.extras?.catch(() => {})
 
     let item = await itemDetail(id)
     let season: string | undefined
     if (item.Type === 'Episode' && item.SeriesId) {
-      season = item.SeasonId // 从单集进来：显示所属剧集，并选中这一季
+      season = item.SeasonId // opened from an episode: show its series with that season selected
       item = await itemDetail(item.SeriesId)
     }
     const series = item.Type === 'Series'
-    const reuse = early && guessSeries === item.Id
-    const [extras, similar] = await Promise.all([
-      series ? (reuse ? early.extras : seriesExtras(item.Id, u)) : undefined,
-      reuse ? early.similar : get<Page>(`/Items/${item.Id}/Similar`, { UserId: u, Limit: 16, Fields: LIST_FIELDS }),
-    ])
+    const r = early && series && guessSeries === item.Id ? early : related(item.Id, series)
+    const [extras, similar] = await Promise.all([r.extras, r.similar])
     const [seasons, nextUp] = extras ?? []
     const next = nextUp?.Items[0]
-    return { item, seasons: seasons?.Items ?? [], next, similar: similar.Items, season: season ?? next?.SeasonId ?? seasons?.Items[0]?.Id }
+    return { item, seasons: seasons?.Items ?? [], next, similar, season: season ?? next?.SeasonId ?? seasons?.Items[0]?.Id }
   }
 
-  // 刷新（手动或播放结束后）时保留当前内容，新数据到了原地替换
+  // A refresh (manual or after playback) keeps the current content; new data replaces it in place
   const q = loader(() => {
     void (session.refresh + session.quiet)
     return load(id)
@@ -66,15 +76,17 @@
   let pickedSeason = $state<string>()
   let expanded = $state(false)
   const logo = $derived(img(item?.Id, 'Logo', item?.ImageTags?.Logo, 400))
-  // Logo 没取到时的条目对象，改显示片名。刷新或换条目后是新对象，会再试一次（上游 404 后端记着，不再打上游）
+  // The item whose logo failed, shown as the title instead; a refresh brings a new object, so the logo is tried again (the backend remembers upstream 404s)
   let badLogo = $state.raw<Item>()
   restoreScrollWhen(() => q.data)
 
-  // 单集行单独加载。换季才换内容（先用这一季的本地快照，没有就清空）；同一季重新取数时先保留旧列表
+  // Episodes load on their own. Only a season change swaps the list (to that season's snapshot, else empty); a refetch keeps the old list until the new one arrives
   let eps = $state<Item[]>([])
   let epsLoading = $state(true)
-  /** 单集列表取失败：要明说，不能显示成「这一季还没有剧集」。 */
+  /** Episode fetch failed: say so rather than "no episodes yet". */
   let epsError = $state('')
+  /** Bumped by the row's retry button: refetch just the episodes, not the whole page. */
+  let epsTry = $state(0)
   let epsKey = ''
   const seasonId = $derived(pickedSeason ?? loaded?.season)
   $effect(() => {
@@ -82,13 +94,14 @@
     const season = seasonId
     const key = `${seriesId}|${season}`
     const snap = snapKey(`eps:${key}`)
+    void epsTry
     if (key !== epsKey) {
       epsKey = key
-      const cached = readSnap<Item[]>(snap) ?? [] // 不读 eps：effect 里读了它，取数回来写 eps 会让这里反复重跑
-      eps = cached
-      epsLoading = !cached.length
+      eps = readSnap<Item[]>(snap) ?? []
     }
     epsError = ''
+    // eps untracked: this effect writes it when the fetch lands, which must not rerun it
+    epsLoading = !!seriesId && !!season && !untrack(() => eps.length)
     if (!seriesId || !season) return
     let alive = true
     get<Page>(`/Shows/${seriesId}/Episodes`, { UserId: uid(), SeasonId: season, Fields: EP_FIELDS })
@@ -108,14 +121,14 @@
     return () => void (alive = false)
   })
 
-  /** 播放按钮的目标：电影是自己；剧集是「下一集」，没有就是所选季的第一集。 */
+  /** What the play button plays: a movie itself; for a series the next-up episode, else the first one of the chosen season. */
   const t = $derived(loaded && (loaded.item.Type === 'Series' ? loaded.next ?? eps[0] : loaded.item))
   const sources = $derived(t?.MediaSources ?? loaded?.item.MediaSources ?? [])
-  /** 选的版本只对当时那个播放目标有效，换了目标（换集、刷新后下一集变了）就回到服务器排的第一个。 */
+  /** A picked version only holds for the target it was picked on; a new target (another episode, next up changed) falls back to the server's first. */
   let picked = $state<{ target?: string; source: string }>()
   const src = $derived(sources.find((s) => picked && picked.target === t?.Id && s.Id === picked.source) ?? sources[0])
   const pickedSource = $derived(sources.length > 1 ? src?.Id : undefined)
-  const bd = $derived(item ? img(item.Id, 'Backdrop', item.BackdropImageTags?.[0], 1600) : '')
+  const bd = $derived(item ? img(item.Id, 'Backdrop', item.BackdropImageTags?.[0], BACKDROP_W) : '')
 
   function playLabel(t?: Item) {
     const pos = t?.UserData?.PlaybackPositionTicks ?? 0
@@ -136,7 +149,7 @@
 </script>
 
 {#if item}
-  {#if bd}<div class="blur" style:background-image={`url("${img(item.Id, 'Backdrop', item.BackdropImageTags?.[0], 320)}")`}></div>{/if}
+  {#if bd}<div class="blur" style:background-image={`url("${img(item.Id, 'Backdrop', item.BackdropImageTags?.[0], BLUR_W)}")`}></div>{/if}
 
   <div class="detail">
     <section class="top">
@@ -166,7 +179,7 @@
             <span>{(item.Genres ?? []).join(' · ')}</span>
           </div>
           <div class="meta tech">
-            {[minutes(t?.RunTimeTicks ?? item.RunTimeTicks), date(t?.PremiereDate ?? item.PremiereDate), sources.length > 1 ? '' : techLine(src)].filter((x) => x && x !== '0分钟').join('   ')}
+            {[minutes(t?.RunTimeTicks ?? item.RunTimeTicks), date(t?.PremiereDate ?? item.PremiereDate), sources.length > 1 ? '' : techLine(src)].filter(Boolean).join('   ')}
             {#if sources.length > 1 && src}
               <Dropdown value={src.Id} items={sources.map((s) => ({ value: s.Id, label: techLine(s) || s.Name || s.Id, hint: [s.MediaStreams?.find((m) => m.Type === 'Video')?.Codec, s.Container].filter(Boolean).join(' · ').toUpperCase() }))} onselect={(v) => (picked = { target: t?.Id, source: v })} />
             {/if}
@@ -184,16 +197,12 @@
       {#if d.item.Type === 'Series'}
         <Row count={eps.length || undefined} href={eps.length && seasonId ? `#/season/${d.item.Id}/${seasonId}` : undefined}>
           {#snippet head()}
-            {#if d.seasons.length > 1}
-              <Dropdown big value={seasonId} items={d.seasons.map((s) => ({ value: s.Id, label: s.Name, hint: s.UserData?.UnplayedItemCount ? `${s.UserData.UnplayedItemCount} 集未看` : '' }))} onselect={(v) => (pickedSeason = v)} />
-            {:else}
-              <h2>{d.seasons[0]?.Name ?? '剧集'}</h2>
-            {/if}
+            <SeasonPick seasons={d.seasons} value={seasonId} onselect={(v) => (pickedSeason = v)} fallback="剧集" />
           {/snippet}
           {#each eps as ep (ep.Id)}
             <Episode {ep} fallback={bd} selected={ep.Id === t?.Id} />
           {:else}
-            {#if epsLoading}{#each { length: 5 } as _, k (k)}<div class="skeleton ep"></div>{/each}{:else if epsError}<span class="muted">单集加载失败：{epsError}（按 F5 重试）</span>{:else}<span class="muted">这一季还没有剧集</span>{/if}
+            {#if epsLoading}{#each { length: 5 } as _, k (k)}<div class="skeleton ep"></div>{/each}{:else if epsError}<LoadError error={epsError} what="单集加载失败" inline retry={() => epsTry++} />{:else}<span class="muted">这一季还没有剧集</span>{/if}
           {/each}
         </Row>
       {/if}
@@ -228,11 +237,12 @@
         </Row>
       {/if}
 
-      {#if links(d.item).length}
+      {@const ls = links(d.item)}
+      {#if ls.length}
         <section class="section">
           <div class="section-head"><h2>链接</h2></div>
           <div class="chips">
-            {#each links(d.item) as l (l.Url)}
+            {#each ls as l (l.Url)}
               <button class="btn" onclick={() => openUrl(l.Url)}><Link size={14} /> {l.Name}</button>
             {/each}
           </div>
@@ -246,18 +256,18 @@
         </section>
       {/if}
     {:else if q.error}
-      <div class="center-msg">加载失败：{errText(q.error)}</div>
+      <LoadError error={q.error} />
     {/if}
   </div>
 {:else if q.error}
-  <div class="center-msg">加载失败：{errText(q.error)}</div>
+  <LoadError error={q.error} />
 {:else}
   <div class="top skeleton-top"></div>
 {/if}
 
 <style>
   .detail { padding-bottom: 56px; animation: page-in 0.18s var(--ease); }
-  /* 整页铺一层模糊的背板色调，往下滚也保持。用小图做源，省解码和显存 */
+  /* A blurred backdrop tint behind the whole page, kept while scrolling; a small source saves decoding and GPU memory */
   .blur {
     position: fixed; inset: -60px; z-index: -1; background-size: cover; background-position: center;
     filter: blur(60px) saturate(1.4); opacity: 0.4;

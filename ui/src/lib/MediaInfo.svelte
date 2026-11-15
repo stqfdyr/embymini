@@ -1,4 +1,4 @@
-<!-- 媒体信息：每条音视频 / 字幕流一张卡，底部是文件名。 -->
+<!-- Media info: one card per video / audio / subtitle stream, file name below. -->
 <script lang="ts">
   import { Captions, Check, Video, Volume2 } from '@lucide/svelte'
   import { bitrate } from './fmt'

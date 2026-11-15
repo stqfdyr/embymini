@@ -1,4 +1,4 @@
-//! 检查更新与自动安装（官方 updater 插件；签名用编进程序的公钥校验）。
+//! Update check and install (the official updater plugin; packages are verified with the built-in public key).
 
 use crate::App;
 use crate::emby::Error;
@@ -7,7 +7,8 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 
-/// 更新代理：`http://`、`https://`、`socks5://`、`socks5h://` 加主机和端口。
+/// Update proxy: `http://`, `https://`, `socks5://` or `socks5h://` plus host and port (or the scheme default).
+/// Also the validation when settings are saved.
 pub(crate) fn proxy_url(p: &str) -> Result<reqwest::Url, Error> {
     let bad = || {
         Error::Other(format!(
@@ -27,81 +28,118 @@ pub(crate) struct UpdateInfo {
     notes: String,
 }
 
-/// 检查更新和下载安装包用的 updater：设了更新代理就走它，否则跟随系统代理
-/// （updater 每次都新建 HTTP 客户端，现读系统代理设置，不会像 Emby 的客户端那样读到过期的）。
-fn updater(handle: &AppHandle, app: &App) -> Result<tauri_plugin_updater::Updater, Error> {
-    // 40 MB 的安装包在慢代理上也要能下完；连不上时 reqwest 照常很快报错
+const CHECK_FAILED: &str = "检查更新失败";
+const INSTALL_FAILED: &str = "更新失败";
+
+/// Why an updater call failed, in words: connection failures read like the Emby ones ([`crate::emby::net`]);
+/// a bad reply (decode) or a bad proxy (builder) keeps reqwest's own text.
+fn reason(e: &tauri_plugin_updater::Error) -> String {
+    use tauri_plugin_updater::Error as U;
+    match e {
+        U::Reqwest(r) if !r.is_decode() && !r.is_builder() => crate::emby::net(r).to_string(),
+        // The check got a non-2xx reply (GitHub rate limit, 404).
+        U::ReleaseNotFound => "取不到版本信息（服务器拒绝或限流），稍后再试".into(),
+        // The download got a non-2xx reply.
+        U::Network(s) => format!("下载安装包被拒绝（{s}）"),
+        e => e.to_string(),
+    }
+}
+
+/// Maps an updater error to `<what>：<reason>` and logs it.
+fn fail(what: &'static str) -> impl Fn(tauri_plugin_updater::Error) -> Error {
+    move |e| {
+        log::warn!("{what}：{e}");
+        Error::Other(format!("{what}：{}", reason(&e)))
+    }
+}
+
+/// Download progress: emitted only when the percent (MB when the size is unknown) changes, not per chunk.
+#[derive(Default)]
+struct Progress {
+    got: u64,
+    shown: Option<u64>,
+}
+
+impl Progress {
+    /// Adds a chunk of `n` bytes; returns the bytes so far when the step changed.
+    fn advance(&mut self, n: usize, total: Option<u64>) -> Option<u64> {
+        self.got += n as u64;
+        let step = total.map_or(self.got >> 20, |t| self.got * 100 / t.max(1));
+        (self.shown.replace(step) != Some(step)).then_some(self.got)
+    }
+}
+
+/// Updater for the check and the download: through the update proxy if set, else the system proxy (the plugin
+/// builds a fresh HTTP client each time, so it reads the current system setting, unlike the Emby client).
+fn updater(
+    handle: &AppHandle,
+    app: &App,
+    what: &'static str,
+) -> Result<tauri_plugin_updater::Updater, Error> {
+    // A 40 MB package must finish over a slow proxy; an unreachable host still fails fast.
     let mut b = handle.updater_builder().timeout(Duration::from_secs(900));
     if let Some(p) = app.cfg().update_proxy.clone() {
         b = b.proxy(proxy_url(&p)?);
     }
-    b.build()
-        .map_err(|e| Error::Other(format!("检查更新失败：{e}")))
+    b.build().map_err(fail(what))
 }
 
-/// 有新版本时返回版本号和更新说明（Release 里的 latest.json，签名用编进程序的公钥校验）。
+/// Version and notes when a newer release exists (`latest.json` of the latest Release).
 #[tauri::command]
 pub(crate) async fn update_check(
     handle: AppHandle,
     app: State<'_, App>,
 ) -> Result<Option<UpdateInfo>, Error> {
-    let u = updater(&handle, &app)?.check().await.map_err(|e| {
-        log::warn!("检查更新失败：{e}");
-        Error::Other(format!("检查更新失败：{e}"))
-    })?;
+    let u = updater(&handle, &app, CHECK_FAILED)?
+        .check()
+        .await
+        .map_err(fail(CHECK_FAILED))?;
     Ok(u.map(|u| UpdateInfo {
         version: u.version,
         notes: u.body.unwrap_or_default(),
     }))
 }
 
-/// 下载并安装新版本：进度经 `update-progress` 事件发给界面（已下载字节, 总字节）。
-/// 下完先关播放器、回传进度，再启动安装器（只显示进度条，不用点），安装器装完自动重新打开程序。
+/// Downloads and installs the new version, reporting `update-progress` as (bytes so far, total or null).
+/// After the download the player is closed (progress reported back), then the installer runs unattended
+/// and reopens the program when done.
 #[tauri::command]
 pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Error> {
-    let fail = |e: tauri_plugin_updater::Error| {
-        log::warn!("更新失败：{e}");
-        Error::Other(format!("更新失败：{e}"))
-    };
-    let u = updater(&handle, &app)?
+    let u = updater(&handle, &app, INSTALL_FAILED)?
         .check()
         .await
-        .map_err(fail)?
+        .map_err(fail(INSTALL_FAILED))?
         .ok_or_else(|| Error::Other("已是最新版本".into()))?;
     log::info!("下载新版本 {}", u.version);
-    let (mut got, mut shown) = (0u64, u64::MAX);
+    let mut progress = Progress::default();
     let bytes = u
         .download(
             |n, total| {
-                got += n as u64;
-                // 每个分块都发的话 40 MB 要发几千次：百分比（不知道总大小时按 MB）变了才发
-                let step = total.map_or(got >> 20, |t| got * 100 / t.max(1));
-                if step != shown {
-                    shown = step;
+                if let Some(got) = progress.advance(n, total) {
                     let _ = handle.emit("update-progress", (got, total));
                 }
             },
             || {},
         )
         .await
-        .map_err(fail)?;
+        .map_err(fail(INSTALL_FAILED))?;
     log::info!("启动安装器，程序退出");
-    // 安装器起来后进程直接退出，不走 RunEvent::Exit：先关播放器、回传进度。
-    // shutdown 内部用 block_on，在 async 命令里直接调会 panic，命令永远不返回、界面停在 100%
+    // The installer ends the process without RunEvent::Exit, so close the player first. `shutdown` uses
+    // block_on, which panics inside an async command: the command would never return (stuck at 100%).
     let h = handle.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
         h.state::<App>().shutdown(Duration::from_secs(3));
     })
     .await;
-    // 进程马上被安装器结束，不走 RunEvent::Exit：先撤掉运行标记，否则下次启动会记成异常退出
+    // Same reason: drop the running marker now, or the next start reports an abnormal exit.
     let root = app.path.parent().unwrap_or(std::path::Path::new("."));
     crate::set_running(root, false);
-    // Windows 上启动安装器后直接退出进程，不会返回
+    // On Windows this starts the installer and exits the process: it only returns on failure.
     if let Err(e) = u.install(bytes) {
         crate::set_running(root, true);
-        // 安装器没起来，程序照常用：撤销退出标记，否则之后点播放都会被当成「正在退出」而放弃
+        // The program stays in use: clear the quit flag, or every later play is dropped as "quitting".
         app.quit.send_replace(false);
-        return Err(fail(e));
+        return Err(fail(INSTALL_FAILED)(e));
     }
     handle.restart()
 }
@@ -114,13 +152,71 @@ mod tests {
     fn proxy_url_accepts_common_forms() {
         for ok in [
             "http://127.0.0.1:10808",
+            "https://proxy.lan",
+            "http://proxy.lan",
             "socks5://127.0.0.1:10808",
             "socks5h://localhost:1080",
         ] {
             assert!(proxy_url(ok).is_ok(), "{ok}");
         }
-        for bad in ["127.0.0.1:10808", "ftp://h:1", "socks5://", ""] {
+        // socks has no default port, so it must be written out.
+        for bad in [
+            "127.0.0.1:10808",
+            "ftp://h:1",
+            "socks5://",
+            "socks5://h",
+            "",
+        ] {
             assert!(proxy_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn progress_emits_when_the_step_changes() {
+        let mut p = Progress::default();
+        let total = Some(200);
+        assert_eq!(p.advance(1, total), Some(1)); // first chunk: 0 %
+        assert_eq!(p.advance(1, total), Some(2)); // 1 %
+        assert_eq!(p.advance(1, total), None); // still 1 %
+        assert_eq!(p.advance(197, total), Some(200)); // 100 %
+        // A zero total must not divide by zero.
+        assert_eq!(Progress::default().advance(5, Some(0)), Some(5));
+        // Unknown size: once per MB.
+        let mut p = Progress::default();
+        assert_eq!(p.advance(1 << 20, None), Some(1 << 20));
+        assert_eq!(p.advance(5, None), None);
+        assert_eq!(p.advance(1 << 20, None), Some((2 << 20) + 5));
+    }
+
+    #[test]
+    fn http_refusals_are_worded() {
+        use tauri_plugin_updater::Error as U;
+        assert!(reason(&U::ReleaseNotFound).starts_with("取不到版本信息"));
+        assert_eq!(
+            reason(&U::Network("status: 404".into())),
+            "下载安装包被拒绝（status: 404）"
+        );
+        assert_eq!(reason(&U::EmptyEndpoints), U::EmptyEndpoints.to_string());
+    }
+
+    /// Connection failures get the Emby wording; a bad reply or a bad request keeps reqwest's text.
+    #[tokio::test]
+    async fn reqwest_errors_worded_by_kind() {
+        use tauri_plugin_updater::Error as U;
+        let (port, _) = crate::emby::tests::fake(|_| ("200 OK", "<html>".into())).await;
+        let c = reqwest::Client::new();
+        let decode = c
+            .get(format!("http://127.0.0.1:{port}/latest.json"))
+            .send()
+            .await
+            .unwrap();
+        let decode = decode.json::<serde_json::Value>().await.unwrap_err();
+        let text = decode.to_string();
+        assert_eq!(reason(&U::Reqwest(decode)), text);
+        let bad = c.get("not a url").send().await.unwrap_err();
+        let text = bad.to_string();
+        assert_eq!(reason(&U::Reqwest(bad)), text);
+        let refused = c.get("http://127.0.0.1:1/").send().await.unwrap_err();
+        assert!(reason(&U::Reqwest(refused)).starts_with("连不上服务器"));
     }
 }

@@ -125,6 +125,11 @@ impl App {
         lock(&self.cfg)
     }
 
+    /// A player is up or a `play` is still starting: the video cache keeps this playback's files.
+    fn playing(&self) -> bool {
+        lock(&self.player).is_some() || self.starting.load(Ordering::SeqCst) > 0
+    }
+
     /// 让正在播放的 mpv 退出（没有就什么都不做）；返回播放任务，需要时可等它回传完 Stopped。
     fn stop_player(&self) -> Option<tauri::async_runtime::JoinHandle<()>> {
         let p = lock(&self.player).take()?;
@@ -434,126 +439,138 @@ fn danmaku_set(app: State<'_, App>, api: String, words: Vec<String>) -> Result<(
     })
 }
 
-/// 缓存管理里各项的字节数；`playing` 时视频缓存里正在播的那部片清不掉。媒体库缓存（列表快照）在界面的 localStorage 里，界面自己算。
-#[derive(Serialize)]
+/// Bytes per cache manager row; `playing` means the film being played stays in the video cache. The library
+/// cache (list snapshots) lives in the UI's localStorage and is counted there.
+#[derive(Serialize, Default)]
 struct CacheInfo {
     video: u64,
     images: u64,
-    /// 外挂字幕和弹幕缓存。
+    /// External subtitles plus danmaku.
     subs: u64,
     temp: u64,
     playing: bool,
 }
 
-/// 「临时缓存」：mpv 的着色器缓存、更新插件留在系统临时目录的安装包目录（每次更新约 40 MB，插件自己不删）、进度条预览留下的图片文件。
-fn temp_paths(app: &App) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = app.mpv_cache.iter().cloned().collect();
-    v.extend(updater_leftovers());
-    for e in std::fs::read_dir(std::env::temp_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        if e.file_name().to_string_lossy().starts_with("thumbfast.out") {
-            v.push(e.path());
-        }
-    }
-    v
+/// What `cache_clear` empties (`subs` = subtitles and danmaku).
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Clear {
+    Video,
+    Images,
+    Subs,
+    Temp,
+    All,
 }
 
-/// 更新插件的临时目录（`<产品名>-<版本>-updater-<随机>`）：装完新版本就没用了。
-fn updater_leftovers() -> Vec<PathBuf> {
-    std::fs::read_dir(std::env::temp_dir())
+impl Clear {
+    fn covers(self, kind: Clear) -> bool {
+        self == Clear::All || self == kind
+    }
+}
+
+/// The updater plugin's temp dir, `<productName>-<version>-updater-<random>`: the plugin keeps it forever
+/// (`tempdir().keep()`, ~40 MB per update) and it is useless once the new version is installed.
+fn is_updater_leftover(name: &str) -> bool {
+    name.starts_with("EmbyMini-") && name.contains("-updater-")
+}
+
+/// Entries of `dir` (the system temp dir) whose name passes `keep`.
+fn temp_entries(dir: &std::path::Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("EmbyMini-") && n.contains("-updater-")
-        })
+        .filter(|e| keep(&e.file_name().to_string_lossy()))
         .map(|e| e.path())
         .collect()
 }
 
+/// "Temporary cache": mpv's shader cache, plus updater leftovers and seek-preview images in `tmp`.
+fn temp_paths(app: &App, tmp: &std::path::Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = app.mpv_cache.iter().cloned().collect();
+    v.extend(temp_entries(tmp, |n| {
+        is_updater_leftover(n) || n.starts_with("thumbfast.out")
+    }));
+    v
+}
+
+/// Deletes a file, a directory tree or a symlink. Symlinks are never followed (the shared /tmp may hold
+/// anyone's links): only the link goes.
 fn remove_path(p: &std::path::Path) {
-    let _ = if p.is_dir() {
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    let _ = if m.is_dir() {
         std::fs::remove_dir_all(p)
+    } else if m.is_symlink() {
+        // A directory symlink on Windows only goes with remove_dir.
+        std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
     } else {
         std::fs::remove_file(p)
     };
 }
 
+/// Bytes under `p`; a symlink counts as its own size, not its target's.
+fn path_size(p: &std::path::Path) -> u64 {
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => stream::dir_size(p),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }
+}
+
 fn cache_info_now(app: &App) -> CacheInfo {
     let (video, subs) = app.stream.as_ref().map_or((0, 0), stream::Stream::usage);
-    let subs = subs + stream::dir_size(&app.danmaku_dir);
-    let playing = lock(&app.player).is_some() || app.starting.load(Ordering::SeqCst) > 0;
-    let temp = temp_paths(app)
-        .iter()
-        .map(|p| {
-            if p.is_dir() {
-                stream::dir_size(p)
-            } else {
-                p.metadata().map_or(0, |m| m.len())
-            }
-        })
-        .sum();
     CacheInfo {
         video,
         images: app.images.usage(),
-        subs,
-        temp,
-        playing,
+        subs: subs + stream::dir_size(&app.danmaku_dir),
+        temp: temp_paths(app, &std::env::temp_dir())
+            .iter()
+            .map(|p| path_size(p))
+            .sum(),
+        playing: app.playing(),
     }
+}
+
+/// Empties `kind` and returns the usage afterwards. Blocking (walks directories).
+fn cache_clear_now(app: &App, kind: Clear) -> CacheInfo {
+    if let Some(s) = app.stream.as_ref() {
+        if kind.covers(Clear::Video) {
+            s.clear_video(app.playing());
+        }
+        if kind.covers(Clear::Subs) {
+            s.clear_subs();
+        }
+    }
+    if kind.covers(Clear::Subs) {
+        remove_path(&app.danmaku_dir);
+    }
+    if kind.covers(Clear::Images) {
+        app.images.clear();
+    }
+    if kind.covers(Clear::Temp) {
+        for p in temp_paths(app, &std::env::temp_dir()) {
+            remove_path(&p);
+        }
+    }
+    log::info!("清理缓存：{kind:?}");
+    cache_info_now(app)
 }
 
 #[tauri::command]
 async fn cache_info(handle: AppHandle) -> CacheInfo {
     tauri::async_runtime::spawn_blocking(move || cache_info_now(&handle.state::<App>()))
         .await
-        .unwrap_or(CacheInfo {
-            video: 0,
-            images: 0,
-            subs: 0,
-            temp: 0,
-            playing: false,
-        })
+        .unwrap_or_default()
 }
 
-/// 清理一项（`video` / `images` / `subs`（字幕和弹幕）/ `temp`，`all` = 全部），返回清理后的占用。
+/// Cache manager: clears one row (`all` = every row but the UI-side library cache).
 #[tauri::command]
-async fn cache_clear(handle: AppHandle, kind: String) -> CacheInfo {
-    tauri::async_runtime::spawn_blocking(move || {
-        let app = handle.state::<App>();
-        let all = kind == "all";
-        let playing = lock(&app.player).is_some() || app.starting.load(Ordering::SeqCst) > 0;
-        if let Some(s) = app.stream.as_ref() {
-            if all || kind == "video" {
-                s.clear_video(playing);
-            }
-            if all || kind == "subs" {
-                s.clear_subs();
-            }
-        }
-        if all || kind == "subs" {
-            remove_path(&app.danmaku_dir);
-        }
-        if all || kind == "images" {
-            app.images.clear();
-        }
-        if all || kind == "temp" {
-            temp_paths(&app).iter().for_each(|p| remove_path(p));
-        }
-        log::info!("清理缓存：{kind}");
-        cache_info_now(&app)
-    })
-    .await
-    .unwrap_or(CacheInfo {
-        video: 0,
-        images: 0,
-        subs: 0,
-        temp: 0,
-        playing: false,
-    })
+async fn cache_clear(handle: AppHandle, kind: Clear) -> CacheInfo {
+    tauri::async_runtime::spawn_blocking(move || cache_clear_now(&handle.state::<App>(), kind))
+        .await
+        .unwrap_or_default()
 }
 
 /// `emby-img` scheme: hands the image to [`images::Images`] (disk cache → upstream). The path carries a server
@@ -806,12 +823,15 @@ fn main() {
                 images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
             images.start();
             let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
-            // 装完新版本，更新插件留下的安装包就没用了；等一会儿再删（安装器可能还没退出）
+            // The installer may still be running right after an update: wait before deleting its leftovers.
             tauri::async_runtime::spawn(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                for p in updater_leftovers() {
-                    remove_path(&p);
-                }
+                let _ = tauri::async_runtime::spawn_blocking(|| {
+                    for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
+                        remove_path(&p);
+                    }
+                })
+                .await;
             });
             app.manage(App {
                 path,
@@ -911,6 +931,106 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         app.path = dir.join("config.json");
         assert_eq!(app.user_mpv_conf(), dir.join("mpv.conf"));
+    }
+
+    /// The updater names its temp dir after productName: renaming the product must update the matcher.
+    #[test]
+    fn updater_leftovers_match_product_name() {
+        let conf: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let name = conf["productName"].as_str().unwrap();
+        assert!(is_updater_leftover(&format!("{name}-0.5.0-updater-a1B2c3")));
+        for other in [
+            "EmbyMini-0.5.0-x",
+            "Other-0.5.0-updater-x",
+            "embymini-0.5.0-updater-x",
+        ] {
+            assert!(!is_updater_leftover(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn clear_all_covers_every_kind() {
+        for k in [Clear::Video, Clear::Images, Clear::Subs, Clear::Temp] {
+            assert!(Clear::All.covers(k) && k.covers(k));
+            assert!(!k.covers(Clear::All));
+        }
+        assert!(!Clear::Subs.covers(Clear::Images));
+        let k: Clear = serde_json::from_str(r#""subs""#).unwrap();
+        assert_eq!(k, Clear::Subs);
+        assert!(serde_json::from_str::<Clear>(r#""snap""#).is_err());
+    }
+
+    /// Each kind empties only its own row; danmaku counts under subtitles.
+    #[test]
+    fn cache_clear_empties_only_its_kind() {
+        let dir = std::env::temp_dir().join(format!("embymini-cache-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (img, dm) = (dir.join("images"), dir.join("danmaku"));
+        std::fs::create_dir_all(&img).unwrap();
+        std::fs::create_dir_all(&dm).unwrap();
+        std::fs::write(img.join("a"), "img").unwrap();
+        std::fs::write(dm.join("b.json"), "12345").unwrap();
+        let mut app = test_app(None);
+        app.images = images::Images::new(img.clone(), images::CAP, reqwest::Client::new());
+        app.danmaku_dir = dm.clone();
+
+        assert_eq!(cache_info_now(&app).subs, 5);
+        let info = cache_clear_now(&app, Clear::Images);
+        assert!(!img.join("a").exists());
+        assert!(dm.join("b.json").exists());
+        assert_eq!(info.subs, 5);
+        std::fs::write(img.join("a"), "img").unwrap();
+        let info = cache_clear_now(&app, Clear::Subs);
+        assert!(!dm.exists());
+        assert!(img.join("a").exists());
+        assert_eq!(info.subs, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Temp cache = mpv's cache dir + updater leftovers + thumbfast images; other temp entries are left alone.
+    #[test]
+    fn temp_paths_pick_our_leftovers() {
+        let tmp = std::env::temp_dir().join(format!("embymini-temp-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let upd = tmp.join("EmbyMini-0.0.0-updater-abc");
+        let thumb = tmp.join("thumbfast.out.tmp");
+        std::fs::create_dir_all(&upd).unwrap();
+        std::fs::write(&thumb, "").unwrap();
+        std::fs::write(tmp.join("other"), "").unwrap();
+        let mut app = test_app(None);
+        app.mpv_cache = Some(PathBuf::from("mpv-cache"));
+        let mut v = temp_paths(&app, &tmp);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        v[1..].sort();
+        assert_eq!(v, [PathBuf::from("mpv-cache"), upd, thumb]);
+    }
+
+    /// A symlink in the shared temp dir is neither followed when sized nor when deleted.
+    #[cfg(unix)]
+    #[test]
+    fn temp_symlinks_are_not_followed() {
+        let dir = std::env::temp_dir().join(format!("embymini-temp-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("big"), vec![0u8; 5000]).unwrap();
+        let link = dir.join("thumbfast.out");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(path_size(&link) < 5000);
+        assert_eq!(path_size(&target), 5000);
+        remove_path(&link);
+        assert!(!link.exists() && target.join("big").exists());
+        remove_path(&target);
+        assert!(!target.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn playing_while_starting() {
+        let app = test_app(None);
+        assert!(!app.playing());
+        let _s = Starting::enter(&app.starting);
+        assert!(app.playing());
     }
 
     fn test_app(player: Option<Player>) -> App {

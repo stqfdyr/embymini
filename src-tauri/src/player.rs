@@ -2096,6 +2096,116 @@ mod tests {
         assert!(build_queue(&emby, "gone", None, false).await.is_err());
     }
 
+    /// mpv's arguments keep their order: bundled config, personal config (only if the file exists), volume, cache
+    /// dirs, thumbfast's mpv path, then what EmbyMini controls, then the caller's extras.
+    #[test]
+    fn mpv_args_order() {
+        let dir = std::env::temp_dir().join(format!("embymini-args-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("mpv.conf");
+        std::fs::write(&conf, "").unwrap();
+        let opts = Options {
+            mpv: "m".into(),
+            config_dir: Some("cfg".into()),
+            preload_percent: 80.0,
+            volume: Some(55.0),
+            cache_dir: Some("c".into()),
+            user_conf: Some(conf.clone()),
+            stream: None,
+            danmaku: None,
+            extra_args: vec!["--x".into()],
+        };
+        let ua = format!("--user-agent={}", emby::UA);
+        let inc = format!("--include={}", conf.display());
+        assert_eq!(
+            mpv_args(&opts, Path::new("ipc")),
+            [
+                "--config-dir=cfg",
+                inc.as_str(),
+                "--volume=55",
+                "--gpu-shader-cache-dir=c",
+                "--icc-cache-dir=c",
+                "--watch-later-dir=c",
+                "--script-opts-append=thumbfast-mpv_path=m",
+                "--input-ipc-server=ipc",
+                ua.as_str(),
+                "--force-window=immediate",
+                "--idle=once",
+                "--x",
+            ]
+        );
+        let bare = Options {
+            config_dir: None,
+            volume: None,
+            cache_dir: None,
+            user_conf: Some(dir.join("missing.conf")),
+            extra_args: Vec::new(),
+            ..opts
+        };
+        assert_eq!(
+            mpv_args(&bare, Path::new("ipc")),
+            [
+                "--script-opts-append=thumbfast-mpv_path=m",
+                "--input-ipc-server=ipc",
+                ua.as_str(),
+                "--force-window=immediate",
+                "--idle=once",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bundled_dir_needs_the_mpv_folder() {
+        let dir = std::env::temp_dir().join(format!("embymini-bundled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(bundled_dir(&dir), None);
+        std::fs::create_dir(dir.join("mpv")).unwrap();
+        assert_eq!(bundled_dir(&dir), Some(dir.join("mpv")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// PlaybackInfo → one episode's parameters: only external subtitles are added, named after the video's cache
+    /// name; a server error code refuses playback (an empty one does not); cache names keep only safe characters.
+    #[test]
+    fn ready_from_real_playbackinfo() {
+        let emby = crate::emby::tests::client();
+        let item = Item {
+            id: "1153511".into(),
+            name: "片名".into(),
+            ..Default::default()
+        };
+        let r = ready(&emby, &item, fixture("playbackinfo.json")).unwrap();
+        assert_eq!(
+            r.name,
+            cache_name(&[&emby.tag, "1153511", "mediasource_1153511"])
+        );
+        assert!(
+            r.name.ends_with("_1153511_mediasource-1153511"),
+            "{}",
+            r.name
+        );
+        let subs: Vec<_> = r
+            .subs
+            .iter()
+            .map(|s| (s.file.as_str(), s.lang.as_str()))
+            .collect();
+        assert_eq!(subs, [(format!("{}_5.ass", r.name).as_str(), "zh-CN")]);
+        assert_eq!(r.source_id, "mediasource_1153511");
+
+        let mut info: emby::PlaybackInfo = fixture("playbackinfo.json");
+        info.error_code = Some(String::new());
+        assert!(ready(&emby, &item, info).is_ok());
+        let mut info: emby::PlaybackInfo = fixture("playbackinfo.json");
+        info.error_code = Some("NoCompatibleStream".into());
+        assert!(matches!(
+            ready(&emby, &item, info),
+            Err(Error::Other(m)) if m == "服务器拒绝播放「片名」（NoCompatibleStream）"
+        ));
+
+        assert_eq!(cache_name(&["a.b/c", "Ab-9", "中"]), "a-b-c_Ab-9_-");
+    }
+
     /// mpv exiting on its own: a clean exit says nothing; an exit code or a signal (no code) is shown to the user.
     #[cfg(unix)]
     #[test]

@@ -890,6 +890,27 @@ mod tests {
         assert_eq!(clean_path("  "), "");
     }
 
+    /// mpv to run: the path from settings (quotes stripped) wins, then the bundled mpv if it is there, then PATH.
+    /// The personal mpv.conf sits next to config.json.
+    #[test]
+    fn mpv_path_order() {
+        let exe = if cfg!(windows) { "mpv.exe" } else { "mpv" };
+        let dir = std::env::temp_dir().join(format!("embymini-mpv-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = test_app(None);
+        app.mpv_dir = Some(dir.clone());
+        assert_eq!(app.mpv_path(), PathBuf::from(exe));
+        std::fs::write(dir.join(exe), "").unwrap();
+        assert_eq!(app.mpv_path(), dir.join(exe));
+        lock(&app.cfg).mpv_path = Some(r#" "D:\mpv\mpv.exe" "#.into());
+        assert_eq!(app.mpv_path(), PathBuf::from(r"D:\mpv\mpv.exe"));
+        lock(&app.cfg).mpv_path = Some("  ".into());
+        assert_eq!(app.mpv_path(), dir.join(exe));
+        std::fs::remove_dir_all(&dir).unwrap();
+        app.path = dir.join("config.json");
+        assert_eq!(app.user_mpv_conf(), dir.join("mpv.conf"));
+    }
+
     fn test_app(player: Option<Player>) -> App {
         App {
             path: PathBuf::new(),

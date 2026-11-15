@@ -6,6 +6,6 @@ export default defineConfig({
   plugins: [svelte(), devBridge()],
   clearScreen: false,
   server: { port: 5173, strictPort: true },
-  // WebView2 是常青 Chromium
+  // WebView2 is evergreen Chromium
   build: { target: 'chrome120' },
 })

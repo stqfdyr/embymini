@@ -504,7 +504,8 @@ fn remove_path(p: &std::path::Path) {
     let _ = if is_real_dir(p) {
         std::fs::remove_dir_all(p)
     } else {
-        std::fs::remove_file(p)
+        // A directory symlink on Windows only goes with remove_dir.
+        std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
     };
 }
 

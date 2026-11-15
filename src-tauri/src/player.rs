@@ -3084,9 +3084,10 @@ mod tests {
         assert!(line.contains(emby::UA), "UA 被个人配置改掉了：{line}");
     }
 
-    /// Runs `testdata/<harness>.lua` in a real mpv; it loads `mpv/scripts/<script>.lua` (path in
+    /// Runs `testdata/<script>_test.lua` in a real mpv; it loads `mpv/scripts/<script>.lua` (path in
     /// `EMBYMINI_LUATEST_SRC`) against a fake `mp`, drives it and quits with 1 on any failed check.
-    fn lua_harness(harness: &str, script: &str) {
+    fn lua_harness(script: &str) {
+        let harness = format!("{script}_test");
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mpv = test_mpv(&dir.join("mpv"));
         let log =
@@ -3147,14 +3148,14 @@ mod tests {
     #[test]
     #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
     fn danmaku_script() {
-        lua_harness("danmaku_test", "danmaku");
+        lua_harness("danmaku");
     }
 
     /// The episode menu (index in and out, current episode not resent) and the cursor kept visible while paused.
     #[test]
     #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
     fn embymini_script() {
-        lua_harness("embymini_test", "embymini");
+        lua_harness("embymini");
     }
 
     /// Copies the bundled config directory to `to` (as if installed elsewhere).

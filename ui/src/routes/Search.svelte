@@ -7,7 +7,7 @@
   import { Search, X } from '@lucide/svelte'
   import Grid from '../lib/Grid.svelte'
   import LoadError from '../lib/LoadError.svelte'
-  import { LIST_FIELDS, get, session, uid } from '../lib/api.svelte'
+  import { LIST_FIELDS, get, uid } from '../lib/api.svelte'
   import type { Page } from '../lib/types'
 
   let q = $state(keep.q)
@@ -20,9 +20,10 @@
     return () => clearTimeout(t)
   })
   $effect(() => input.focus())
+  /** Bumped by the retry button; failed requests are not cached, so reading it queries again. */
+  let attempt = $state(0)
   const result = $derived(
-    // Reads session.refresh so the retry button (a refresh) queries again; failed requests are not cached
-    (void session.refresh, term) ? get<Page>(`/Users/${uid()}/Items`, { Recursive: true, SearchTerm: term, IncludeItemTypes: 'Movie,Series', Limit: 60, Fields: LIST_FIELDS }) : null,
+    (void attempt, term) ? get<Page>(`/Users/${uid()}/Items`, { Recursive: true, SearchTerm: term, IncludeItemTypes: 'Movie,Series', Limit: 60, Fields: LIST_FIELDS }) : null,
   )
 </script>
 
@@ -38,7 +39,7 @@
     {:then r}
       {#if r.Items.length}<Grid items={r.Items} />{:else}<div class="center-msg">没有找到「{term}」</div>{/if}
     {:catch e}
-      <LoadError error={e} what="搜索失败" />
+      <LoadError error={e} what="搜索失败" retry={() => attempt++} />
     {/await}
   {:else}
     <div class="center-msg">输入片名搜索电影和剧集</div>

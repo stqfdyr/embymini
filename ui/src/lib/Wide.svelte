@@ -16,7 +16,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="wide" style:width={`${width}px`} oncontextmenu={onmenu} onpointerenter={onhover} onpointerleave={onhover ? cancelPrefetch : undefined}>
+<div class="wide" style:width={`${width}px`} oncontextmenu={onmenu} onpointerenter={onhover} onpointerleave={cancelPrefetch}>
   {#snippet art()}
     {#if src}<img {src} alt="" loading="lazy" use:fade />{/if}
     {#if played}<span class="badge"><Check size={12} strokeWidth={3} /></span>{/if}

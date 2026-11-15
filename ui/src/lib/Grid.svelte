@@ -1,20 +1,23 @@
 <!-- Poster grid; with `onmore`, the next page loads as the end comes within 1200 px (IntersectionObserver). -->
 <script lang="ts">
+  import { untrack } from 'svelte'
   import Poster from './Poster.svelte'
   import type { Item } from './types'
 
   let { items, onmore, loading = false }: { items: Item[]; onmore?: () => void; loading?: boolean } = $props()
   let sentinel: HTMLDivElement | undefined = $state()
+  let near = $state(false)
 
   $effect(() => {
-    // Re-armed whenever the list changes: a fresh observer reports at once, so a sentinel still inside the margin after a
-    // page lands (big screens, short pages) loads the next one; an observer only fires on entering. A failed load changes
-    // nothing, so it is not retried in a loop.
-    void items.length
-    if (!sentinel || !onmore) return
-    const io = new IntersectionObserver((es) => es[0].isIntersecting && onmore(), { rootMargin: '1200px' })
+    if (!sentinel) return
+    const io = new IntersectionObserver((es) => (near = es[0].isIntersecting), { rootMargin: '1200px' })
     io.observe(sentinel)
     return () => io.disconnect()
+  })
+  // Keep loading while the end stays within the margin: the observer only reports crossings, and on big screens a page
+  // can land with the sentinel still inside. After a failure `onmore` (pager) waits for a retry, so this cannot loop.
+  $effect(() => {
+    if (near && !loading && onmore) untrack(onmore)
   })
 </script>
 

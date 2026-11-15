@@ -130,11 +130,18 @@ impl App {
         lock(&self.player).is_some() || self.starting.load(Ordering::SeqCst) > 0
     }
 
-    /// 让正在播放的 mpv 退出（没有就什么都不做）；返回播放任务，需要时可等它回传完 Stopped。
-    fn stop_player(&self) -> Option<tauri::async_runtime::JoinHandle<()>> {
-        let p = lock(&self.player).take()?;
+    /// Tells the running mpv to quit; false when there is none.
+    fn stop_player(&self) -> bool {
+        let p = lock(&self.player).take();
+        p.map(|p| self.retire(p)).is_some()
+    }
+
+    /// Sends Quit and keeps the task: it still reports Stopped, and [`App::shutdown`] waits for it.
+    fn retire(&self, p: Player) {
         let _ = p.ctl.send(player::Ctl::Quit);
-        Some(p.task)
+        let mut closing = lock(&self.closing);
+        closing.retain(|t| !t.inner().is_finished());
+        closing.push(p.task);
     }
 
     /// 起播要等几秒（取 PlaybackInfo、连 IPC），这期间 mpv 窗口已经开着。程序退出时丢掉起播的 future，
@@ -152,9 +159,8 @@ impl App {
     /// 让正在播的 mpv 立刻退出；它的回传任务留给 [`App::shutdown`] 去等。可重复调用。
     fn begin_shutdown(&self) {
         self.quit.send_replace(true);
-        if let Some(task) = self.stop_player() {
+        if self.stop_player() {
             log::info!("程序退出，先关闭播放器并回传进度");
-            lock(&self.closing).push(task);
         }
     }
 
@@ -639,7 +645,7 @@ async fn play(
     let _starting = Starting::enter(&app.starting);
     let (_, client) = app.active()?;
     let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let _ = app.stop_player(); // switching titles: the old mpv quits and reports on its own, no need to wait
+    app.stop_player(); // switching titles: the old mpv quits and reports on its own, no need to wait
     let (preload_percent, volume, dm) = {
         let c = app.cfg();
         (f64::from(c.preload_percent), c.volume, c.danmaku.clone())
@@ -687,8 +693,9 @@ async fn play(
     tauri::async_runtime::spawn(session.run(ctl_rx, ev_tx));
     let task = tauri::async_runtime::spawn(forward_events(handle, ev_rx));
     // Just in case another player got registered meanwhile: close it rather than leave an orphaned mpv
-    if let Some(old) = lock(&app.player).replace(Player { ctl: ctl_tx, task }) {
-        let _ = old.ctl.send(player::Ctl::Quit);
+    let old = lock(&app.player).replace(Player { ctl: ctl_tx, task });
+    if let Some(old) = old {
+        app.retire(old);
     }
     Ok(())
 }
@@ -1096,5 +1103,45 @@ mod tests {
         let t0 = std::time::Instant::now();
         app(task, tx).shutdown(Duration::from_millis(300));
         assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Switching titles then quitting at once: the previous title's report is waited for too, not dropped.
+    #[test]
+    fn shutdown_waits_for_the_switched_away_player() {
+        let quit_then = |delay| {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let d = done.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
+                tokio::time::sleep(delay).await;
+                d.store(true, Ordering::SeqCst);
+            });
+            (Player { ctl: tx, task }, done)
+        };
+        let (old, old_done) = quit_then(Duration::from_millis(300));
+        let app = test_app(Some(old));
+        let _ = app.stop_player(); // what `play` does on a new click
+        let (new, _) = quit_then(Duration::ZERO);
+        *lock(&app.player) = Some(new);
+        app.shutdown(Duration::from_secs(3));
+        assert!(old_done.load(Ordering::SeqCst));
+    }
+
+    /// Finished tasks are pruned on the next switch, so the list stays as long as the players still reporting.
+    #[test]
+    fn retire_prunes_finished_tasks() {
+        let app = test_app(None);
+        let player = |task| Player {
+            ctl: mpsc::unbounded_channel().0,
+            task,
+        };
+        app.retire(player(tauri::async_runtime::spawn(async {})));
+        while !lock(&app.closing)[0].inner().is_finished() {
+            std::thread::yield_now();
+        }
+        app.retire(player(tauri::async_runtime::spawn(std::future::pending())));
+        assert_eq!(lock(&app.closing).len(), 1);
+        assert!(!lock(&app.closing)[0].inner().is_finished());
     }
 }

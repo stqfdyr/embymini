@@ -2237,6 +2237,57 @@ mod tests {
         assert!(!file.exists());
     }
 
+    /// Reports go out in order; a Progress with anything queued behind it is stale and skipped.
+    #[tokio::test]
+    async fn reporter_drops_stale_progress() {
+        let (port, heads) = emby::tests::fake(|_| ("200 OK", "{}".into())).await;
+        let (tx, task) = spawn_reporter(emby::tests::local(port));
+        for path in ["/Sessions/Playing", "/a/Progress", "/b/Progress"] {
+            tx.send((path.into(), json!({}))).unwrap();
+        }
+        drop(tx);
+        task.await.unwrap();
+        let sent: Vec<String> = heads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| h.split(' ').nth(1).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(sent, ["/emby/Sessions/Playing", "/emby/b/Progress"]);
+    }
+
+    /// mpv dying before anything played tells the UI, unless we asked it to quit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn crash_reported_only_when_unasked() {
+        for asked in [false, true] {
+            let (mut session, theirs) = fake_session(crate::emby::tests::client());
+            session.child = tokio::process::Command::new("false").spawn().unwrap();
+            let (ctl, ctl_rx) = mpsc::unbounded_channel();
+            let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+            let run = tokio::spawn(session.run(ctl_rx, ev_tx));
+            let (rd, wr) = tokio::io::split(theirs);
+            let mut lines = BufReader::new(rd).lines();
+            if asked {
+                ctl.send(Ctl::Quit).unwrap();
+                while let Some(l) = lines.next_line().await.unwrap() {
+                    if serde_json::from_str::<Value>(&l).unwrap()["command"] == json!(["quit"]) {
+                        break;
+                    }
+                }
+            }
+            drop((lines, wr)); // mpv is gone
+            run.await.unwrap();
+            let mut got = Vec::new();
+            while let Some(e) = ev_rx.recv().await {
+                got.push(e);
+            }
+            let failed = got.iter().any(|e| matches!(e, Event::Failed { .. }));
+            assert_eq!(failed, !asked, "asked to quit: {asked}; events {got:?}");
+            assert!(matches!(got.last(), Some(Event::Ended { .. })));
+        }
+    }
+
     /// A two-episode session on the first episode, talking to a fake mpv (the returned end) and a dummy child.
     fn fake_session(emby: Emby) -> (Session, tokio::io::DuplexStream) {
         let (st, _, _) = offline_state(2);

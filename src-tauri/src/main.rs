@@ -411,15 +411,17 @@ fn settings_set(
     Ok(())
 }
 
-/// 弹幕设置页的两项：接口地址（`/api/v2` 格式，可带令牌）、屏蔽词（一行一个，空行去掉）。显示设置在播放器的弹幕面板里改。
+/// The danmaku settings page: API address (`/api/v2` style, may carry a token) and blocked words (one per line,
+/// blanks dropped); applied to the running playback at once. Display settings live in the player's panel.
 #[tauri::command]
 fn danmaku_set(app: State<'_, App>, api: String, words: Vec<String>) -> Result<(), Error> {
     let api = danmaku::normalize(&api).map_err(Error::Other)?;
-    let words = words
+    let words: Vec<String> = words
         .iter()
-        .map(|w| w.trim().to_owned())
+        .map(|w| w.trim())
         .filter(|w| !w.is_empty())
-        .collect::<Vec<String>>();
+        .map(str::to_owned)
+        .collect();
     if let Some(p) = lock(&app.player).as_ref() {
         let _ = p.ctl.send(player::Ctl::Danmaku {
             api: danmaku::Api::new(app.http.clone(), &api),

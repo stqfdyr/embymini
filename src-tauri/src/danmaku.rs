@@ -1,8 +1,8 @@
-//! 弹幕数据：社区通用的 `/api/v2` 弹幕接口（`match`、`search/anime`、`bangumi/{id}`、`comment/{id}`）。
+//! Danmaku data from the community `/api/v2` danmaku API (`match`, `search/anime`, `bangumi/{id}`, `comment/{id}`).
 //!
-//! 接口地址由用户填写，路径里可能带令牌：地址不进日志，错误信息里也不带 URL。
-//! 这里只负责匹配、拉取、按集缓存到磁盘（播放时经 IPC 整集发给脚本）；排版和渲染在 mpv 脚本 `mpv/scripts/danmaku.lua` 里按屏幕刷新率逐帧做
-//! （mpv 的字幕只在视频帧变化时重绘，24 帧片源上滚动弹幕会一顿一顿，所以不走字幕轨）。
+//! The API address is user-supplied and may carry a token in its path: it never goes into logs, nor do URLs in errors.
+//! This module only matches, fetches and caches per episode (each goes to the script whole over IPC); layout and
+//! drawing happen per display frame in `mpv/scripts/danmaku.lua`, since mpv subtitles only redraw on new video frames.
 
 use crate::emby::{self, Item};
 use reqwest::Client;
@@ -13,47 +13,47 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
-/// 缓存在这段时间内直接用（还在播出的剧，弹幕会越来越多）。
+/// Cached danmaku younger than this is used as is (shows still airing keep gaining comments).
 const FRESH: Duration = Duration::from_secs(24 * 3600);
-/// 超过这么久没用的缓存文件，下次拉取时删掉。
+/// Cache files not rewritten for this long are deleted on the next successful fetch.
 const KEEP: Duration = Duration::from_secs(7 * 24 * 3600);
-/// 一集 4 万条的剧，接口冷启动接近 20 秒。
+/// A 40k-comment episode takes the API close to 20 s when cold.
 const TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
-    /// 接口地址（`/api/v2` 格式，可带令牌）；空串 = 不用弹幕。
+    /// API address (`/api/v2` style, may carry a token); empty = danmaku off.
     pub api: String,
-    /// 屏蔽词：弹幕含其中任一个（不分大小写）就不显示。
+    /// Blocked words: a comment containing any of them (case-insensitive) is hidden.
     pub words: Vec<String>,
     pub style: Style,
-    /// 手动匹配的结果，键见 [`key`]。
+    /// Manual matches, keyed by [`key`].
     pub picks: HashMap<String, Pick>,
 }
 
-/// 显示设置，在播放器的弹幕设置面板里改（字段和面板一一对应，见 danmaku.lua）。
+/// Display settings, edited in the player's danmaku panel (fields mirror the panel, see danmaku.lua).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Style {
     pub on: bool,
-    /// 不透明度 0.1–1。
+    /// Opacity 0.1–1.
     pub opacity: f64,
-    /// 滚动和顶部弹幕可用的高度占比：0.25 / 0.5 / 0.75 / 1。
+    /// Share of the height scrolling and top danmaku may use: 0.25 / 0.5 / 0.75 / 1.
     pub area: f64,
-    /// 字号倍数 0.5–2。
+    /// Font size factor 0.5–2.
     pub scale: f64,
-    /// 速度档 1（极慢）– 5（极快）。
+    /// Speed step 1 (slowest) – 5 (fastest).
     pub speed: u8,
     pub bold: bool,
-    /// 描边：`heavy` 重墨 / `outline` 描边 / `shadow` 45° 投影。
+    /// Border: `heavy` / `outline` / `shadow` (45° drop shadow).
     pub border: String,
-    /// 合并短时间内的重复弹幕。
+    /// Merge repeats posted close together.
     pub merge: bool,
     pub no_scroll: bool,
     pub no_top: bool,
     pub no_bottom: bool,
-    /// 屏蔽彩色弹幕（只留白色）。
+    /// Hide coloured danmaku (keep white only).
     pub no_color: bool,
 }
 
@@ -77,7 +77,7 @@ impl Default for Style {
 }
 
 impl Style {
-    /// 面板发来的值来自脚本，越界的拉回范围内。
+    /// Values come from the script; out-of-range ones are pulled back in.
     pub fn clamped(mut self) -> Self {
         let num = |v: f64, lo: f64, hi: f64, d: f64| {
             Some(v)
@@ -95,16 +95,16 @@ impl Style {
     }
 }
 
-/// 手动匹配：这部剧（这一季）对应接口里的哪部番剧，集数差几集。
+/// A manual match: which API show this show (this season) is, and how far its episode numbering is shifted.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Pick {
     pub anime: i64,
-    /// 接口里的集序号（从 0 起）= Emby 集号 - 1 + offset。
+    /// API episode position (from 0) = Emby episode number - 1 + offset.
     pub offset: i32,
 }
 
-/// 校验并规范化接口地址：只认 http / https，去掉末尾的 `/`。空串表示关闭。
+/// Validates and normalizes an API address: http / https only, trailing `/` removed. Empty means off.
 pub fn normalize(input: &str) -> Result<String, String> {
     let s = input.trim().trim_end_matches('/');
     if s.is_empty() {
@@ -118,18 +118,19 @@ pub fn normalize(input: &str) -> Result<String, String> {
     }
 }
 
-/// 手动匹配的键：剧集按「上游 + 剧 + 季」（同一季的集共用一次匹配），其余按「上游 + 条目」。
+/// Manual match key: episodes by upstream + series + season (one match per season), anything else by upstream + item.
 pub fn key(tag: &str, item: &Item) -> String {
     match (&item.series_id, item.kind.as_str()) {
         (Some(series), "Episode") => {
-            // 没有季号的按第 1 季，和 match_name 一致
+            // No season number counts as season 1, as in match_name
             format!("{tag}:{series}:{}", item.parent_index_number.unwrap_or(1))
         }
         _ => format!("{tag}:{}", item.id),
     }
 }
 
-/// 自动匹配用的名字：剧集「剧名 SxxEyy」（没有季号的按第 1 季），电影「片名 (年份)」。接口按文件名的习惯解析这两种写法。
+/// Name for automatic matching: "Series SxxEyy" (season 1 if missing) or "Title (year)",
+/// the file-name forms the API parses.
 pub fn match_name(item: &Item) -> String {
     match (
         &item.series_name,
@@ -144,10 +145,10 @@ pub fn match_name(item: &Item) -> String {
     }
 }
 
-/// Emby 集号对应的接口集序号（从 0 起，未加偏移）。电影等没有集号的算第 0 集。
+/// API episode position (from 0, before any offset) for an Emby item; items without an episode number are 0.
 pub fn index(item: &Item) -> i32 {
     match item.kind.as_str() {
-        "Episode" => item.index_number.unwrap_or(1) - 1,
+        "Episode" => item.index_number.unwrap_or(1).saturating_sub(1),
         _ => 0,
     }
 }
@@ -165,14 +166,14 @@ pub struct Episode {
     pub title: String,
 }
 
-/// 弹幕接口出错的三种后果（状态码分类见 [`crate::status`]）。
+/// The three outcomes of an API failure (status classes in [`crate::status`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fail {
-    /// 地址或令牌不对（401 / 403、地址下回的不是 JSON）：这次播放不再请求，提示到设置里检查地址。
+    /// Wrong address or token (401 / 403, or not JSON): stop asking for this playback and point to the settings.
     Setup(String),
-    /// 暂时取不到（限流、5xx、连不上，已重试过）：有旧缓存先用旧的，弹幕面板里可以重试。
+    /// Temporarily unavailable (rate limit, 5xx, unreachable; already retried): fall back to an old cache.
     Busy(String),
-    /// 接口明确说失败（如这一集没有弹幕）。
+    /// The API said it failed (e.g. no danmaku for this episode).
     Other(String),
 }
 
@@ -183,7 +184,7 @@ impl std::fmt::Display for Fail {
     }
 }
 
-/// 回包 → 结果。`json` 为 None 表示正文不是 JSON。
+/// Reply → result. `json` is None when the body is not JSON.
 fn judge(code: u16, json: Option<Value>) -> Result<Value, Fail> {
     use crate::status::{Class, classify, describe};
     let msg = json
@@ -191,25 +192,24 @@ fn judge(code: u16, json: Option<Value>) -> Result<Value, Fail> {
         .and_then(|v| v["errorMessage"].as_str())
         .filter(|m| !m.is_empty())
         .map(str::to_owned);
-    let fallback = || {
-        if code < 300 {
-            "请求失败".to_owned()
-        } else {
-            describe(code, "")
-        }
+    let class = classify(code);
+    let fallback = || match class {
+        Class::Ok => "请求失败".to_owned(),
+        _ => describe(code, ""),
     };
     let text = |m: Option<String>| format!("弹幕接口：{}", m.unwrap_or_else(fallback));
-    match (classify(code), json) {
+    match (class, json) {
         (Class::Ok, Some(v)) if v.is_object() && v["success"] != false => Ok(v),
-        (Class::Ok, Some(_)) => Err(Fail::Other(text(msg))),
         (Class::Auth | Class::Denied, _) => Err(Fail::Setup(format!(
             "弹幕接口拒绝访问（{code}），令牌可能已失效，请在设置里检查弹幕接口地址"
         ))),
-        // 地址对的话，接口出错也回 JSON；回 HTML（如反代的 404 页、防火墙验证页）说明地址不对或被拦
+        // A correct address answers errors in JSON; HTML (a proxy's 404 page, a firewall challenge)
+        // means the address is wrong or blocked
         (_, None) if code != 429 && code < 500 => Err(Fail::Setup(format!(
             "弹幕接口地址不对或被拦截（{code}，回的不是 JSON），请在设置里检查弹幕接口地址"
         ))),
         (Class::Busy | Class::Failed, _) | (_, None) => Err(Fail::Busy(text(msg))),
+        // `success:false`, or another status the API answered in JSON
         _ => Err(Fail::Other(text(msg))),
     }
 }
@@ -221,7 +221,7 @@ pub struct Api {
 }
 
 impl Api {
-    /// 地址为空或不合法时返回 None（设置页保存时已校验，这里只是兜底）。
+    /// None when the address is empty or invalid (the settings page validates it; this is a backstop).
     pub fn new(http: Client, url: &str) -> Option<Self> {
         normalize(url)
             .ok()
@@ -229,9 +229,15 @@ impl Api {
             .map(|base| Self { base, http })
     }
 
-    /// 发请求（暂时性失败按 [`crate::status`] 重试），按 [`judge`] 定结果。错误里不带 URL：地址里可能有令牌。
+    /// The normalized address (identifies the API; may carry a token, so never log it).
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    /// Sends with retries on transient failures ([`crate::status`]) and judges the reply ([`judge`]).
+    /// Errors carry no URL.
     async fn send(&self, build: impl Fn() -> reqwest::RequestBuilder) -> Result<Value, Fail> {
-        // 接口全是查询（match 也只是用 POST 传参），重发无副作用
+        // Every endpoint is a query (match only uses POST for its parameters), so resending is harmless
         let (sent, _) = crate::status::send_readonly(|| build().timeout(TIMEOUT)).await;
         let net = |e: reqwest::Error| Fail::Busy(format!("弹幕接口：{}", emby::net(&e)));
         let r = sent.map_err(net)?;
@@ -245,7 +251,7 @@ impl Api {
         self.send(|| self.http.get(&url).query(query)).await
     }
 
-    /// 按名字自动匹配，取第一个结果。
+    /// Automatic match by name; takes the first result.
     pub async fn matched(&self, name: &str) -> Result<Option<Episode>, Fail> {
         let url = format!("{}/api/v2/match", self.base);
         let body = json!({ "fileName": name, "matchMode": "fileNameOnly" });
@@ -258,14 +264,14 @@ impl Api {
         Ok(parse_search(&v))
     }
 
-    /// 一部番剧的全部集（按接口给的顺序）。
+    /// All episodes of a show, in API order.
     pub async fn episodes(&self, anime: i64) -> Result<Vec<Episode>, Fail> {
         let v = self.get(&format!("bangumi/{anime}"), &[]).await?;
         Ok(parse_bangumi(&v))
     }
 
-    /// 一集的弹幕（含关联来源、转成简体），规范化成按时间排好的 `[秒, 类型, 颜色, 文字, 字宽]`（见 [`parse_comments`]）。
-    pub async fn comments(&self, episode: i64) -> Result<Vec<Value>, Fail> {
+    /// An episode's danmaku (related sources included, converted to Simplified Chinese) as time-sorted [`Row`]s.
+    pub async fn comments(&self, episode: i64) -> Result<Vec<Row>, Fail> {
         let q = [("withRelated", "true"), ("chConvert", "1")];
         let v = self.get(&format!("comment/{episode}"), &q).await?;
         Ok(parse_comments(&v))
@@ -320,8 +326,9 @@ fn join_title(anime: Option<&str>, ep: Option<&str>) -> String {
         .join(" ")
 }
 
-/// 文字宽度估算（单位 em，脚本排版用）：按 UTF-8 字节数分类，中日韩全角 1、半角 0.55。
-/// 在这里算好：脚本里逐条算，4 万条要一两秒。
+/// Estimated text width in em for the script's layout, by UTF-8 length:
+/// 1 byte 0.55, 2 bytes 0.6, 3 bytes (CJK) 1, 4 bytes 1.1.
+/// Done here because the script took a second or two for 40k comments.
 fn em_width(s: &str) -> f64 {
     let w: f64 = s
         .chars()
@@ -335,15 +342,18 @@ fn em_width(s: &str) -> f64 {
     (w * 100.0).round() / 100.0
 }
 
-/// `p` = `秒,类型,颜色(十进制 RGB),[来源]`；类型 4 底部、5 顶部，其余都按滚动。
-/// 输出按时间排好的 `[秒, 类型, 颜色, 文字, 字宽(em)]`。
-fn parse_comments(v: &Value) -> Vec<Value> {
-    let mut out: Vec<(f64, Value)> = v["comments"]
+/// One danmaku as the script takes it: `[seconds, mode, colour, text, width in em]`.
+pub type Row = (f64, u8, u32, String, f64);
+
+/// `p` = `seconds,mode,colour (decimal RGB),[source]`; mode 4 bottom, 5 top, anything else scrolls.
+/// Returns rows sorted by time.
+fn parse_comments(v: &Value) -> Vec<Row> {
+    let mut out: Vec<Row> = v["comments"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|c| {
-            // 换行换成空格；去掉表情后面的变体选择符（U+FE0F，部分字体会画成方框）
+            // Newlines become spaces; U+FE0F after emoji is dropped (some fonts draw it as a box)
             let text = c["m"]
                 .as_str()?
                 .replace(['\r', '\n'], " ")
@@ -369,24 +379,24 @@ fn parse_comments(v: &Value) -> Vec<Value> {
                 .unwrap_or(0xFF_FFFF)
                 & 0xFF_FFFF;
             let t = (t * 100.0).round() / 100.0;
-            Some((t, json!([t, mode, color, text, em_width(text)])))
+            Some((t, mode, color, text.to_owned(), em_width(text)))
         })
         .collect();
     out.sort_by(|a, b| a.0.total_cmp(&b.0));
-    out.into_iter().map(|(_, v)| v).collect()
+    out
 }
 
-/// 一次播放用到的弹幕环境（起播时从配置取一份）。
+/// Danmaku environment for one playback (taken from the config at start).
 #[derive(Clone)]
 pub struct Ctx {
-    /// 没填接口地址时为 None：面板里提示到设置里填。
+    /// None when no API is set: the panel says to fill it in the settings.
     pub api: Option<Api>,
-    /// 缓存目录（每集一个 `<接口地址哈希>-<episodeId>.json`）。
+    /// Cache dir (one `<API address hash>-<episodeId>.json` per episode).
     pub dir: PathBuf,
     pub cfg: Config,
 }
 
-/// 找一集弹幕要的东西（取自 Emby 条目，在播放循环里组好，交给后台任务）。
+/// What finding one episode's danmaku needs (built from the Emby item in the playback loop, handed to a task).
 #[derive(Clone, Debug)]
 pub struct Want {
     pub name: String,
@@ -394,29 +404,29 @@ pub struct Want {
     pub pick: Option<Pick>,
 }
 
-/// 拉好的一集：弹幕（缓存文件的原文，JSON 数组）和给人看的出处。
+/// A loaded episode: its danmaku (the cache file's text, a JSON array) and where it came from, for display.
 #[derive(Serialize, Debug, PartialEq)]
 pub struct Loaded {
     pub list: String,
     pub title: String,
     pub manual: bool,
-    /// 接口暂时取不到，用的是旧缓存。
+    /// The API was unavailable; this is an old cache.
     pub stale: bool,
 }
 
-/// 找到对应的集、取弹幕（缓存新鲜就直接用）。没匹配上返回 Ok(None)。
-/// 接口暂时取不到（[`Fail::Busy`] / [`Fail::Other`]）而本地有这一集的旧缓存时用旧的。
+/// Finds the episode and its danmaku (a fresh cache is used directly). Ok(None) when nothing matched.
+/// When the API fails softly ([`Fail::Busy`] / [`Fail::Other`]) an old cache of the episode is used instead.
 pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fail> {
     let ep = match &w.pick {
         Some(p) => {
-            let i = w.index + p.offset;
+            let i = w.index.saturating_add(p.offset);
             let eps = api.episodes(p.anime).await?;
             usize::try_from(i).ok().and_then(|i| eps.into_iter().nth(i))
         }
         None => api.matched(&w.name).await?,
     };
     let Some(ep) = ep else { return Ok(None) };
-    // 集 id 只在同一个接口里唯一：文件名带上接口地址的哈希，换了接口不会读到别家的缓存
+    // Episode ids are only unique within one API: the file name carries the address hash so APIs never share a cache
     let path = dir.join(format!(
         "{}-{}.json",
         crate::config::server_tag(&api.base),
@@ -428,8 +438,11 @@ pub async fn load(api: &Api, dir: &Path, w: &Want) -> Result<Option<Loaded>, Fai
         match api.comments(ep.id).await {
             Ok(v) => {
                 prune(dir);
-                let text = Value::Array(v).to_string();
-                write(&path, &text).map_err(Fail::Other)?;
+                // Plain numbers and strings: serializing cannot fail
+                let text = serde_json::to_string(&v).unwrap_or_else(|_| "[]".into());
+                if let Err(e) = write(&path, &text) {
+                    log::warn!("{e}");
+                }
                 list = Some(text);
             }
             Err(e @ (Fail::Busy(_) | Fail::Other(_))) if path.is_file() => {
@@ -461,7 +474,8 @@ fn fresh(path: &Path, within: Duration) -> bool {
     })
 }
 
-/// 先写临时文件再改名。同一集可能同时在取（预取下一集还没完就开播了、连点重新加载），临时文件名各不相同。
+/// Writes a temp file, then renames it. One episode may be fetched twice at once (prefetch vs start,
+/// repeated reloads), so temp names are unique.
 fn write(path: &Path, text: &str) -> Result<(), String> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let fail = |e: std::io::Error| format!("写弹幕缓存失败：{e}");
@@ -476,7 +490,7 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     r.map_err(fail)
 }
 
-/// 删掉一周没更新的缓存。
+/// Deletes cache files not rewritten for a week.
 fn prune(dir: &Path) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         if !fresh(&e.path(), KEEP) {
@@ -520,6 +534,8 @@ mod tests {
         assert_eq!(match_name(&movie), "沙丘2 (2024)");
         assert_eq!(key("t", &movie), "t:9");
         assert_eq!(index(&movie), 0);
+        let odd = item("Episode", Some("某番"), None, Some(i32::MIN));
+        assert_eq!(index(&odd), i32::MIN, "a bogus episode number saturates");
     }
 
     #[test]
@@ -547,12 +563,12 @@ mod tests {
             (s.opacity, s.area, s.speed, s.border.as_str()),
             (1.0, 0.5, 1, "heavy")
         );
-        // 旧配置里没有的字段取默认值
+        // Fields missing from an old config take defaults
         let s: Style = serde_json::from_str(r#"{"on":false}"#).unwrap();
         assert!(!s.on && s.bold && s.speed == 3);
     }
 
-    // 回包形状取自真实接口（文字、id 已替换）
+    // Reply shapes taken from the real API (texts and ids replaced)
     #[test]
     fn parses_api_shapes() {
         let m = json!({"errorCode":0,"success":true,"isMatched":true,"matches":[
@@ -588,15 +604,21 @@ mod tests {
             {"cid":2,"p":"3.00,5,16711680,[src2]","m":"顶部红"},
             {"cid":3,"p":"4,4,255,[x]","m":"  "},
             {"cid":4,"p":"bad,1,1","m":"坏时间"},
-            {"cid":5,"p":"5,6,99999999999","m":"怪类型"}]});
+            {"cid":5,"p":"5,6,99999999999","m":"怪类型"},
+            {"cid":6,"p":"-1,1,1","m":"负时间"}]});
         assert_eq!(
             parse_comments(&c),
             vec![
-                json!([3.0, 5, 0xFF0000, "顶部红", 3.0]),
-                json!([5.0, 1, 0xFFFFFF, "怪类型", 3.0]),
-                json!([12.35, 1, 0xFFFFFF, "后 一条", 3.55]),
+                (3.0, 5, 0xFF0000, "顶部红".into(), 3.0),
+                (5.0, 1, 0xFFFFFF, "怪类型".into(), 3.0),
+                (12.35, 1, 0xFFFFFF, "后 一条".into(), 3.55),
             ]
         );
+    }
+
+    #[test]
+    fn widths() {
+        assert_eq!(em_width("a\u{e9}中😀"), 0.55 + 0.6 + 1.0 + 1.1);
     }
 
     #[test]
@@ -612,9 +634,14 @@ mod tests {
         );
         assert!(matches!(judge(401, None), Err(Fail::Setup(_))));
         assert!(matches!(judge(403, Some(json!({}))), Err(Fail::Setup(_))));
-        assert!(matches!(judge(404, None), Err(Fail::Setup(_)))); // 反代的 404 页：地址不对
-        assert!(matches!(judge(200, None), Err(Fail::Setup(_)))); // 防火墙验证页
+        assert!(matches!(judge(404, None), Err(Fail::Setup(_)))); // a proxy 404 page: wrong address
+        assert!(matches!(judge(200, None), Err(Fail::Setup(_)))); // a firewall challenge
         assert!(matches!(judge(502, None), Err(Fail::Busy(_))));
+        assert!(matches!(judge(500, None), Err(Fail::Busy(_))));
+        assert_eq!(
+            judge(304, Some(json!({"success": false}))),
+            Err(Fail::Other("弹幕接口：请求失败".into()))
+        );
         assert!(matches!(judge(429, None), Err(Fail::Busy(_))));
         assert_eq!(
             judge(
@@ -629,7 +656,7 @@ mod tests {
         );
     }
 
-    /// 同一集同时写两份（预取和开播撞上）：各写各的临时文件，都成功。
+    /// Two writers of one episode (prefetch meets start): each uses its own temp file and both succeed.
     #[test]
     fn concurrent_writes() {
         let dir = std::env::temp_dir().join(format!("embymini-dm-w-{}", std::process::id()));
@@ -641,11 +668,122 @@ mod tests {
             })
             .collect();
         assert!(ts.into_iter().all(|t| t.join().unwrap()));
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "不留临时文件");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temp files left"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// 真接口：环境变量 `DANMU_API` 为接口地址（含令牌）。
+    fn age(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    /// Behaviour of `comment/101` on the fake API: 0 = comments, 1 = "no such episode", 2 = 401.
+    static MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    fn route(path: &str) -> (&'static str, String) {
+        let ok = |v: Value| ("200 OK", v.to_string());
+        let comments = |m: &str| ok(json!({"comments":[{"p":"1.5,1,16777215","m":m}]}));
+        let gone = || {
+            (
+                "404 Not Found",
+                json!({"success":false,"errorMessage":"没有这一集"}).to_string(),
+            )
+        };
+        match path.trim_start_matches("/x/tok/api/v2/") {
+            "match" => ok(
+                json!({"matches":[{"episodeId":101,"animeTitle":"某剧","episodeTitle":"第3集"}]}),
+            ),
+            "bangumi/7" => ok(json!({"bangumi":{"animeTitle":"某剧","episodes":[
+                {"episodeId":1,"episodeTitle":"第1集"},{"episodeId":2},{"episodeId":3,"episodeTitle":"第3集"}]}})),
+            "comment/101" => match MODE.load(Ordering::SeqCst) {
+                0 => comments("好"),
+                1 => gone(),
+                _ => ("401 Unauthorized", String::new()),
+            },
+            "comment/3" => comments("三"),
+            _ => gone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_matches_caches_and_falls_back() {
+        let (port, heads) = emby::tests::fake(route).await;
+        let api = Api::new(
+            emby::http_client().unwrap(),
+            &format!("http://127.0.0.1:{port}/x/tok/"),
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("embymini-dm-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, recent) = (dir.join("old.json"), dir.join("recent.json"));
+        std::fs::write(&old, "[]").unwrap();
+        std::fs::write(&recent, "[]").unwrap();
+        age(&old, 8 * 24 * 3600);
+        age(&recent, 6 * 24 * 3600);
+        let auto = Want {
+            name: "某剧 S01E03".into(),
+            index: 2,
+            pick: None,
+        };
+        let list = |l: &Loaded| serde_json::from_str::<Value>(&l.list).unwrap()[0][3].clone();
+
+        let l = load(&api, &dir, &auto).await.unwrap().unwrap();
+        assert_eq!(
+            (l.title.as_str(), l.manual, l.stale),
+            ("某剧 第3集", false, false)
+        );
+        assert_eq!(list(&l), "好");
+        let cached = dir.join(format!("{}-101.json", crate::config::server_tag(&api.base)));
+        assert!(cached.is_file());
+        assert!(
+            !old.exists() && recent.exists(),
+            "a successful fetch prunes week-old files only"
+        );
+
+        let n = heads.lock().unwrap().len();
+        assert!(load(&api, &dir, &auto).await.unwrap().is_some());
+        let sent = heads.lock().unwrap()[n..].to_vec();
+        assert_eq!(sent.len(), 1, "a fresh cache only re-matches: {sent:?}");
+
+        // Stale cache: used when the API fails softly, not when the address is wrong.
+        age(&cached, 2 * 24 * 3600);
+        MODE.store(1, Ordering::SeqCst);
+        let l = load(&api, &dir, &auto).await.unwrap().unwrap();
+        assert!(l.stale);
+        assert_eq!(list(&l), "好");
+        MODE.store(2, Ordering::SeqCst);
+        assert!(matches!(load(&api, &dir, &auto).await, Err(Fail::Setup(_))));
+
+        // Manual pick: API index = Emby index + offset.
+        let pick = |offset| Want {
+            pick: Some(Pick { anime: 7, offset }),
+            index: 1,
+            ..auto.clone()
+        };
+        let l = load(&api, &dir, &pick(1)).await.unwrap().unwrap();
+        assert_eq!((l.title.as_str(), l.manual), ("某剧 第3集", true));
+        assert_eq!(list(&l), "三");
+        assert_eq!(load(&api, &dir, &pick(5)).await, Ok(None));
+        assert_eq!(load(&api, &dir, &pick(i32::MAX)).await, Ok(None));
+        // No cache to fall back on: the API's own error comes through.
+        assert_eq!(
+            load(&api, &dir, &pick(-1)).await,
+            Err(Fail::Other("弹幕接口：没有这一集".into()))
+        );
+
+        // An unwritable cache still shows the danmaku.
+        MODE.store(0, Ordering::SeqCst);
+        let l = load(&api, &recent, &auto).await.unwrap().unwrap();
+        assert_eq!(list(&l), "好");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Real API: `DANMU_API` holds the address (with token).
     #[tokio::test]
     #[ignore]
     async fn e2e_danmaku_api() {
@@ -660,7 +798,7 @@ mod tests {
             index: 0,
             pick: None,
         };
-        let l = load(&api, &dir, &w).await.unwrap().expect("应能匹配");
+        let l = load(&api, &dir, &w).await.unwrap().expect("should match");
         let list: Vec<Value> = serde_json::from_str(&l.list).unwrap();
         println!("{}：{} 条", l.title, list.len());
         assert!(list.len() > 100);

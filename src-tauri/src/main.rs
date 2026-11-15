@@ -983,6 +983,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Temp cache = mpv's cache dir + updater leftovers + thumbfast images; other temp entries are left alone.
+    #[test]
+    fn temp_paths_pick_our_leftovers() {
+        let tmp = std::env::temp_dir();
+        let id = std::process::id();
+        let upd = tmp.join(format!("EmbyMini-0.0.0-updater-test{id}"));
+        let thumb = tmp.join(format!("thumbfast.out-test{id}"));
+        let other = tmp.join(format!("embymini-other-test{id}"));
+        std::fs::create_dir_all(&upd).unwrap();
+        std::fs::write(&thumb, "").unwrap();
+        std::fs::write(&other, "").unwrap();
+        let mut app = test_app(None);
+        app.mpv_cache = Some(PathBuf::from("mpv-cache"));
+        let v = temp_paths(&app);
+        for p in [&upd, &thumb, &other] {
+            remove_path(p);
+        }
+        assert_eq!(v[0], PathBuf::from("mpv-cache"));
+        assert!(v.contains(&upd) && v.contains(&thumb), "{v:?}");
+        assert!(!v.contains(&other));
+    }
+
     /// A symlink in the shared temp dir is neither followed when sized nor when deleted.
     #[cfg(unix)]
     #[test]

@@ -38,9 +38,20 @@ fn fail(what: &str, e: &tauri_plugin_updater::Error) -> Error {
     Error::Other(format!("{what}：{reason}"))
 }
 
-/// Percent downloaded (MB when the size is unknown): progress is emitted only when it changes, not per chunk.
-fn progress_step(got: u64, total: Option<u64>) -> u64 {
-    total.map_or(got >> 20, |t| got * 100 / t.max(1))
+/// Download progress: emitted only when the percent (MB when the size is unknown) changes, not per chunk.
+#[derive(Default)]
+struct Progress {
+    got: u64,
+    shown: Option<u64>,
+}
+
+impl Progress {
+    /// Adds a chunk of `n` bytes; returns the bytes so far when the step changed.
+    fn advance(&mut self, n: usize, total: Option<u64>) -> Option<u64> {
+        self.got += n as u64;
+        let step = total.map_or(self.got >> 20, |t| self.got * 100 / t.max(1));
+        (self.shown.replace(step) != Some(step)).then_some(self.got)
+    }
 }
 
 /// Updater for the check and the download: through the update proxy if set, else the system proxy (the plugin
@@ -82,14 +93,11 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
         .map_err(fail)?
         .ok_or_else(|| Error::Other("已是最新版本".into()))?;
     log::info!("下载新版本 {}", u.version);
-    let (mut got, mut shown) = (0u64, u64::MAX);
+    let mut progress = Progress::default();
     let bytes = u
         .download(
             |n, total| {
-                got += n as u64;
-                let step = progress_step(got, total);
-                if step != shown {
-                    shown = step;
+                if let Some(got) = progress.advance(n, total) {
                     let _ = handle.emit("update-progress", (got, total));
                 }
             },
@@ -146,12 +154,19 @@ mod tests {
     }
 
     #[test]
-    fn progress_steps_by_percent_or_mb() {
-        assert_eq!(progress_step(0, Some(200)), 0);
-        assert_eq!(progress_step(3, Some(200)), 1);
-        assert_eq!(progress_step(200, Some(200)), 100);
+    fn progress_emits_when_the_step_changes() {
+        let mut p = Progress::default();
+        let total = Some(200);
+        assert_eq!(p.advance(1, total), Some(1)); // first chunk: 0 %
+        assert_eq!(p.advance(1, total), Some(2)); // 1 %
+        assert_eq!(p.advance(1, total), None); // still 1 %
+        assert_eq!(p.advance(197, total), Some(200)); // 100 %
         // A zero total must not divide by zero.
-        assert_eq!(progress_step(5, Some(0)), 500);
-        assert_eq!(progress_step((3 << 20) + 5, None), 3);
+        assert_eq!(Progress::default().advance(5, Some(0)), Some(5));
+        // Unknown size: once per MB.
+        let mut p = Progress::default();
+        assert_eq!(p.advance(1 << 20, None), Some(1 << 20));
+        assert_eq!(p.advance(5, None), None);
+        assert_eq!(p.advance(1 << 20, None), Some((2 << 20) + 5));
     }
 }

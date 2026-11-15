@@ -1,5 +1,6 @@
-<!-- 缓存管理：逐项显示占用，可单独清理或一键清理。视频、图片、字幕和弹幕、临时缓存在 Rust 里（cache_info / cache_clear），
-     媒体库缓存是界面的列表快照（snap.ts）。正在播放的那部片的视频缓存清不掉。Esc、点外面、「完成」关闭。 -->
+<!-- Cache manager: usage per row, clear one or all. Video, images, subtitles + danmaku and temp live in Rust
+     (cache_info / cache_clear); the library cache is the UI's list snapshots (snap.ts). The film being played
+     keeps its video cache. Closes on Esc, a click outside or 完成. -->
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core'
   import { errText, notify } from './api.svelte'
@@ -8,6 +9,7 @@
 
   let { onclose }: { onclose: () => void } = $props()
   type Info = { video: number; images: number; subs: number; temp: number; playing: boolean }
+  type Kind = 'video' | 'images' | 'subs' | 'snap' | 'temp' | 'all'
   let info = $state<Info | null>(null)
   let snap = $state(snapSize())
   let busy = $state(false)
@@ -17,7 +19,7 @@
     (e) => notify(errText(e)),
   )
 
-  async function clear(kind: string) {
+  async function clear(kind: Kind) {
     busy = true
     try {
       if (kind === 'snap' || kind === 'all') {
@@ -32,7 +34,7 @@
     }
   }
 
-  const rows = $derived(
+  const rows = $derived<{ kind: Kind; label: string; size: number; note: string }[]>(
     info
       ? [
           { kind: 'video', label: '视频缓存', size: info.video, note: info.playing ? '正在播放的除外' : '' },

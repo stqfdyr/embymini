@@ -84,7 +84,10 @@ pub struct Config {
     /// Proxy for update checks and installer downloads only (e.g. `http://127.0.0.1:10808`); empty follows
     /// the system proxy. Every other request bypasses proxies.
     pub update_proxy: Option<String>,
-    /// Cache the whole video while playing (default on); off caches only a window ahead of playback.
+    /// Cache the whole video while playing (default off: only a window ahead of playback, see stream.rs).
+    /// Stored under a new key: the old `cacheWhole` was saved as on by default, so dropping it turns everyone
+    /// to ahead-only once, and a later choice sticks.
+    #[serde(rename = "cacheWholeFile")]
     pub cache_whole: bool,
     /// Danmaku: API address, blocked words, display settings, manual matches.
     pub danmaku: crate::danmaku::Config,
@@ -100,7 +103,7 @@ impl Default for Config {
             preload_percent: 80,
             volume: None,
             update_proxy: None,
-            cache_whole: true,
+            cache_whole: false,
             danmaku: crate::danmaku::Config::default(),
         }
     }
@@ -385,6 +388,25 @@ mod tests {
         }
         assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Whole-file caching became opt-in: the old key (saved as on by default) is dropped, the new one sticks.
+    #[test]
+    fn whole_file_cache_is_opt_in_once() {
+        let old: Config =
+            serde_json::from_str(r#"{"cacheWhole":true,"preloadPercent":90}"#).unwrap();
+        assert!(!old.cache_whole);
+        assert_eq!(old.preload_percent, 90, "other settings survive");
+        let json = serde_json::to_string(&Config {
+            cache_whole: true,
+            ..old
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""cacheWholeFile":true"#) && !json.contains(r#""cacheWhole""#),
+            "{json}"
+        );
+        assert!(serde_json::from_str::<Config>(&json).unwrap().cache_whole);
     }
 
     #[test]

@@ -21,7 +21,7 @@
   let mpvPath = $state(session.cfg?.mpvPath ?? '')
   let preload = $state(session.cfg?.preloadPercent ?? 80)
   let updateProxy = $state(session.cfg?.updateProxy ?? '')
-  let cacheWhole = $state(session.cfg?.cacheWhole ?? true)
+  let cacheWhole = $state(session.cfg?.cacheWhole ?? false)
   let cacheOpen = $state(false)
   let dmApi = $state(session.cfg?.danmakuApi ?? '')
   let dmWords = $state((session.cfg?.danmakuWords ?? []).join('\n'))
@@ -201,7 +201,7 @@
       <span class="label">边播边缓存</span>
       <div class="grow">
         <div>缓存整个视频</div>
-        <div class="sub">播放时在后台把整个文件存到本地：拖动进度、进度条预览、重看不用再等网络；只保留最近播放的那一集，最多 20 GB。关掉时只缓存播放位置前方一段</div>
+        <div class="sub">播放时在后台把整个文件存到本地：拖动进度、进度条预览、重看不用再等网络；只保留最近播放的那一集，最多 20 GB。会多用流量：看一半关掉时，后面没看的部分也已经下了。不开时只缓存播放位置前方一段</div>
       </div>
       <input type="checkbox" bind:checked={cacheWhole} onchange={savePlayer} />
     </label>

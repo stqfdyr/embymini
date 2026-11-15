@@ -60,7 +60,7 @@ export function devBridge(): Plugin {
           const cmd = (req.url ?? '').replace(/^\//, '')
           if (cmd === 'config_get') {
             return reply(200, {
-              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: true, danmakuApi: '', danmakuWords: [], version: 'dev',
+              active: 'dev', mpvPath: null, preloadPercent: 80, userMpvConf: 'D:\\EmbyMini\\data\\mpv.conf', updateProxy: null, cacheWhole: false, danmakuApi: '', danmakuWords: [], version: 'dev',
               servers: [{ id: 'dev', name: s.name, url: s.url, port: s.port, user: process.env.EMBY_USER, userId: s.userId, base: s.base, loggedIn: true }],
             })
           }

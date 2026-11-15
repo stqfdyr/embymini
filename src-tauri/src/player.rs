@@ -31,8 +31,6 @@ const TICKS_PER_SEC: f64 = 10_000_000.0;
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 /// How often the upstream download speed goes to the OSC top bar ([`SPEED_MSG`]).
 const SPEED_EVERY: Duration = Duration::from_secs(1);
-/// A stall starting this soon after a seek is counted as the seek loading.
-const STALL_AFTER_SEEK: Duration = Duration::from_secs(3);
 /// Sent by mpv's previous / next buttons and keys (see mpv/input.conf, mpv/script-opts/modernz.conf).
 const NEXT_MSG: &str = "embymini-next";
 const PREV_MSG: &str = "embymini-prev";
@@ -733,6 +731,7 @@ async fn finish(
     at: usize,
     quit_sent: bool,
 ) {
+    st.end_stall("退出");
     if let Some(i) = st.cur {
         st.stop(i); // mpv was closed before it could send end-file
     }
@@ -846,10 +845,23 @@ struct State {
     dm: Option<Dm>,
     /// Upstream bytes the cache proxy had last time (the top-bar speed is the difference).
     up_seen: u64,
-    /// mpv's last seek; a stall right after one is the seek loading, not the network.
-    seeked: Option<Instant>,
-    /// Playback waiting for the cache since (when, upstream bytes then, right after a seek).
-    stall: Option<(Instant, u64, bool)>,
+    /// Playback of the current file has begun (its first playback-restart); waits before that are startup.
+    restarted: bool,
+    /// Between a seek event and the playback-restart that ends it.
+    seeking: bool,
+    stall: Option<Stall>,
+}
+
+/// Playback waiting for the cache (mpv's paused-for-cache), timed for the log.
+struct Stall {
+    since: Instant,
+    /// The current file's upstream bytes when it began.
+    up: u64,
+    /// Began while a seek was loading: the seek, not the network.
+    seek: bool,
+    /// The user seeked or paused meanwhile, so the duration is not all network.
+    seeked: bool,
+    paused: bool,
 }
 
 impl State {
@@ -887,7 +899,8 @@ impl State {
             stream: None,
             dm: None,
             up_seen: 0,
-            seeked: None,
+            restarted: false,
+            seeking: false,
             stall: None,
         }
     }
@@ -1038,7 +1051,13 @@ impl State {
             None => self.on_reply(&v).await,
             Some("property-change") => self.on_property(&v),
             Some("client-message") => self.on_client_message(&v["args"]).await,
-            Some("seek") => self.seeked = Some(Instant::now()),
+            Some("seek") => {
+                self.seeking = true;
+                if let Some(s) = &mut self.stall {
+                    s.seeked = true;
+                }
+            }
+            Some("playback-restart") => (self.seeking, self.restarted) = (false, true),
             Some(ev @ ("start-file" | "file-loaded" | "end-file")) => {
                 self.on_file_event(ev, &v).await
             }
@@ -1081,7 +1100,8 @@ impl State {
                 // mpv may play the same entry again (playlist loop): a new playback, or every report is skipped
                 (self.queue[i].started, self.queue[i].stopped) = (false, false);
                 self.cur = Some(i);
-                self.stall = None;
+                self.end_stall("换集");
+                (self.restarted, self.seeking) = (false, false);
                 self.applied = None;
                 let labels: Vec<String> =
                     self.queue.iter().map(|e| episode_label(&e.item)).collect();
@@ -1170,6 +1190,9 @@ impl State {
             (Some("pause"), d) => {
                 if let Some(p) = d.as_bool().filter(|p| *p != self.paused) {
                     self.paused = p;
+                    if let Some(s) = self.stall.as_mut().filter(|_| p) {
+                        s.paused = true;
+                    }
                     self.progress(if p { "Pause" } else { "Unpause" });
                 }
             }
@@ -1182,30 +1205,61 @@ impl State {
         }
     }
 
-    /// Times each wait for the cache and returns a log line when it ends: the upstream rate during the stall tells
-    /// an outage (0) from a connection that is up but slower than the video.
+    /// Times each wait for the cache once playback has begun and returns a log line when it ends: the current
+    /// file's upstream rate during the stall tells an outage (0) from a connection slower than the video.
     fn on_stall(&mut self, waiting: bool) -> Option<String> {
-        let up = || self.stream.as_ref().map_or(0, Stream::up_bytes);
-        if waiting {
-            if self.stall.is_none() && self.tracking() {
-                let seek = self.seeked.is_some_and(|t| t.elapsed() < STALL_AFTER_SEEK);
-                self.stall = Some((Instant::now(), up(), seek));
-            }
-            return None;
+        if !waiting {
+            return self.stall_note(None);
         }
-        let (t, up0, seek) = self.stall.take()?;
-        let secs = t.elapsed().as_secs_f64();
-        let cause = if seek {
+        if self.stall.is_none() && self.restarted && self.tracking() {
+            self.stall = Some(Stall {
+                since: Instant::now(),
+                up: self.cur_up().unwrap_or(0),
+                seek: self.seeking,
+                seeked: false,
+                paused: false,
+            });
+        }
+        None
+    }
+
+    /// Logs a stall still open when the episode changes or mpv quits: the ones bad enough to leave matter most.
+    fn end_stall(&mut self, why: &str) {
+        if let Some(note) = self.stall_note(Some(why)) {
+            log::info!("{note}");
+        }
+    }
+
+    fn stall_note(&mut self, gave_up: Option<&str>) -> Option<String> {
+        let s = self.stall.take()?;
+        let secs = s.since.elapsed().as_secs_f64();
+        let cause = if s.seek {
             "拖动后加载"
         } else {
             "缓冲耗尽"
         };
         let mut note = format!("播放卡顿 {secs:.1} 秒（{cause}），位置 {:.0} 秒", self.pos);
-        if self.stream.is_some() {
-            let rate = up().saturating_sub(up0) as f64 / secs.max(0.001) / 1024.0;
-            let _ = write!(note, "，期间上游 {rate:.0} KB/s");
+        if let Some(up) = self.cur_up() {
+            let rate = up.saturating_sub(s.up) as f64 / secs.max(0.001) / 1024.0;
+            let _ = write!(note, "，期间这一集上游 {rate:.0} KB/s");
+        }
+        for (on, what) in [(s.seeked, "，期间拖动过"), (s.paused, "，期间手动暂停过")]
+        {
+            if on {
+                note.push_str(what);
+            }
+        }
+        if let Some(why) = gave_up {
+            let _ = write!(note, "，没等到恢复就{why}");
         }
         Some(note)
+    }
+
+    /// The current file's upstream bytes through the cache proxy (None without the proxy).
+    fn cur_up(&self) -> Option<u64> {
+        let s = self.stream.as_ref()?;
+        let r = self.queue.get(self.cur?)?.ready.as_ref()?;
+        Some(s.file_up_bytes(&r.name))
     }
 
     fn tracking(&self) -> bool {
@@ -2769,32 +2823,43 @@ mod tests {
         }
     }
 
-    /// A wait for the cache is timed only once the episode's tracks are set, and is labelled a seek load when it
-    /// starts right after a seek; repeated "waiting" does not restart the clock.
+    /// A wait for the cache counts only after playback began (not the startup load, including a resume seek);
+    /// it is labelled a seek load while a seek is loading, notes a seek or pause in between, and repeated
+    /// "waiting" does not restart the clock.
     #[tokio::test]
     async fn stalls_are_timed_and_labelled() {
         let (mut st, _mpv, _ev) = offline_state(1);
         st.pos = 42.0;
-        assert_eq!(st.on_stall(true), None);
-        assert!(
-            st.stall.is_none(),
-            "not playing yet: startup buffering is not a stall"
-        );
         (st.cur, st.applied) = (Some(0), Some(0));
+        st.on_message(json!({ "event": "seek" })).await; // the resume seek at load
+        assert_eq!(st.on_stall(true), None);
+        assert!(st.stall.is_none(), "startup is not a stall");
+        st.on_message(json!({ "event": "playback-restart" })).await;
         assert_eq!(st.on_stall(false), None, "no stall to end");
         st.on_stall(true);
-        let t0 = st.stall.unwrap().0;
+        let t0 = st.stall.as_ref().unwrap().since;
         st.on_stall(true);
-        assert_eq!(st.stall.unwrap().0, t0);
+        assert_eq!(st.stall.as_ref().unwrap().since, t0);
         let note = st.on_stall(false).unwrap();
         assert!(
-            note.starts_with("播放卡顿 ") && note.contains("（缓冲耗尽），位置 42 秒"),
+            note.starts_with("播放卡顿 ") && note.ends_with("（缓冲耗尽），位置 42 秒"),
             "{note}"
         );
-        assert!(!note.contains("上游"), "no cache proxy, no rate: {note}");
         st.on_message(json!({ "event": "seek" })).await;
         st.on_stall(true);
-        assert!(st.on_stall(false).unwrap().contains("拖动后加载"));
+        st.on_message(json!({ "event": "playback-restart" })).await;
+        assert!(st.on_stall(false).unwrap().contains("（拖动后加载）"));
+        st.on_stall(true);
+        st.on_message(json!({ "event": "seek" })).await;
+        st.on_message(prop("pause", json!(true))).await;
+        let note = st.on_stall(false).unwrap();
+        assert!(
+            note.contains("（缓冲耗尽）") && note.ends_with("，期间拖动过，期间手动暂停过"),
+            "{note}"
+        );
+        st.on_stall(true);
+        st.end_stall("换集");
+        assert!(st.stall.is_none());
     }
 
     /// Playing / Progress (pause, resume) / Stopped go to the report task with the position; nothing before the

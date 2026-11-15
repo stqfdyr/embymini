@@ -214,6 +214,8 @@ struct File {
     st: Mutex<St>,
     /// Bumped on new data or state changes; readers wake on it.
     changed: watch::Sender<u64>,
+    /// Upstream bytes for this file alone (the player's stall log; the top-bar speed uses the total).
+    up: AtomicU64,
 }
 
 impl File {
@@ -259,6 +261,7 @@ impl File {
                 ..Default::default()
             }),
             changed: watch::Sender::new(0),
+            up: AtomicU64::new(0),
         }
     }
 
@@ -346,7 +349,7 @@ pub struct Inner {
     video: PathBuf,
     subs: PathBuf,
     http: reqwest::Client,
-    /// Cache whole videos while playing (setting, on by default); off caches only a window ahead of the reader.
+    /// Cache whole videos while playing (setting, off by default); off caches only a window ahead of the reader.
     whole: AtomicBool,
     cap: AtomicU64,
     /// Bytes of done blocks in the video cache.
@@ -584,6 +587,13 @@ impl Stream {
     /// Bytes downloaded upstream so far (only grows).
     pub fn up_bytes(&self) -> u64 {
         self.up_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes downloaded upstream for one registered file (0 when not registered).
+    pub fn file_up_bytes(&self, name: &str) -> u64 {
+        lock(&self.files)
+            .get(name)
+            .map_or(0, |f| f.up.load(Ordering::Relaxed))
     }
 
     /// Registers a video and returns its local URL for mpv. `name` is the cache dir, the same for a file every time,
@@ -1232,6 +1242,7 @@ impl Stream {
         if let Ok(o) = &r {
             self.up_bytes
                 .fetch_add(o.first.len() as u64, Ordering::Relaxed);
+            f.up.fetch_add(o.first.len() as u64, Ordering::Relaxed);
         }
         r
     }
@@ -1372,6 +1383,7 @@ impl Stream {
                     };
                     self.up_bytes
                         .fetch_add(pending.len() as u64, Ordering::Relaxed);
+                    f.up.fetch_add(pending.len() as u64, Ordering::Relaxed);
                 }
                 let part = pending.split_to(pending.len().min((len - got) as usize));
                 // shortcut: sync write of tens of KB into the page cache (microseconds); move to spawn_blocking if it ever shows up
@@ -2603,6 +2615,12 @@ mod tests {
         );
         // Every byte received counts, including the partial blocks lost to the cuts
         assert!(s.up_bytes() >= 10 * BLOCK, "{}", s.up_bytes());
+        assert_eq!(
+            s.file_up_bytes("srv_18_a"),
+            s.up_bytes(),
+            "the only file has all the bytes"
+        );
+        assert_eq!(s.file_up_bytes("unknown"), 0);
         drop(f);
         let _ = std::fs::remove_dir_all(dir);
     }

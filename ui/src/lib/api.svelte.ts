@@ -122,7 +122,7 @@ function invokeAuthed<T>(cmd: string, args: Record<string, unknown>): Promise<T>
   })
 }
 
-const call = <T>(method: string, path: string, query?: Record<string, unknown>) => invokeAuthed<T>('emby', { method, path, query })
+const call = <T>(method: string, path: string, query?: Record<string, unknown>, body?: unknown) => invokeAuthed<T>('emby', { method, path, query, body })
 
 export function get<T = unknown>(path: string, query: Record<string, unknown> = {}): Promise<T> {
   const key = `${session.server?.id}|${path}|${JSON.stringify(query)}`

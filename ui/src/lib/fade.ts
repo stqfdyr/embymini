@@ -2,7 +2,6 @@
 const CACHED_MS = 50
 
 /** `<img use:fade>`: decode off the main thread and fade in once loaded, only for images that came from the network. */
-
 export function fade(img: HTMLImageElement) {
   img.decoding = 'async'
   if (img.complete && img.naturalWidth) return

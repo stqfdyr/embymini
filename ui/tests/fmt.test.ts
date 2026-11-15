@@ -1,5 +1,6 @@
 // Display formats (src/lib/fmt.ts): durations, years and dates, series badge, tech line resolution tiers, cache usage.
-// Dates are shown in local time; pin the users' zone (UTC+8). Node picks up a TZ change before the first Date use.
+// Dates are shown in local time. Run in the users' zone (UTC+8) where Node honours a runtime TZ change, so a switch to UTC
+// getters fails; expectations come from local-midnight Dates, so a runner that ignores TZ (Windows) still passes.
 process.env.TZ = 'Asia/Shanghai'
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -25,10 +26,9 @@ test('years: ended series as a range, everything else the start year', () => {
   assert.equal(years(it({ EndDate: '2025-03-01T00:00:00.0000000Z' })), '')
 })
 
-test('date: local time, so Beijing midnight stored as T16:00Z is the next day', () => {
-  assert.equal(date('2010-07-14T16:00:00.0000000Z'), '2010年7月15日')
-  assert.equal(date('2010-07-15T00:00:00.0000000Z'), '2010年7月15日')
-  assert.equal(date('2024-12-31T16:00:00.0000000Z'), '2025年1月1日')
+test('date: local time, so local midnight stored in UTC (T16:00Z at UTC+8) keeps its day', () => {
+  assert.equal(date(new Date(2010, 6, 15).toISOString()), '2010年7月15日')
+  assert.equal(date(new Date(2025, 0, 1).toISOString()), '2025年1月1日')
   assert.equal(date(), '')
 })
 

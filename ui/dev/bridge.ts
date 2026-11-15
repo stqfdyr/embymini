@@ -41,6 +41,8 @@ function readJson(req: IncomingMessage): Promise<Record<string, any>> {
 
 export function devBridge(): Plugin {
   let session: Promise<Session> | null = null
+  // A failed sign-in (upstream 502…) is not cached: the next request retries without restarting vite
+  const signIn = () => (session ??= login().catch((e) => ((session = null), Promise.reject(e))))
   return {
     name: 'embymini-dev-bridge',
     apply: 'serve',
@@ -52,9 +54,8 @@ export function devBridge(): Plugin {
           res.end(JSON.stringify(v ?? null))
         }
         try {
-          // A failed sign-in (upstream 502…) is not cached: the next request retries without restarting vite
-          session ??= login().catch((e) => ((session = null), Promise.reject(e)))
-          const s = await session
+          const mine = signIn()
+          const s = await mine
           const args = await readJson(req)
           const cmd = (req.url ?? '').replace(/^\//, '')
           if (cmd === 'config_get') {
@@ -66,13 +67,19 @@ export function devBridge(): Plugin {
           if (cmd === 'emby') {
             const q = new URLSearchParams()
             for (const [k, v] of Object.entries(args.query ?? {})) if (v != null) q.set(k, String(v))
-            const r = await fetch(`${s.base}${args.path}${q.size ? `?${q}` : ''}`, {
-              method: args.method,
-              headers: { 'User-Agent': UA, 'X-Emby-Authorization': auth(s.userId, s.token), 'X-Emby-Token': s.token, 'Content-Type': 'application/json' },
-              body: args.body ? JSON.stringify(args.body) : undefined,
-            })
+            const forward = (t: Session) =>
+              fetch(`${t.base}${args.path}${q.size ? `?${q}` : ''}`, {
+                method: args.method,
+                headers: { 'User-Agent': UA, 'X-Emby-Authorization': auth(t.userId, t.token), 'X-Emby-Token': t.token, 'Content-Type': 'application/json' },
+                body: args.body ? JSON.stringify(args.body) : undefined,
+              })
+            let r = await forward(s)
+            if (r.status === 401) {
+              // Token expired: sign in again (unless another request already did) and retry once
+              if (session === mine) session = null
+              r = await forward(await signIn())
+            }
             const text = await r.text()
-            if (r.status === 401) session = null // token expired: sign in again on the next request
             if (!r.ok) return reply(500, { kind: r.status === 401 ? 'unauthorized' : 'status', message: `服务器返回 ${r.status}：${text.slice(0, 200)}` })
             return reply(200, text ? JSON.parse(text) : null)
           }

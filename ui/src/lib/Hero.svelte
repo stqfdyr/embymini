@@ -1,5 +1,5 @@
-<!-- 首页顶部轮播：背景图 + Logo（没有或取不到就显示标题）+ 简介 + 圆点，8 秒切换，鼠标停在上面时暂停。
-     整块点击进详情；悬停出左右箭头，箭头和圆点只切换不跳转。切换前预加载下一张背景图。 -->
+<!-- Home carousel: backdrop, logo (title when missing or failed), overview and dots; rotates, paused while hovered.
+     A click anywhere opens the detail page; the hover arrows and the dots only switch. The next backdrop is preloaded. -->
 <script lang="ts">
   import { ChevronLeft, ChevronRight } from '@lucide/svelte'
   import { img } from './api.svelte'
@@ -8,6 +8,8 @@
   import { go } from './router.svelte'
   import type { Item } from './types'
 
+  const ROTATE_MS = 8000
+
   let { items }: { items: Item[] } = $props()
   let i = $state(0)
   let hold = $state(false)
@@ -15,17 +17,18 @@
   const cur = $derived(items[i % n])
   const bg = (it?: Item) => (it ? img(it.Id, 'Backdrop', it.BackdropImageTags?.[0], 1600) : '')
   const logo = $derived(img(cur?.Id, 'Logo', cur?.ImageTags?.Logo, 420))
-  // 这一页没取到的 Logo 地址。只记到切走为止：转回来再试一次（上游 404 后端记着，不再打上游；网络出错的恢复后能出图）
+  // Logo URL that failed on this slide, remembered only until it changes: coming back retries (the backend remembers
+  // upstream 404s, so that costs no upstream request; a network error can recover)
   let badLogo = $state('')
   const show = (k: number) => ((i = (k + n) % n), (badLogo = ''))
   const step = (d: number) => show(i + d)
 
   $effect(() => {
     if (items.length < 2 || hold) return
-    const t = setInterval(() => step(1), 8000)
+    const t = setInterval(() => step(1), ROTATE_MS)
     return () => clearInterval(t)
   })
-  // 下一张提前进 HTTP 缓存，切过去时直接从缓存出图
+  // Warm the cache with the next backdrop so switching shows it at once
   $effect(() => {
     const next = bg(items[(i + 1) % n])
     if (next) new Image().src = next
@@ -40,7 +43,7 @@
     {/key}
     <div class="scrim"></div>
     <div class="info">
-      <!-- 换图就换元素：上一张晚到的 error 不会算到这一张头上 -->
+      <!-- A new element per URL, so a late error from the previous logo cannot hit this one -->
       {#key logo}
         {#if logo && badLogo !== logo}
           <img class="logo" src={logo} alt={cur.Name} onerror={() => (badLogo = logo)} />
@@ -66,7 +69,7 @@
 <style>
   .hero { position: relative; height: min(58vh, 600px); margin-top: calc(-1 * var(--bar-h) - 8px); overflow: hidden; cursor: pointer; }
   .bg { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-  /* 渐变遮罩叠在图上（比 mask-image 便宜），底部融进页面底色 */
+  /* A gradient overlay (cheaper than mask-image) fades the image into the page background */
   .scrim { position: absolute; inset: 0; background: var(--scrim); }
   .info {
     position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%); width: min(920px, 88%);
@@ -76,7 +79,7 @@
   .title { font-size: 36px; font-weight: 700; letter-spacing: -0.02em; }
   .meta { font-size: 13px; color: var(--text-2); }
   .ov { margin: 0; font-size: 14px; line-height: 1.6; }
-  /* 箭头同横滑行：悬停才出现的圆形按钮 */
+  /* Arrows as in Row: round buttons shown on hover */
   .arrow {
     position: absolute; top: 50%; margin-top: -16px; z-index: 2; color: var(--text);
     opacity: 0; transition: opacity 0.15s;

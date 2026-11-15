@@ -1,4 +1,4 @@
-<!-- 搜索：输入停顿 250ms 后查询；离开再回来保留关键词和结果。Esc 清空。 -->
+<!-- Search: queries once typing pauses for 250 ms; the term and results survive leaving the page. Esc clears. -->
 <script module lang="ts">
   let keep = $state({ q: '' })
 </script>
@@ -6,7 +6,8 @@
 <script lang="ts">
   import { Search, X } from '@lucide/svelte'
   import Grid from '../lib/Grid.svelte'
-  import { LIST_FIELDS, errText, get, uid } from '../lib/api.svelte'
+  import LoadError from '../lib/LoadError.svelte'
+  import { LIST_FIELDS, get, session, uid } from '../lib/api.svelte'
   import type { Page } from '../lib/types'
 
   let q = $state(keep.q)
@@ -20,7 +21,8 @@
   })
   $effect(() => input.focus())
   const result = $derived(
-    term ? get<Page>(`/Users/${uid()}/Items`, { Recursive: true, SearchTerm: term, IncludeItemTypes: 'Movie,Series', Limit: 60, Fields: LIST_FIELDS }) : null,
+    // Reads session.refresh so the retry button (a refresh) queries again; failed requests are not cached
+    (void session.refresh, term) ? get<Page>(`/Users/${uid()}/Items`, { Recursive: true, SearchTerm: term, IncludeItemTypes: 'Movie,Series', Limit: 60, Fields: LIST_FIELDS }) : null,
   )
 </script>
 
@@ -36,7 +38,7 @@
     {:then r}
       {#if r.Items.length}<Grid items={r.Items} />{:else}<div class="center-msg">没有找到「{term}」</div>{/if}
     {:catch e}
-      <div class="center-msg">搜索失败：{errText(e)}</div>
+      <LoadError error={e} what="搜索失败" />
     {/await}
   {:else}
     <div class="center-msg">输入片名搜索电影和剧集</div>

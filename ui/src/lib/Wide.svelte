@@ -1,6 +1,8 @@
-<!-- 横版卡（16:9）：继续观看、单集、媒体库共用。点图片 onplay（悬停出播放键），点文字 href，点简介 ondesc。 -->
+<!-- 16:9 card for continue watching, episodes and libraries. The image runs `onplay` (play button on hover), the text
+     follows `href`, the overview runs `ondesc`. -->
 <script lang="ts">
   import { Check, Play } from '@lucide/svelte'
+  import { cancelPrefetch } from './api.svelte'
   import { fade } from './fade'
 
   let {
@@ -14,7 +16,7 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="wide" style:width={`${width}px`} oncontextmenu={onmenu} onpointerenter={onhover}>
+<div class="wide" style:width={`${width}px`} oncontextmenu={onmenu} onpointerenter={onhover} onpointerleave={onhover ? cancelPrefetch : undefined}>
   {#snippet art()}
     {#if src}<img {src} alt="" loading="lazy" use:fade />{/if}
     {#if played}<span class="badge"><Check size={12} strokeWidth={3} /></span>{/if}
@@ -48,7 +50,7 @@
   .art:active { transform: scale(0.98); }
   .badge {
     position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; border-radius: 50%;
-    background: var(--accent); color: #fff; display: grid; place-items: center;
+    background: var(--accent); color: var(--accent-text); display: grid; place-items: center;
   }
   .corner {
     position: absolute; right: 6px; bottom: 8px; padding: 1px 6px; border-radius: 4px;
@@ -56,7 +58,7 @@
   }
   .bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255, 255, 255, 0.3); }
   .bar i { display: block; height: 100%; background: var(--accent); }
-  /* 悬停时中间出现播放键 */
+  /* Play button in the middle on hover */
   .play {
     position: absolute; left: 50%; top: 50%; width: 44px; height: 44px; margin: -22px 0 0 -22px; border-radius: 50%;
     display: grid; place-items: center; color: #fff; background: rgba(0, 0, 0, 0.5);
@@ -67,7 +69,7 @@
   .text { display: block; padding: 8px 2px 0; }
   .name { font-size: 13px; font-weight: 500; }
   .sub { font-size: 12px; color: var(--text-2); margin-top: 1px; }
-  /* 不写 display：要用 .clamp-3 的 -webkit-box 截成三行 */
+  /* No display here: .clamp-3 needs its -webkit-box to cut at three lines */
   .desc { width: 100%; padding: 0 2px; text-align: left; font-size: 12px; color: var(--text-2); margin-top: 4px; line-height: 1.5; }
   button.desc:hover { color: var(--text); }
 </style>

@@ -1,8 +1,9 @@
-<!-- 媒体库：海报网格，滚到底加载下一页；排序 + 只看未看（服务端过滤，总数才准）。 -->
+<!-- Library: poster grid paged as it scrolls; sort plus unplayed-only (filtered server-side so the total is right). -->
 <script lang="ts">
   import Dropdown from '../lib/Dropdown.svelte'
   import Grid from '../lib/Grid.svelte'
-  import { LIST_FIELDS, get, pager, uid } from '../lib/api.svelte'
+  import LoadError from '../lib/LoadError.svelte'
+  import { LIST_FIELDS, get, loader, pager, peek, uid } from '../lib/api.svelte'
   import { restoreScrollWhen } from '../lib/router.svelte'
   import type { Item } from '../lib/types'
 
@@ -11,7 +12,7 @@
 
   let sort = $state<keyof typeof SORTS>('DateCreated')
   let unplayed = $state(false)
-  // 换排序、切换「只看未看」、手动刷新：都从第一页重来
+  // A new sort, the unplayed toggle or a manual refresh starts over from page one
   const { s: pg, more } = pager(() => ({
     ParentId: id, Recursive: true, IncludeItemTypes: 'Movie,Series', Fields: LIST_FIELDS,
     SortBy: sort === 'SortName' ? 'SortName' : `${sort},SortName`, SortOrder: sort === 'SortName' ? 'Ascending' : 'Descending',
@@ -19,12 +20,13 @@
   }))
   restoreScrollWhen(() => pg.loaded)
 
-  const view = $derived(get<Item>(`/Users/${uid()}/Items/${id}`))
+  // The name is known from the home page's library list; the request only fills it in when opened some other way
+  const view = loader(() => get<Item>(`/Users/${uid()}/Items/${id}`))
 </script>
 
 <div class="page">
   <div class="page-title">
-    {#await view then v}<h1>{v.Name}</h1>{/await}
+    <h1>{view.data?.Name ?? peek(id)?.Name ?? ''}</h1>
     {#if pg.total}<span class="muted">{pg.total} 部</span>{/if}
     <span class="grow"></span>
     <div class="seg">
@@ -33,7 +35,7 @@
     </div>
     <Dropdown value={sort} items={Object.entries(SORTS).map(([value, label]) => ({ value: value as keyof typeof SORTS, label }))} onselect={(v) => (sort = v)} />
   </div>
-  {#if pg.error}<div class="center-msg">加载失败：{pg.error}</div>{/if}
+  {#if pg.error}<LoadError error={pg.error} retry={more} />{/if}
   <Grid items={pg.items} onmore={more} loading={pg.busy} />
   {#if pg.loaded && !pg.items.length}<div class="center-msg">{unplayed ? '这里都看过了' : '这个媒体库是空的'}</div>{/if}
 </div>

@@ -474,9 +474,9 @@ fn is_updater_leftover(name: &str) -> bool {
     name.starts_with("EmbyMini-") && name.contains("-updater-")
 }
 
-/// Entries of the system temp dir whose name passes `keep`.
-fn temp_entries(keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
-    std::fs::read_dir(std::env::temp_dir())
+/// Entries of `dir` (the system temp dir) whose name passes `keep`.
+fn temp_entries(dir: &std::path::Path, keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -485,36 +485,37 @@ fn temp_entries(keep: impl Fn(&str) -> bool) -> Vec<PathBuf> {
         .collect()
 }
 
-/// "Temporary cache": mpv's shader cache, updater leftovers and the seek-preview image files.
-fn temp_paths(app: &App) -> Vec<PathBuf> {
+/// "Temporary cache": mpv's shader cache, plus updater leftovers and seek-preview images in `tmp`.
+fn temp_paths(app: &App, tmp: &std::path::Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = app.mpv_cache.iter().cloned().collect();
-    v.extend(temp_entries(|n| {
+    v.extend(temp_entries(tmp, |n| {
         is_updater_leftover(n) || n.starts_with("thumbfast.out")
     }));
     v
 }
 
-/// Whether `p` is a real directory; a symlink is not followed (the shared /tmp may hold anyone's links).
-fn is_real_dir(p: &std::path::Path) -> bool {
-    std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
-}
-
-/// Deletes a file, a directory tree or a symlink (only the link itself).
+/// Deletes a file, a directory tree or a symlink. Symlinks are never followed (the shared /tmp may hold
+/// anyone's links): only the link goes.
 fn remove_path(p: &std::path::Path) {
-    let _ = if is_real_dir(p) {
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    let _ = if m.is_dir() {
         std::fs::remove_dir_all(p)
-    } else {
+    } else if m.is_symlink() {
         // A directory symlink on Windows only goes with remove_dir.
         std::fs::remove_file(p).or_else(|_| std::fs::remove_dir(p))
+    } else {
+        std::fs::remove_file(p)
     };
 }
 
 /// Bytes under `p`; a symlink counts as its own size, not its target's.
 fn path_size(p: &std::path::Path) -> u64 {
-    if is_real_dir(p) {
-        stream::dir_size(p)
-    } else {
-        std::fs::symlink_metadata(p).map_or(0, |m| m.len())
+    match std::fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => stream::dir_size(p),
+        Ok(m) => m.len(),
+        Err(_) => 0,
     }
 }
 
@@ -524,7 +525,10 @@ fn cache_info_now(app: &App) -> CacheInfo {
         video,
         images: app.images.usage(),
         subs: subs + stream::dir_size(&app.danmaku_dir),
-        temp: temp_paths(app).iter().map(|p| path_size(p)).sum(),
+        temp: temp_paths(app, &std::env::temp_dir())
+            .iter()
+            .map(|p| path_size(p))
+            .sum(),
         playing: app.playing(),
     }
 }
@@ -546,7 +550,7 @@ fn cache_clear_now(app: &App, kind: Clear) -> CacheInfo {
         app.images.clear();
     }
     if kind.covers(Clear::Temp) {
-        for p in temp_paths(app) {
+        for p in temp_paths(app, &std::env::temp_dir()) {
             remove_path(&p);
         }
     }
@@ -823,7 +827,7 @@ fn main() {
             tauri::async_runtime::spawn(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let _ = tauri::async_runtime::spawn_blocking(|| {
-                    for p in temp_entries(is_updater_leftover) {
+                    for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
                         remove_path(&p);
                     }
                 })
@@ -986,23 +990,19 @@ mod tests {
     /// Temp cache = mpv's cache dir + updater leftovers + thumbfast images; other temp entries are left alone.
     #[test]
     fn temp_paths_pick_our_leftovers() {
-        let tmp = std::env::temp_dir();
-        let id = std::process::id();
-        let upd = tmp.join(format!("EmbyMini-0.0.0-updater-test{id}"));
-        let thumb = tmp.join(format!("thumbfast.out-test{id}"));
-        let other = tmp.join(format!("embymini-other-test{id}"));
+        let tmp = std::env::temp_dir().join(format!("embymini-temp-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let upd = tmp.join("EmbyMini-0.0.0-updater-abc");
+        let thumb = tmp.join("thumbfast.out.tmp");
         std::fs::create_dir_all(&upd).unwrap();
         std::fs::write(&thumb, "").unwrap();
-        std::fs::write(&other, "").unwrap();
+        std::fs::write(tmp.join("other"), "").unwrap();
         let mut app = test_app(None);
         app.mpv_cache = Some(PathBuf::from("mpv-cache"));
-        let v = temp_paths(&app);
-        for p in [&upd, &thumb, &other] {
-            remove_path(p);
-        }
-        assert_eq!(v[0], PathBuf::from("mpv-cache"));
-        assert!(v.contains(&upd) && v.contains(&thumb), "{v:?}");
-        assert!(!v.contains(&other));
+        let mut v = temp_paths(&app, &tmp);
+        std::fs::remove_dir_all(&tmp).unwrap();
+        v[1..].sort();
+        assert_eq!(v, [PathBuf::from("mpv-cache"), upd, thumb]);
     }
 
     /// A symlink in the shared temp dir is neither followed when sized nor when deleted.

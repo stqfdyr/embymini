@@ -28,14 +28,29 @@ pub(crate) struct UpdateInfo {
     notes: String,
 }
 
-/// Logs and words an updater error; network failures read like the Emby ones ([`crate::emby::net`]).
-fn fail(what: &str, e: &tauri_plugin_updater::Error) -> Error {
-    log::warn!("{what}：{e}");
-    let reason = match e {
-        tauri_plugin_updater::Error::Reqwest(r) => crate::emby::net(r).to_string(),
+const CHECK_FAILED: &str = "检查更新失败";
+const INSTALL_FAILED: &str = "更新失败";
+
+/// Why an updater call failed, in words: connection failures read like the Emby ones ([`crate::emby::net`]);
+/// a bad reply (decode) or a bad proxy (builder) keeps reqwest's own text.
+fn reason(e: &tauri_plugin_updater::Error) -> String {
+    use tauri_plugin_updater::Error as U;
+    match e {
+        U::Reqwest(r) if !r.is_decode() && !r.is_builder() => crate::emby::net(r).to_string(),
+        // The check got a non-2xx reply (GitHub rate limit, 404).
+        U::ReleaseNotFound => "取不到版本信息（服务器拒绝或限流），稍后再试".into(),
+        // The download got a non-2xx reply.
+        U::Network(s) => format!("下载安装包被拒绝（{s}）"),
         e => e.to_string(),
-    };
-    Error::Other(format!("{what}：{reason}"))
+    }
+}
+
+/// Maps an updater error to `<what>：<reason>` and logs it.
+fn fail(what: &'static str) -> impl Fn(tauri_plugin_updater::Error) -> Error {
+    move |e| {
+        log::warn!("{what}：{e}");
+        Error::Other(format!("{what}：{}", reason(&e)))
+    }
 }
 
 /// Download progress: emitted only when the percent (MB when the size is unknown) changes, not per chunk.
@@ -56,13 +71,17 @@ impl Progress {
 
 /// Updater for the check and the download: through the update proxy if set, else the system proxy (the plugin
 /// builds a fresh HTTP client each time, so it reads the current system setting, unlike the Emby client).
-fn updater(handle: &AppHandle, app: &App) -> Result<tauri_plugin_updater::Updater, Error> {
+fn updater(
+    handle: &AppHandle,
+    app: &App,
+    what: &'static str,
+) -> Result<tauri_plugin_updater::Updater, Error> {
     // A 40 MB package must finish over a slow proxy; an unreachable host still fails fast.
     let mut b = handle.updater_builder().timeout(Duration::from_secs(900));
     if let Some(p) = app.cfg().update_proxy.clone() {
         b = b.proxy(proxy_url(&p)?);
     }
-    b.build().map_err(|e| fail("检查更新失败", &e))
+    b.build().map_err(fail(what))
 }
 
 /// Version and notes when a newer release exists (`latest.json` of the latest Release).
@@ -71,10 +90,10 @@ pub(crate) async fn update_check(
     handle: AppHandle,
     app: State<'_, App>,
 ) -> Result<Option<UpdateInfo>, Error> {
-    let u = updater(&handle, &app)?
+    let u = updater(&handle, &app, CHECK_FAILED)?
         .check()
         .await
-        .map_err(|e| fail("检查更新失败", &e))?;
+        .map_err(fail(CHECK_FAILED))?;
     Ok(u.map(|u| UpdateInfo {
         version: u.version,
         notes: u.body.unwrap_or_default(),
@@ -86,11 +105,10 @@ pub(crate) async fn update_check(
 /// and reopens the program when done.
 #[tauri::command]
 pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Result<(), Error> {
-    let fail = |e: tauri_plugin_updater::Error| fail("更新失败", &e);
-    let u = updater(&handle, &app)?
+    let u = updater(&handle, &app, INSTALL_FAILED)?
         .check()
         .await
-        .map_err(fail)?
+        .map_err(fail(INSTALL_FAILED))?
         .ok_or_else(|| Error::Other("已是最新版本".into()))?;
     log::info!("下载新版本 {}", u.version);
     let mut progress = Progress::default();
@@ -104,7 +122,7 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
             || {},
         )
         .await
-        .map_err(fail)?;
+        .map_err(fail(INSTALL_FAILED))?;
     log::info!("启动安装器，程序退出");
     // The installer ends the process without RunEvent::Exit, so close the player first. `shutdown` uses
     // block_on, which panics inside an async command: the command would never return (stuck at 100%).
@@ -121,7 +139,7 @@ pub(crate) async fn update_install(handle: AppHandle, app: State<'_, App>) -> Re
         crate::set_running(root, true);
         // The program stays in use: clear the quit flag, or every later play is dropped as "quitting".
         app.quit.send_replace(false);
-        return Err(fail(e));
+        return Err(fail(INSTALL_FAILED)(e));
     }
     handle.restart()
 }
@@ -168,5 +186,16 @@ mod tests {
         assert_eq!(p.advance(1 << 20, None), Some(1 << 20));
         assert_eq!(p.advance(5, None), None);
         assert_eq!(p.advance(1 << 20, None), Some((2 << 20) + 5));
+    }
+
+    #[test]
+    fn http_refusals_are_worded() {
+        use tauri_plugin_updater::Error as U;
+        assert!(reason(&U::ReleaseNotFound).starts_with("取不到版本信息"));
+        assert_eq!(
+            reason(&U::Network("status: 404".into())),
+            "下载安装包被拒绝（status: 404）"
+        );
+        assert_eq!(reason(&U::EmptyEndpoints), U::EmptyEndpoints.to_string());
     }
 }

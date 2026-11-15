@@ -802,8 +802,9 @@ struct Dm {
 enum DmMsg {
     /// (episode index, [`Dm::seq`] of the load, result).
     Loaded(usize, u64, Result<Option<danmaku::Loaded>, DmFail>),
-    /// A reply for the script (name, JSON): search results, an episode list.
-    Reply(&'static str, Value),
+    /// A reply for the script (name, the request's argument, JSON): search results, an episode list.
+    /// The argument goes back so the script can drop a slow reply to an earlier request.
+    Reply(&'static str, String, Value),
 }
 
 struct State {
@@ -1419,7 +1420,11 @@ impl State {
 
     async fn on_dm_result(&mut self, m: DmMsg) {
         let (i, seq, r) = match m {
-            DmMsg::Reply(name, v) => return self.dm_send(name, v).await,
+            DmMsg::Reply(name, arg, v) => {
+                let msg = json!(["script-message-to", "danmaku", name, v.to_string(), arg]);
+                self.send(msg).await;
+                return;
+            }
             DmMsg::Loaded(i, seq, r) => (i, seq, r),
         };
         let Some(d) = &mut self.dm else { return };
@@ -1553,7 +1558,7 @@ impl State {
                 }
             };
             let v = v.unwrap_or_else(|e| json!({ "error": e.to_string() }));
-            let _ = tx.send(DmMsg::Reply(name, v));
+            let _ = tx.send(DmMsg::Reply(name, arg, v));
         });
     }
 }
@@ -2042,7 +2047,10 @@ mod tests {
             loop {
                 let m = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
                 match m.expect("a reply within 5 s").unwrap() {
-                    DmMsg::Reply(name, v) => return (name, v),
+                    DmMsg::Reply(name, arg, v) => {
+                        assert_eq!(json!(arg), msg[1], "the request's argument goes back");
+                        return (name, v);
+                    }
                     DmMsg::Loaded(..) => {} // the load from switching on
                 }
             }

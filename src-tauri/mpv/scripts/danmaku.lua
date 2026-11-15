@@ -79,6 +79,11 @@ local function bgr(c)
     return string.format("%02X%02X%02X", c % 256, math.floor(c / 256) % 256, math.floor(c / 65536) % 256)
 end
 
+-- ASS 转义：花括号会被当成样式块，反斜杠会被当成转义
+local function ass_escape(s)
+    return (s:gsub("\\", "＼"):gsub("{", "｛"):gsub("}", "｝"))
+end
+
 local function blocked(c)
     if (c.mode == 1 and style.noScroll) or (c.mode == 5 and style.noTop) or (c.mode == 4 and style.noBottom) then
         return true
@@ -117,8 +122,7 @@ local function rebuild()
         else
             item.shown = item.text
         end
-        -- ASS 转义：花括号会被当成样式块，反斜杠会被当成转义
-        item.shown = item.shown:gsub("\\", "＼"):gsub("{", "｛"):gsub("}", "｝")
+        item.shown = ass_escape(item.shown)
         -- 每帧不变的部分（颜色、描边色、文字）先拼好，逐帧只拼位置和字号等样式
         local c = item.color
         local dark = (c % 256 + math.floor(c / 256) % 256 + math.floor(c / 65536)) < 120
@@ -315,6 +319,7 @@ local draw_panel
 
 local function close_panel()
     if not open then return end
+    if drag then save() end                     -- 拖滑块时按 Esc：值已生效，也要存
     open, drag = false, nil
     panel:remove()
     for _, k in ipairs({ "MBTN_LEFT", "MBTN_LEFT_DBL", "ESC" }) do mp.remove_key_binding("dm-panel-" .. k) end
@@ -378,7 +383,7 @@ draw_panel = function()
     local status = src.text ~= "" and src.text or (style.on and "播放后自动匹配弹幕" or "弹幕已关闭")
     if src.kind == "ok" and raw then status = string.format("%s · %d 条", src.text, #raw) end
     local bad = src.kind == "error" or src.kind == "setup"
-    text(out, lx, y + rh / 2, 4, fsz * 0.86, (status:gsub("{", "｛")), bad and "6B8BFF" or "A0A0A0")
+    text(out, lx, y + rh / 2, 4, fsz * 0.86, ass_escape(status), bad and "6B8BFF" or "A0A0A0")
     y = y + rh
     label("屏蔽类型")
     seg({ { "noScroll", "滚动" }, { "noTop", "顶部" }, { "noBottom", "底部" }, { "noColor", "彩色" } },
@@ -484,6 +489,14 @@ mp.observe_property("mouse-pos", "native", function(_, p)
 end)
 
 -- 手动匹配：输入关键词 → 选番剧 / 剧 → 选集，结果由 EmbyMini 记住（同一季之后的集按同样的偏移）
+-- 最后一次查询（"search\n关键词" / "episodes\n剧 id"）：回复带着请求参数回来，对不上的是之前的慢回复，丢掉；换集清空
+local asked = nil
+
+local function lookup(name, arg)
+    asked = name .. "\n" .. arg
+    mp.commandv("script-message", "embymini-danmaku-" .. name, arg)
+end
+
 manual_match = function()
     local title = mp.get_property("media-title", "")
     local kw = title:match("^(.-) S%d+E%d+") or title
@@ -494,13 +507,15 @@ manual_match = function()
             input.terminate()
             if s ~= "" then
                 toast("正在搜索…")
-                mp.commandv("script-message", "embymini-danmaku-search", s)
+                lookup("search", s)
             end
         end,
     })
 end
 
-local function reply(json)
+-- 查询的回复；过期的（不是最后一次查询的）返回 nil，出错的提示后返回 nil
+local function reply(name, json, arg)
+    if asked ~= name .. "\n" .. tostring(arg) then return nil end
     local v = utils.parse_json(json)
     if not v or v.error then
         toast(v and v.error or "搜索失败")
@@ -509,8 +524,9 @@ local function reply(json)
     return v
 end
 
-mp.register_script_message("search", function(json)
-    local v = reply(json)
+mp.register_script_message("search", function(json, arg)
+    local v = reply("search", json, arg)
+    local key = asked
     if not v then return end
     if #v == 0 then return toast("没有搜到，换个关键词试试") end
     local items = {}
@@ -519,12 +535,15 @@ mp.register_script_message("search", function(json)
     input.select({
         prompt = "选择剧集：",
         items = items,
-        submit = function(i) mp.commandv("script-message", "embymini-danmaku-episodes", tostring(v[i].id)) end,
+        submit = function(i)
+            if asked == key then lookup("episodes", tostring(v[i].id)) end
+        end,
     })
 end)
 
-mp.register_script_message("episodes", function(json)
-    local v = reply(json)
+mp.register_script_message("episodes", function(json, arg)
+    local v = reply("episodes", json, arg)
+    local key = asked
     if not v then return end
     if #v.list == 0 then return toast("这部没有分集信息") end
     local items = {}
@@ -534,7 +553,7 @@ mp.register_script_message("episodes", function(json)
         items = items,
         default_item = (v.at or 0) + 1,
         submit = function(i)
-            mp.commandv("script-message", "embymini-danmaku-pick", tostring(v.anime), tostring(i - 1))
+            if asked == key then mp.commandv("script-message", "embymini-danmaku-pick", tostring(v.anime), tostring(i - 1)) end
         end,
     })
 end)
@@ -550,6 +569,8 @@ mp.register_script_message("init", function(json)
     for _, w in ipairs(v.words or {}) do words[#words + 1] = w:lower() end
     mp.commandv("script-message", "embymini-danmaku-on", style.on and "yes" or "no")
     after("rebuild")
+    publish()
+    draw_panel()
 end)
 
 -- status {kind, text, toast, item, start}：加载中、没匹配上、出错、没填接口。start = 这一集的第一条（记下 item）
@@ -593,7 +614,7 @@ mp.register_script_message("panel", open_panel)
 
 -- mpv 状态 ---------------------------------------------------------------------------------------------------
 mp.register_event("start-file", function()
-    raw, list, active, offset, want = nil, {}, {}, 0, nil
+    raw, list, active, offset, want, asked = nil, {}, {}, 0, nil, nil
     src = { kind = "idle", text = "" }
     publish()
     close_panel()

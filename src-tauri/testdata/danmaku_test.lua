@@ -3,7 +3,7 @@
 local utils = require "mp.utils"
 local real = mp
 
-local fake = { time = 100, props = {}, handlers = {}, events = {}, observers = {}, overlays = {}, sent = {}, bindings = {} }
+local fake = { time = 100, props = { ["cursor-autohide"] = "1000" }, handlers = {}, events = {}, observers = {}, overlays = {}, sent = {}, bindings = {} }
 local m = { msg = { verbose = function() end } }
 function m.get_time() return fake.time end
 function m.get_property(k, d) local v = fake.props[k]; if v == nil then return d end return v end
@@ -150,6 +150,51 @@ local function run()
     check(state().count == 8, "load for another item dropped")
     send("status", { kind = "error", text = "x", item = "B" })
     check(state().kind == "ok", "status for another item dropped")
+
+    -- New blocked words replace the old ones at once and reach user-data (both 哈哈 out, the spoiler back)
+    send("init", { style = {}, words = { "哈哈" } })
+    check(state().shown == 4, "init re-filters and republishes, shown " .. state().shown)
+
+    -- A slider drag ended by Esc is still saved
+    fake.handlers.panel()
+    local pct = find(panel(), "80%")
+    check(pct ~= nil, "opacity value shown")
+    fake.observers["mouse-pos"](nil, { x = pct.x - 150, y = pct.y })
+    fake.sent = {}
+    fake.bindings["dm-panel-MBTN_LEFT"]({ event = "down" })
+    fake.bindings["dm-panel-ESC"]()
+    local saved = sent("embymini-danmaku-style")
+    check(#saved == 1 and utils.parse_json(saved[1][3]).opacity == 0.6, "drag ended by Esc saved")
+    check(fake.bindings["dm-panel-MBTN_LEFT"] == nil and fake.props["cursor-autohide"] ~= "no", "panel bindings undone")
+
+    -- Panel status text is escaped like the danmaku
+    fake.handlers.panel()
+    send("status", { kind = "error", text = "坏\\N}", item = "A" })
+    check(find(panel(), "坏＼N｝") ~= nil, "status text escaped")
+
+    -- Manual match: only the reply to the latest lookup counts, and nothing from before an episode change
+    for _, kw in ipairs({ "旧", "新" }) do
+        if not fake.bindings["dm-panel-ESC"] then fake.handlers.panel() end
+        click("手动匹配")
+        fake.input.submit(kw)
+    end
+    check(#sent("embymini-danmaku-search") == 2, "two searches sent")
+    fake.select = nil
+    send("search", { { id = 1, title = "旧剧", count = 3 } }, "旧")
+    check(fake.select == nil, "stale search reply dropped")
+    send("search", { { id = 2, title = "新剧", count = 3 } }, "新")
+    check(fake.select and fake.select.items[1] == "新剧（3 集）", "latest search reply shown")
+    fake.select.submit(1)
+    local eps = sent("embymini-danmaku-episodes")
+    check(#eps == 1 and eps[1][3] == "2", "episodes asked for the chosen show")
+    send("episodes", { anime = 2, list = { { title = "第 1 集" }, { title = "第 2 集" } }, at = 1 }, "2")
+    check(fake.select.default_item == 2, "expected episode preselected")
+    local pick = fake.select
+    fake.events["start-file"]()
+    pick.submit(2)
+    check(#sent("embymini-danmaku-pick") == 0, "pick from before an episode change dropped")
+    send("search", { { id = 3, title = "迟到", count = 1 } }, "新")
+    check(fake.select == pick, "reply from before an episode change dropped")
 end
 
 local ok, err = pcall(function()

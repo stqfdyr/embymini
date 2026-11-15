@@ -11,7 +11,11 @@ export function clock(ticks = 0) {
   return h ? `${p(h)}:${p(m)}:${p(sec)}` : `${p(m)}:${p(sec)}`
 }
 
-export const minutes = (ticks = 0) => `${Math.round(ticks / TICKS_PER_SEC / 60)}分钟`
+/** Runtime in minutes; empty when unknown or under half a minute, so the meta line skips it. */
+export function minutes(ticks = 0) {
+  const m = Math.round(ticks / TICKS_PER_SEC / 60)
+  return m ? `${m}分钟` : ''
+}
 
 /** Year; an ended series shows `2015 - 2025`.
  *  Local time on purpose (also in `date`): scrapers often store Beijing midnight as `T16:00:00Z`, so UTC would be a day early. */

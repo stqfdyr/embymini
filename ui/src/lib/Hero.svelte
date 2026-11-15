@@ -2,7 +2,7 @@
      A click anywhere opens the detail page; the hover arrows and the dots only switch. The next backdrop is preloaded. -->
 <script lang="ts">
   import { ChevronLeft, ChevronRight } from '@lucide/svelte'
-  import { img } from './api.svelte'
+  import { BACKDROP_W, img } from './api.svelte'
   import { fade } from './fade'
   import { years } from './fmt'
   import { go } from './router.svelte'
@@ -15,7 +15,7 @@
   let hold = $state(false)
   const n = $derived(Math.max(items.length, 1))
   const cur = $derived(items[i % n])
-  const bg = (it?: Item) => (it ? img(it.Id, 'Backdrop', it.BackdropImageTags?.[0], 1600) : '')
+  const bg = (it?: Item) => (it ? img(it.Id, 'Backdrop', it.BackdropImageTags?.[0], BACKDROP_W) : '')
   const logo = $derived(img(cur?.Id, 'Logo', cur?.ImageTags?.Logo, 420))
   // Logo URL that failed on this slide, remembered only until it changes: coming back retries (the backend remembers
   // upstream 404s, so that costs no upstream request; a network error can recover)

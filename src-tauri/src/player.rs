@@ -3084,15 +3084,14 @@ mod tests {
         assert!(line.contains(emby::UA), "UA 被个人配置改掉了：{line}");
     }
 
-    /// The danmaku script (layout, merging, escaping, panel, message handling) inside a real mpv against a fake `mp`:
-    /// `testdata/danmaku_test.lua` loads `mpv/scripts/danmaku.lua` (path in `EMBYMINI_DMTEST_SRC`), drives it and quits
-    /// with 1 on any failed check.
-    #[test]
-    #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
-    fn danmaku_script() {
+    /// Runs `testdata/<script>_test.lua` in a real mpv; it loads `mpv/scripts/<script>.lua` (path in
+    /// `EMBYMINI_LUATEST_SRC`) against a fake `mp`, drives it and quits with 1 on any failed check.
+    fn lua_harness(script: &str) {
+        let harness = format!("{script}_test");
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mpv = test_mpv(&dir.join("mpv"));
-        let log = std::env::temp_dir().join(format!("embymini-dmtest-{}.log", std::process::id()));
+        let log =
+            std::env::temp_dir().join(format!("embymini-{harness}-{}.log", std::process::id()));
         let mut child = std::process::Command::new(&mpv)
             .args([
                 "--no-config",
@@ -3103,13 +3102,17 @@ mod tests {
                 &format!("--log-file={}", log.display()),
                 &format!(
                     "--script={}",
-                    dir.join("testdata").join("danmaku_test.lua").display()
+                    dir.join("testdata")
+                        .join(format!("{harness}.lua"))
+                        .display()
                 ),
             ])
             // An environment variable, not --script-opts: that list splits at commas in the path
             .env(
-                "EMBYMINI_DMTEST_SRC",
-                dir.join("mpv").join("scripts").join("danmaku.lua"),
+                "EMBYMINI_LUATEST_SRC",
+                dir.join("mpv")
+                    .join("scripts")
+                    .join(format!("{script}.lua")),
             )
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -3130,14 +3133,29 @@ mod tests {
         };
         let text = std::fs::read_to_string(&log).unwrap_or_default();
         let _ = std::fs::remove_file(&log);
+        let tag = format!("][i][{harness}]");
         let lines: Vec<_> = text
             .lines()
-            .filter(|l| l.contains("][i][danmaku_test]") || l.contains("][e]["))
+            .filter(|l| l.contains(&tag) || l.contains("][e]["))
             .collect();
         assert!(
             status.is_some_and(|s| s.success()),
             "{status:?}\n{lines:#?}"
         );
+    }
+
+    /// The danmaku script: layout, merging, escaping, panel, message handling.
+    #[test]
+    #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
+    fn danmaku_script() {
+        lua_harness("danmaku");
+    }
+
+    /// The episode menu (index in and out, current episode not resent) and the cursor kept visible while paused.
+    #[test]
+    #[cfg_attr(not(windows), ignore = "需要 PATH 里的 mpv；Windows CI 上默认运行")]
+    fn embymini_script() {
+        lua_harness("embymini");
     }
 
     /// Copies the bundled config directory to `to` (as if installed elsewhere).

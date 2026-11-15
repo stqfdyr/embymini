@@ -1,5 +1,5 @@
 -- Runs mpv/scripts/danmaku.lua against a fake `mp` and checks what it draws and sends.
--- Started by the player test `danmaku_script` (script path in EMBYMINI_DMTEST_SRC); quits mpv with 0 on success.
+-- Started by the player test `danmaku_script` (script path in EMBYMINI_LUATEST_SRC); quits mpv with 0 on success.
 local utils = require "mp.utils"
 local real = mp
 
@@ -233,7 +233,7 @@ local function run()
 end
 
 local ok, err = pcall(function()
-    local chunk = assert(loadfile(os.getenv("EMBYMINI_DMTEST_SRC"), "t", env))
+    local chunk = assert(loadfile(os.getenv("EMBYMINI_LUATEST_SRC"), "t", env))
     chunk()
     run()
 end)

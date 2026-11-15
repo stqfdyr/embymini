@@ -1,11 +1,11 @@
--- EmbyMini 选集菜单：EmbyMini 每次换集时下发整季集名，这里只负责显示，选中后把下标回传给 EmbyMini。
--- 不用 mpv 自带的播放列表菜单：还没播过的条目在那里显示成直链 URL，而且列表里只有已加载的几集。
--- 另外：暂停时光标不自动隐藏（控制栏暂停时常显，见 modernz.conf 的 keeponpause），继续播放后恢复原设置。
+-- EmbyMini episode menu: EmbyMini sends the season's episode names on every switch; this only shows them and sends
+-- the picked index back. mpv's own playlist menu shows unplayed entries as stream URLs and only has loaded episodes.
+-- Also keeps the cursor visible while paused (the controls stay too, keeponpause in modernz.conf).
 local input = require "mp.input"
 local utils = require "mp.utils"
 local titles, cur = {}, 1
 
-local autohide -- 暂停前的 cursor-autohide（个人配置可能改过，不写死）
+local autohide -- cursor-autohide before the pause (a personal config may have changed it)
 mp.observe_property("pause", "bool", function(_, paused)
     if paused then
         autohide = autohide or mp.get_property("cursor-autohide")
@@ -16,6 +16,7 @@ mp.observe_property("pause", "bool", function(_, paused)
     end
 end)
 
+-- `at` is EmbyMini's 0-based queue index
 mp.register_script_message("episodes", function(json, at)
     titles = utils.parse_json(json) or {}
     cur = (tonumber(at) or 0) + 1

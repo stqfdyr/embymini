@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::poster::Key;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// 2:3 poster
     Poster,
@@ -235,11 +235,19 @@ async fn emby(base: &str, user: &str, pass: &str) -> Result<Vec<Row>> {
         )
     });
     for (v, items) in views.iter().zip(futures_join(latest).await) {
+        // One broken library should not take the whole page down
+        let items = match items {
+            Ok(items) => items,
+            Err(e) => {
+                log::warn!("latest in {}: {e:#}", v.name);
+                continue;
+            }
+        };
         rows.push(Row {
             id: format!("latest-{}", v.id).into(),
             title: format!("最新 {}", v.name).into(),
             kind: Kind::Poster,
-            cards: items?
+            cards: items
                 .into_iter()
                 .map(|i| card(base, i, Kind::Poster))
                 .collect(),

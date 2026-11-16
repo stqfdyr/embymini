@@ -75,6 +75,7 @@ jobs:
         timeout-minutes: 5
         run: |
           $p = Start-Process target\release\embymini.exe -ArgumentList '--fake', '--bench', "$PWD\out\bench.json" -PassThru -RedirectStandardError out\bench.log
+          $null = $p.Handle  # without it ExitCode stays empty after the process exits
           if (-not $p.WaitForExit(180000)) { Stop-Process $p.Id; throw "测速超时" }
           Get-Content out\bench.log
           if (-not (Test-Path out\bench.json)) { throw "没有生成 bench.json（退出码 $($p.ExitCode)）" }
@@ -83,6 +84,7 @@ jobs:
         run: |
           . ./.github/scripts/measure.ps1
           $p = Start-Process target\release\embymini.exe -ArgumentList '--fake' -PassThru
+          $null = $p.Handle
           Start-Sleep 15
           Save-Screen out\gpui.png
           Get-Memory 'embymini' | ConvertTo-Json | Set-Content out\mem-gpui.json
@@ -94,7 +96,11 @@ jobs:
         run: |
           # Preinstalled on the runner image; install only when missing
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          if (-not (Test-Path $iscc)) {
+            # The script and its translation are for 6.x; Chocolatey's latest may be 7
+            choco install innosetup --version 6.7.1 -y --no-progress | Out-Null
+            if ($LASTEXITCODE) { throw "安装 Inno Setup 6 失败" }
+          }
           $ver = (Select-String -Path crates\app\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           & $iscc "/DAppVersion=$ver" packaging\windows\embymini.iss
           if ($LASTEXITCODE) { throw "ISCC 失败" }
@@ -106,10 +112,12 @@ jobs:
           $setup = Get-ChildItem target\installer\*-setup.exe | Select-Object -First 1
           Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
           $dir = "$env:LOCALAPPDATA\Programs\EmbyMini"
+          # Only the mpv config is packaged for now (the spike does not play); mpv.exe is fetched once playback lands
           foreach ($f in 'embymini.exe', 'mpv\mpv.conf', 'unins000.exe') {
             if (-not (Test-Path "$dir\$f")) { throw "安装后缺少 $dir\$f" }
           }
           $p = Start-Process "$dir\embymini.exe" -ArgumentList '--fake' -PassThru
+          $null = $p.Handle
           Start-Sleep 10
           Save-Screen out\installed.png
           if ($p.HasExited) { throw "安装后启动即退出（退出码 $($p.ExitCode)）" }

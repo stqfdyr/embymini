@@ -94,12 +94,16 @@ impl Render for Home {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(b) = &mut self.bench {
             let total = match &self.state {
+                // GPUI loads each (key, size) once, so a backdrop shared by two cards in a row counts once
                 State::Ready(rows) => rows
                     .iter()
-                    .flat_map(|r| &r.cards)
-                    .filter(|c| c.image.is_some())
-                    .count(),
-                _ => usize::MAX,
+                    .flat_map(|r| r.cards.iter().map(move |c| (r.kind, c)))
+                    .filter_map(|(kind, c)| Some((kind, c.image.as_ref()?)))
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                // Nothing to wait for: go straight to the scroll phase and write the report
+                State::Failed(_) => 0,
+                State::Loading => usize::MAX,
             };
             if b.step(total, &self.scroll, window) {
                 cx.quit();
@@ -235,7 +239,7 @@ struct Bench {
 /// Scroll speed in logical pixels per frame and how long the scroll phase lasts.
 const SCROLL_STEP: f32 = 12.0;
 const SCROLL_FOR: Duration = Duration::from_secs(8);
-/// Give up waiting for images after this long (a slow server should not hang the bench).
+/// Give up waiting for data and images after this long (a slow server should not hang the bench).
 const IMAGES_TIMEOUT_MS: f64 = 60_000.0;
 
 impl Bench {
@@ -265,7 +269,7 @@ impl Bench {
         if self.images_ms.is_none() {
             let done =
                 poster::LOADED.load(Ordering::Relaxed) + poster::FAILED.load(Ordering::Relaxed);
-            if done >= total || (total != usize::MAX && now_ms > IMAGES_TIMEOUT_MS) {
+            if done >= total || now_ms > IMAGES_TIMEOUT_MS {
                 self.images_ms = Some(now_ms);
                 self.mem_loaded_mb = memory_mb();
                 self._poll = None; // from here on every frame asks for the next one

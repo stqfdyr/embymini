@@ -10,6 +10,8 @@ pub const PAD: f32 = 40.;
 pub const BAR_H: f32 = 52.;
 /// Sidebar width.
 pub const SIDEBAR_W: f32 = 232.;
+/// Width of the collapsed sidebar (icons only).
+pub const RAIL_W: f32 = 64.;
 /// Poster card width in rows; grids stretch it to fill the line.
 pub const POSTER_W: f32 = 156.;
 /// Gap between cards in a row.

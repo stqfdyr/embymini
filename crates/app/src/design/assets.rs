@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         LayoutGrid,
         List,
         MonitorPlay,
+        PanelLeft,
         Moon,
         Music,
         Palette,

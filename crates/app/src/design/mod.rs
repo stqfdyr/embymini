@@ -12,13 +12,18 @@ mod ui;
 use std::{path::PathBuf, rc::Rc};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::{Theme, ThemeMode, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{Theme, ThemeMode, TitleBar, h_flex, tooltip::Tooltip, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use fixture::{Fixture, Item};
-use tokens::{BAR_H, SIDEBAR_W, T};
+use tokens::{BAR_H, RAIL_W, SIDEBAR_W, T};
 use ui::{ghost_button, icon, medium, semibold, text};
+
+actions!(design, [ToggleSidebar]);
+
+/// Below this window width the sidebar starts out as an icon rail (until the user toggles it).
+const AUTO_RAIL_BELOW: f32 = 1200.;
 
 #[derive(Clone)]
 pub enum Page {
@@ -29,6 +34,15 @@ pub enum Page {
     Library(usize),
     Detail(Rc<Item>),
     Settings,
+}
+
+/// The page a navigation item leads to is the one shown (detail pages belong to no item).
+fn same_page(a: &Page, b: &Page) -> bool {
+    match (a, b) {
+        (Page::Library(i), Page::Library(j)) => i == j,
+        (Page::Detail(_), _) | (_, Page::Detail(_)) => false,
+        _ => std::mem::discriminant(a) == std::mem::discriminant(b),
+    }
 }
 
 pub struct Gallery {
@@ -42,11 +56,38 @@ pub struct Gallery {
     hero: usize,
     settings_tab: usize,
     filter: usize,
+    /// The user's choice; None follows the window width.
+    collapsed: Option<bool>,
+    focus: FocusHandle,
 }
 
 impl Gallery {
+    /// Tokens for the page area: the detail page is always dark (artwork-led, like a cinema), whatever the theme.
     fn t(&self) -> T {
+        T::new(self.dark || matches!(self.page, Page::Detail(_)))
+    }
+
+    /// Tokens for the sidebar, which follows the theme.
+    fn chrome(&self) -> T {
         T::new(self.dark)
+    }
+
+    fn is_rail(&self, window: &Window) -> bool {
+        self.collapsed
+            .unwrap_or_else(|| f32::from(window.viewport_size().width) < AUTO_RAIL_BELOW)
+    }
+
+    fn sidebar_w(&self, window: &Window) -> f32 {
+        if self.is_rail(window) {
+            RAIL_W
+        } else {
+            SIDEBAR_W
+        }
+    }
+
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.collapsed = Some(!self.is_rail(window));
+        cx.notify();
     }
 
     fn go(&mut self, page: Page, cx: &mut Context<Self>) {
@@ -103,35 +144,47 @@ impl Gallery {
         id: impl Into<ElementId>,
         ic: IconName,
         label: impl Into<SharedString>,
-        on: bool,
         page: Page,
+        rail: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let t = self.t();
+        let t = self.chrome();
+        let on = same_page(&self.page, &page);
+        let label: SharedString = label.into();
         h_flex()
             .id(id)
-            .h(px(34.))
-            .px(px(10.))
-            .gap(px(10.))
+            .h(px(if rail { 40. } else { 34. }))
             .items_center()
             .rounded(px(8.))
             .cursor_pointer()
             .when(on, |d| d.bg(t.accent))
             .when(!on, |d| d.hover(|s| s.bg(t.hover)))
-            .child(icon(ic, 16., if on { t.fg } else { t.fg2 }))
-            .child(
-                text(13.5, if on { t.fg } else { t.fg2 }, label).font_weight(if on {
-                    FontWeight::MEDIUM
-                } else {
-                    FontWeight::NORMAL
-                }),
-            )
+            .when(rail, |d| {
+                let tip = label.clone();
+                d.w(px(44.))
+                    .justify_center()
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            })
+            .when(!rail, |d| d.px(px(10.)).gap(px(10.)))
+            .child(icon(
+                ic,
+                if rail { 18. } else { 16. },
+                if on { t.fg } else { t.fg2 },
+            ))
+            .when(!rail, |d| {
+                d.child(
+                    text(13.5, if on { t.fg } else { t.fg2 }, label).font_weight(if on {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    }),
+                )
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.go(page.clone(), cx)))
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.t();
-        let is = |p: fn(&Page) -> bool| p(&self.page);
+    fn sidebar(&self, rail: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.chrome();
         let libs: Vec<_> = self
             .fx
             .views
@@ -143,13 +196,12 @@ impl Gallery {
                     Some("music") => IconName::Music,
                     _ => IconName::Clapperboard,
                 };
-                let on = matches!(self.page, Page::Library(j) if j == i);
-                self.nav_item(("lib", i), ic, v.name.clone(), on, Page::Library(i), cx)
+                self.nav_item(("lib", i), ic, v.name.clone(), Page::Library(i), rail, cx)
                     .into_any_element()
             })
             .collect();
         v_flex()
-            .w(px(SIDEBAR_W))
+            .w(px(if rail { RAIL_W } else { SIDEBAR_W }))
             .h_full()
             .flex_shrink_0()
             .bg(t.sidebar)
@@ -159,8 +211,8 @@ impl Gallery {
                 h_flex()
                     .id("brand")
                     .h(px(BAR_H))
-                    .px(px(18.))
-                    .gap(px(10.))
+                    .when(rail, |d| d.justify_center())
+                    .when(!rail, |d| d.px(px(18.)).gap(px(10.)))
                     .items_center()
                     .window_control_area(WindowControlArea::Drag)
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
@@ -174,7 +226,7 @@ impl Gallery {
                             .justify_center()
                             .child(icon(IconName::Play, 12., t.bg).ml(px(1.))),
                     )
-                    .child(semibold(text(14.5, t.fg, "EmbyMini"))),
+                    .when(!rail, |d| d.child(semibold(text(14.5, t.fg, "EmbyMini")))),
             )
             .child(
                 v_flex()
@@ -185,36 +237,32 @@ impl Gallery {
                     .px(px(10.))
                     .pt(px(6.))
                     .gap(px(2.))
-                    .child(self.nav_item(
-                        "nav-home",
-                        IconName::House,
-                        "首页",
-                        is(|p| matches!(p, Page::Home)),
-                        Page::Home,
-                        cx,
-                    ))
+                    .when(rail, |d| d.items_center())
+                    .child(self.nav_item("nav-home", IconName::House, "首页", Page::Home, rail, cx))
                     .child(self.nav_item(
                         "nav-search",
                         IconName::Search,
                         "搜索",
-                        is(|p| matches!(p, Page::Search)),
                         Page::Search,
+                        rail,
                         cx,
                     ))
                     .child(self.nav_item(
                         "nav-fav",
                         IconName::Heart,
                         "收藏",
-                        is(|p| matches!(p, Page::Favorites)),
                         Page::Favorites,
+                        rail,
                         cx,
                     ))
-                    .child(
+                    .child(if rail {
+                        div().w(px(24.)).h(px(1.)).my(px(12.)).bg(t.border)
+                    } else {
                         medium(text(12., t.fg3, "媒体库"))
                             .px(px(10.))
                             .pt(px(22.))
-                            .pb(px(6.)),
-                    )
+                            .pb(px(6.))
+                    })
                     .children(libs),
             )
             .child(
@@ -223,12 +271,13 @@ impl Gallery {
                     .pb(px(12.))
                     .pt(px(8.))
                     .gap(px(2.))
+                    .when(rail, |d| d.items_center())
                     .child(self.nav_item(
                         "nav-settings",
                         IconName::Settings,
                         "设置",
-                        is(|p| matches!(p, Page::Settings)),
                         Page::Settings,
+                        rail,
                         cx,
                     ))
                     .child(
@@ -236,12 +285,16 @@ impl Gallery {
                             .id("server")
                             .mt(px(6.))
                             .h(px(48.))
-                            .px(px(8.))
-                            .gap(px(10.))
                             .items_center()
                             .rounded(px(10.))
-                            .border_1()
-                            .border_color(t.border)
+                            .when(rail, |d| {
+                                d.w(px(44.)).justify_center().tooltip(|window, cx| {
+                                    Tooltip::new("家庭影院").build(window, cx)
+                                })
+                            })
+                            .when(!rail, |d| {
+                                d.px(px(8.)).gap(px(10.)).border_1().border_color(t.border)
+                            })
                             .cursor_pointer()
                             .hover(|s| s.bg(t.hover))
                             .child(
@@ -254,21 +307,27 @@ impl Gallery {
                                     .justify_center()
                                     .child(semibold(text(12., t.fg, "家"))),
                             )
-                            .child(
-                                v_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(medium(text(13., t.fg, "家庭影院")).truncate())
-                                    .child(
-                                        text(
-                                            11.5,
-                                            t.fg3,
-                                            format!("{} 个媒体库", self.fx.views.len()),
-                                        )
-                                        .truncate(),
-                                    ),
-                            )
-                            .child(icon(IconName::ChevronsUpDown, 14., t.fg3)),
+                            .when(!rail, |d| {
+                                d.child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(medium(text(13., t.fg, "家庭影院")).truncate())
+                                        .child(
+                                            text(
+                                                11.5,
+                                                t.fg3,
+                                                format!("{} 个媒体库", self.fx.views.len()),
+                                            )
+                                            .truncate(),
+                                        ),
+                                )
+                                .child(icon(
+                                    IconName::ChevronsUpDown,
+                                    14.,
+                                    t.fg3,
+                                ))
+                            }),
                     ),
             )
     }
@@ -291,10 +350,20 @@ impl Gallery {
             .child(
                 h_flex()
                     .w_full()
-                    .pl(px(tokens::PAD - 12.))
+                    .pl(px(12.))
                     .pr(px(8.))
                     .gap(px(4.))
                     .items_center()
+                    .child(
+                        ghost_button("toggle-sidebar", IconName::PanelLeft, t.fg2, t)
+                            .tooltip(|window, cx| {
+                                Tooltip::new("折叠侧栏 (Ctrl+B)").build(window, cx)
+                            })
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)),
+                            ),
+                    )
+                    .child(div().w(px(1.)).h(px(16.)).mx(px(6.)).bg(t.border))
                     .child(
                         ghost_button(
                             "back",
@@ -351,7 +420,8 @@ impl Gallery {
                     .child(
                         ghost_button(
                             "theme",
-                            if t.dark {
+                            // what the theme is, not the always-dark detail page
+                            if self.dark {
                                 IconName::Sun
                             } else {
                                 IconName::Moon
@@ -372,6 +442,7 @@ impl Gallery {
 impl Render for Gallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.t();
+        let rail = self.is_rail(window);
         let page = match self.page.clone() {
             Page::Home => self.home(window, cx).into_any_element(),
             Page::Search => self.search(window, cx).into_any_element(),
@@ -382,12 +453,17 @@ impl Render for Gallery {
         };
         h_flex()
             .size_full()
+            .track_focus(&self.focus)
+            .on_action(
+                cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)),
+            )
             .bg(t.bg)
             .text_color(t.fg)
-            .child(self.sidebar(cx))
+            .child(self.sidebar(rail, cx))
             .child(
                 div()
                     .relative()
+                    .bg(t.bg)
                     .flex_1()
                     .min_w_0()
                     .h_full()
@@ -429,6 +505,7 @@ pub fn run(opts: Options) {
         .with_assets(assets::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            cx.bind_keys([KeyBinding::new("ctrl-b", ToggleSidebar, None)]);
             let window = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
@@ -458,6 +535,8 @@ pub fn run(opts: Options) {
                     "settings" => Page::Settings,
                     _ => Page::Home,
                 };
+                let focus = cx.focus_handle();
+                window.focus(&focus, cx);
                 cx.new(|_| Gallery {
                     fx,
                     page,
@@ -469,6 +548,8 @@ pub fn run(opts: Options) {
                     hero: 0,
                     settings_tab: 0,
                     filter: 0,
+                    collapsed: None,
+                    focus,
                 })
             })
             .expect("opening the design window");

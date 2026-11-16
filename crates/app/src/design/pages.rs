@@ -6,13 +6,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::fixture::Item;
-use super::tokens::{BAR_H, PAD, POSTER_W, SIDEBAR_W, T};
+use super::tokens::{BAR_H, PAD, POSTER_W, T};
 use super::ui::*;
 use super::{Gallery, Page};
 
 /// Columns and card width that fill the content width exactly.
-fn grid_columns(window: &Window, min_w: f32, gap: f32) -> (usize, f32) {
-    let content = f32::from(window.viewport_size().width) - SIDEBAR_W - 2. * PAD - 2.;
+fn grid_columns(window: &Window, sidebar: f32, min_w: f32, gap: f32) -> (usize, f32) {
+    let content = f32::from(window.viewport_size().width) - sidebar - 2. * PAD - 2.;
     let cols = ((content + gap) / (min_w + gap)).floor().max(2.);
     (
         cols as usize,
@@ -38,7 +38,7 @@ fn page_head(title: impl Into<SharedString>, sub: impl Into<SharedString>, t: T)
 impl Gallery {
     fn poster_grid(&self, items: &[Item], window: &Window, cx: &mut Context<Self>) -> Div {
         let t = self.t();
-        let (cols, w) = grid_columns(window, POSTER_W, 20.);
+        let (cols, w) = grid_columns(window, self.sidebar_w(window), POSTER_W, 20.);
         let mut grid = v_flex().px(px(PAD)).gap(px(28.));
         for (r, chunk) in items.chunks(cols).enumerate() {
             grid = grid.child(h_flex().gap(px(20.)).items_start().children(

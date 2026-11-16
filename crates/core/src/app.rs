@@ -1,26 +1,18 @@
-// No console window in release builds: keep this.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+//! The application state behind the UI: config and servers, the caches, playback and the exit sequence.
+//!
+//! The UI keeps one [`App`] for the life of the process and forwards each user action to a method here; nothing in
+//! this module knows about the UI framework.
 
-mod config;
-mod danmaku;
-mod emby;
-mod images;
-mod player;
-mod status;
-mod stream;
-mod updater;
-
-use config::{Config, Server, ServerView};
-use emby::{Emby, Error};
+use crate::config::{self, Config, Server, ServerView};
+use crate::emby::{self, Emby, Error};
+use crate::{danmaku, images, lock, player, rt, stream, updater};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_log::{RotationStrategy, Target, TargetKind, TimezoneStrategy};
 use tokio::sync::{mpsc, watch};
 
 /// When the user closed the window (or the process began exiting): each close phase logs its time since, to find
@@ -29,12 +21,12 @@ use tokio::sync::{mpsc, watch};
 static CLOSE_T0: OnceLock<Instant> = OnceLock::new();
 
 /// Starts the timer; later calls keep the first start.
-fn exit_start() {
+pub fn exit_start() {
     CLOSE_T0.get_or_init(Instant::now);
 }
 
 /// Logs a close phase; does nothing when not closing (e.g. mpv closed during normal use or for an update).
-pub(crate) fn exit_mark(phase: &str) {
+pub fn exit_mark(phase: &str) {
     if let Some(t0) = CLOSE_T0.get() {
         log::info!("关闭耗时 {phase}：{} ms", t0.elapsed().as_millis());
     }
@@ -44,7 +36,7 @@ pub(crate) fn exit_mark(phase: &str) {
 /// (auto-update included). Still there at start = the last run crashed or was killed.
 const RUNNING: &str = "running";
 
-pub(crate) fn set_running(root: &std::path::Path, on: bool) {
+pub fn set_running(root: &std::path::Path, on: bool) {
     let f = root.join(RUNNING);
     let _ = if on {
         std::fs::write(f, emby::VERSION)
@@ -53,7 +45,7 @@ pub(crate) fn set_running(root: &std::path::Path, on: bool) {
     };
 }
 
-struct App {
+pub struct App {
     path: PathBuf,
     cfg: Mutex<Config>,
     http: reqwest::Client,
@@ -75,7 +67,7 @@ struct App {
     /// `play` calls not yet returned ([`Starting`]); exit waits for them.
     starting: AtomicUsize,
     /// Players told to quit that are still reporting Stopped; exit waits for them (see [`App::retire`]).
-    closing: Mutex<Vec<tauri::async_runtime::JoinHandle<()>>>,
+    closing: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 /// Counts `play` calls in progress: up on entry, down when dropped.
@@ -97,7 +89,7 @@ impl Drop for Starting<'_> {
 /// The current playback: its control channel and the event-forwarding task (ends after the session).
 struct Player {
     ctl: mpsc::UnboundedSender<player::Ctl>,
-    task: tauri::async_runtime::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// The mpv path from settings without surrounding blanks and quotes (Explorer's "Copy as path" adds them).
@@ -105,25 +97,8 @@ fn clean_path(p: &str) -> &str {
     p.trim().trim_matches('"').trim()
 }
 
-/// Ignores lock poisoning: the data here is replaced whole, never left half-updated by a panic.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Subtracts without going below 0: an inexact count should undercount, never wrap into a huge number
-/// that would make trimming delete everything. Shared by the video and image caches.
-fn sub_total(total: &AtomicU64, n: u64) {
-    // fetch_update is renamed try_update in new toolchains and the new name is missing in our MSRV: hand-rolled CAS.
-    let mut v = total.load(Ordering::Relaxed);
-    while let Err(now) =
-        total.compare_exchange_weak(v, v.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed)
-    {
-        v = now;
-    }
-}
-
 impl App {
-    fn cfg(&self) -> MutexGuard<'_, Config> {
+    pub fn cfg(&self) -> MutexGuard<'_, Config> {
         lock(&self.cfg)
     }
 
@@ -153,7 +128,7 @@ impl App {
     fn retire(&self, p: Player) {
         let _ = p.ctl.send(player::Ctl::Quit);
         let mut closing = lock(&self.closing);
-        closing.retain(|t| !t.inner().is_finished());
+        closing.retain(|t| !t.is_finished());
         closing.push(p.task);
     }
 
@@ -170,7 +145,7 @@ impl App {
 
     /// First exit step, run as soon as close is clicked (before window teardown and `RunEvent::Exit`): stops
     /// starting `play` calls and tells mpv to quit; [`App::shutdown`] waits for the reports. Repeatable.
-    fn begin_shutdown(&self) {
+    pub fn begin_shutdown(&self) {
         self.quit.send_replace(true);
         if self.stop_player() {
             log::info!("程序退出，先关闭播放器并回传进度");
@@ -180,9 +155,9 @@ impl App {
     /// Call before exiting: mpv is a separate process that outlives us, while the report tasks die with us and the
     /// resume point is lost. So stop starting `play` calls and wait for them (or one may register a player right
     /// after), then quit mpv and wait for the Stopped reports. Waits `wait` at most in total.
-    fn shutdown(&self, wait: Duration) {
+    pub fn shutdown(&self, wait: Duration) {
         self.begin_shutdown();
-        tauri::async_runtime::block_on(async {
+        rt::block_on(async {
             let deadline = tokio::time::Instant::now() + wait;
             while self.starting.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline
             {
@@ -277,11 +252,346 @@ impl App {
             .filter(|p| p.is_file())
             .unwrap_or_else(|| PathBuf::from(exe))
     }
+
+    /// Opens the data dir `root`: loads (and on first start writes) the config, checks and sets the running marker,
+    /// starts the image cache and the caching proxy. `mpv_dir` is the bundled mpv config dir, if any.
+    pub fn open(root: &Path, mpv_dir: Option<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
+        let path = root.join("config.json");
+        let cfg =
+            config::load(&path).map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
+        config::save(&path, &cfg)?; // first start: persist the generated device_id
+        if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
+            log::warn!("上次没有正常退出（版本 {v}）");
+        }
+        set_running(root, true);
+        // Where things are, for troubleshooting from a log (the mpv dir must have no \\?\ prefix, see player::bundled_dir)
+        log::info!(
+            "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
+            emby::VERSION,
+            root.display(),
+            mpv_dir
+                .as_deref()
+                .map_or("（无）".into(), |d| d.display().to_string())
+        );
+        spawn_cleanups(root.to_path_buf());
+        let http = emby::http_client()?;
+        let images =
+            images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
+        images.start();
+        let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
+        Ok(Self {
+            path,
+            cfg: Mutex::new(cfg),
+            http,
+            images,
+            stream,
+            danmaku_dir: root.join("cache").join("danmaku"),
+            mpv_dir,
+            mpv_cache: Some(root.join("mpv-cache")),
+            player: Mutex::new(None),
+            play_seq: AtomicU64::new(0),
+            quit: watch::Sender::new(false),
+            starting: AtomicUsize::new(0),
+            closing: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The data dir (holds config.json, the caches and the running marker).
+    pub fn data_root(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// Undoes [`App::begin_shutdown`] when the program stays in use after all (an update that failed to start):
+    /// otherwise every later play is dropped as "quitting".
+    pub fn cancel_shutdown(&self) {
+        self.quit.send_replace(false);
+    }
+
+    /// Settings page contents.
+    pub fn config_view(&self) -> ConfigView {
+        let c = self.cfg();
+        ConfigView {
+            active: c.active.clone(),
+            servers: c.servers.iter().map(Server::view).collect(),
+            mpv_path: c.mpv_path.clone(),
+            preload_percent: c.preload_percent,
+            user_mpv_conf: self.user_mpv_conf().display().to_string(),
+            update_proxy: c.update_proxy.clone(),
+            cache_whole: c.cache_whole,
+            danmaku_api: c.danmaku.api.clone(),
+            danmaku_words: c.danmaku.words.clone(),
+            version: emby::VERSION,
+        }
+    }
+
+    /// Adds a server and makes it the active one: reads its name, logs in, saves.
+    pub async fn server_add(
+        &self,
+        url: String,
+        port: Option<u16>,
+        user: String,
+        password: String,
+    ) -> Result<ServerView, Error> {
+        let (url, port) = config::normalize(&url, port).map_err(Error::Other)?;
+        let mut s = Server {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: String::new(),
+            url,
+            port,
+            user,
+            user_id: String::new(),
+            token: String::new(),
+        };
+        s.name = emby::server_name(&self.http, &s.api_base()).await?;
+        self.login(&mut s, &password).await?;
+        let view = s.view();
+        self.update(|c| {
+            c.active = Some(s.id.clone());
+            c.servers.push(s);
+        })?;
+        Ok(view)
+    }
+
+    /// Edits a server (same id; stays active if it was): address, port, user, or a fresh login.
+    /// Connects to the new address first (refreshing the server name) and saves nothing if that fails.
+    /// An address-only change (new domain, port, reverse proxy) keeps the token, no password needed;
+    /// a changed user, a typed password or a missing token logs in again with the given credentials.
+    pub async fn server_edit(
+        &self,
+        id: String,
+        url: String,
+        port: Option<u16>,
+        user: String,
+        password: String,
+    ) -> Result<ServerView, Error> {
+        let (url, port) = config::normalize(&url, port).map_err(Error::Other)?;
+        let mut s = self.server(&id)?;
+        let relogin = !password.is_empty() || user != s.user || s.token.is_empty();
+        (s.url, s.port, s.user) = (url, port, user);
+        s.name = emby::server_name(&self.http, &s.api_base()).await?;
+        if relogin {
+            self.login(&mut s, &password).await?;
+        }
+        self.put_server(s)
+    }
+
+    /// Logs in again with just the password: the token expired or a new one is wanted.
+    pub async fn server_login(&self, id: String, password: String) -> Result<ServerView, Error> {
+        let mut s = self.server(&id)?;
+        self.login(&mut s, &password).await?;
+        // Only the login fields: an edit saved while logging in keeps its address.
+        self.update(|c| {
+            let t = c.servers.iter_mut().find(|t| t.id == id)?;
+            (t.user_id, t.token) = (s.user_id, s.token);
+            Some(t.view())
+        })?
+        .ok_or_else(no_server)
+    }
+
+    pub fn server_remove(&self, id: String) -> Result<(), Error> {
+        self.update(|c| {
+            c.servers.retain(|s| s.id != id);
+            if c.active.as_deref() == Some(id.as_str()) {
+                c.active = c.servers.first().map(|s| s.id.clone());
+            }
+        })
+    }
+
+    pub fn server_use(&self, id: String) -> Result<(), Error> {
+        self.update(|c| {
+            if c.servers.iter().any(|s| s.id == id) {
+                c.active = Some(id);
+            }
+        })
+    }
+
+    /// The general settings: mpv path, preload point, update proxy (validated), whole-file caching.
+    pub fn settings_set(
+        &self,
+        mpv_path: Option<String>,
+        preload_percent: u8,
+        update_proxy: Option<String>,
+        cache_whole: bool,
+    ) -> Result<(), Error> {
+        let update_proxy = update_proxy
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty());
+        if let Some(p) = &update_proxy {
+            updater::proxy_url(p)?;
+        }
+        self.update(|c| {
+            c.mpv_path = mpv_path
+                .map(|p| clean_path(&p).to_owned())
+                .filter(|p| !p.is_empty());
+            c.preload_percent = preload_percent.clamp(50, 99);
+            c.update_proxy = update_proxy;
+            c.cache_whole = cache_whole;
+        })?;
+        if let Some(s) = &self.stream {
+            s.set_whole(cache_whole);
+        }
+        Ok(())
+    }
+
+    /// The danmaku settings page: API address (`/api/v2` style, may carry a token) and blocked words (one per line,
+    /// blanks dropped); applied to the running playback at once. Display settings live in the player's panel.
+    pub fn danmaku_set(&self, api: String, words: Vec<String>) -> Result<(), Error> {
+        let api = danmaku::normalize(&api).map_err(Error::Other)?;
+        let words: Vec<String> = words
+            .iter()
+            .map(|w| w.trim())
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if let Some(p) = lock(&self.player).as_ref() {
+            let _ = p.ctl.send(player::Ctl::Danmaku {
+                api: danmaku::Api::new(self.http.clone(), &api),
+                words: words.clone(),
+            });
+        }
+        self.update(|c| {
+            c.danmaku.api = api;
+            c.danmaku.words = words;
+        })
+    }
+
+    /// Cache manager rows (walks directories, off the async threads).
+    pub async fn cache_info(self: Arc<Self>) -> CacheInfo {
+        rt::spawn_blocking(move || cache_info_now(&self))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Cache manager: clears one row (`all` = every row but the UI-side library cache).
+    pub async fn cache_clear(self: Arc<Self>, kind: Clear) -> CacheInfo {
+        rt::spawn_blocking(move || cache_clear_now(&self, kind))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// A poster or backdrop for the image scheme, from [`images::Images`] (disk cache → upstream). The path carries a
+    /// server id, mapped here to that server's API root; unknown servers get a 404 and nothing is fetched elsewhere.
+    pub async fn image(&self, path: &str) -> images::Got {
+        let Some(req) = images::Req::parse(path) else {
+            return Err(400);
+        };
+        let base = {
+            let c = self.cfg();
+            c.servers
+                .iter()
+                .find(|s| s.id == req.server)
+                .map(config::Server::api_base)
+        };
+        let Some(base) = base else {
+            return Err(404);
+        };
+        self.images.get(&req, &base).await
+    }
+
+    /// Generic Emby request to the active server. On 401 that server's token is cleared and the UI asks to sign in.
+    pub async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        query: Option<Map<String, Value>>,
+        body: Option<Value>,
+    ) -> Result<Value, Error> {
+        let (server_id, client) = self.active()?;
+        let method = match method.to_ascii_uppercase().as_str() {
+            "GET" => Method::GET,
+            "POST" => Method::POST,
+            "DELETE" => Method::DELETE,
+            m => return Err(Error::Other(format!("不支持的方法：{m}"))),
+        };
+        let query: Vec<(String, String)> = query
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned)))
+            .collect();
+        let r = client.call(method, path, &query, body.as_ref()).await;
+        if matches!(r, Err(Error::Unauthorized)) {
+            // Clear the server that was asked: the user may have switched servers meanwhile
+            self.remember(|c| {
+                if let Some(s) = c.servers.iter_mut().find(|s| s.id == server_id) {
+                    s.token.clear();
+                }
+            });
+        }
+        r
+    }
+
+    /// Plays `item_id` in a new mpv, closing the current player; a later click while this one starts wins.
+    /// Playback events go to `emit` (the UI), except the ones that only update the config.
+    pub async fn play(
+        self: &Arc<Self>,
+        item_id: String,
+        source_id: Option<String>,
+        from_start: bool,
+        emit: impl Fn(&player::Event) + Send + 'static,
+    ) -> Result<(), Error> {
+        let _starting = Starting::enter(&self.starting);
+        let (_, client) = self.active()?;
+        let seq = self.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.stop_player(); // switching titles: the old mpv quits and reports on its own; only exit waits for it
+        let (preload_percent, volume, dm) = {
+            let c = self.cfg();
+            (f64::from(c.preload_percent), c.volume, c.danmaku.clone())
+        };
+        let opts = player::Options {
+            mpv: self.mpv_path(),
+            config_dir: self.mpv_dir.clone(),
+            preload_percent,
+            volume,
+            cache_dir: self.mpv_cache.clone(),
+            user_conf: Some(self.user_mpv_conf()),
+            stream: self.stream.clone(),
+            danmaku: Some(danmaku::Ctx {
+                api: danmaku::Api::new(self.http.clone(), &dm.api),
+                dir: self.danmaku_dir.clone(),
+                cfg: dm,
+            }),
+            extra_args: Vec::new(),
+        };
+        let Some(session) = self
+            .unless_quit(player::start(
+                client,
+                &item_id,
+                source_id.as_deref(),
+                from_start,
+                opts,
+            ))
+            .await
+        else {
+            log::info!("程序退出，放弃起播：{item_id}");
+            return Ok(());
+        };
+        let session = session?;
+        if *self.quit.borrow() {
+            session.abort().await;
+            return Ok(());
+        }
+        if self.play_seq.load(Ordering::SeqCst) != seq {
+            log::info!("起播期间又点了别的，作废这一次：{item_id}");
+            session.abort().await;
+            return Ok(());
+        }
+        let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        rt::spawn(session.run(ctl_rx, ev_tx));
+        let task = rt::spawn(forward_events(self.clone(), seq, ev_rx, emit));
+        // Just in case another player got registered meanwhile: close it rather than leave an orphaned mpv
+        let old = lock(&self.player).replace(Player { ctl: ctl_tx, task });
+        if let Some(old) = old {
+            self.retire(old);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigView {
+pub struct ConfigView {
     active: Option<String>,
     servers: Vec<ServerView>,
     mpv_path: Option<String>,
@@ -296,171 +606,14 @@ struct ConfigView {
     version: &'static str,
 }
 
-#[tauri::command]
-fn config_get(app: State<'_, App>) -> ConfigView {
-    let c = app.cfg();
-    ConfigView {
-        active: c.active.clone(),
-        servers: c.servers.iter().map(Server::view).collect(),
-        mpv_path: c.mpv_path.clone(),
-        preload_percent: c.preload_percent,
-        user_mpv_conf: app.user_mpv_conf().display().to_string(),
-        update_proxy: c.update_proxy.clone(),
-        cache_whole: c.cache_whole,
-        danmaku_api: c.danmaku.api.clone(),
-        danmaku_words: c.danmaku.words.clone(),
-        version: emby::VERSION,
-    }
-}
-
 fn no_server() -> Error {
     Error::Other("服务器不存在".into())
-}
-
-#[tauri::command]
-async fn server_add(
-    app: State<'_, App>,
-    url: String,
-    port: Option<u16>,
-    user: String,
-    password: String,
-) -> Result<ServerView, Error> {
-    let (url, port) = config::normalize(&url, port).map_err(Error::Other)?;
-    let mut s = Server {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: String::new(),
-        url,
-        port,
-        user,
-        user_id: String::new(),
-        token: String::new(),
-    };
-    s.name = emby::server_name(&app.http, &s.api_base()).await?;
-    app.login(&mut s, &password).await?;
-    let view = s.view();
-    app.update(|c| {
-        c.active = Some(s.id.clone());
-        c.servers.push(s);
-    })?;
-    Ok(view)
-}
-
-/// Edits a server (same id; stays active if it was): address, port, user, or a fresh login.
-/// Connects to the new address first (refreshing the server name) and saves nothing if that fails.
-/// An address-only change (new domain, port, reverse proxy) keeps the token, no password needed;
-/// a changed user, a typed password or a missing token logs in again with the given credentials.
-#[tauri::command]
-async fn server_edit(
-    app: State<'_, App>,
-    id: String,
-    url: String,
-    port: Option<u16>,
-    user: String,
-    password: String,
-) -> Result<ServerView, Error> {
-    let (url, port) = config::normalize(&url, port).map_err(Error::Other)?;
-    let mut s = app.server(&id)?;
-    let relogin = !password.is_empty() || user != s.user || s.token.is_empty();
-    (s.url, s.port, s.user) = (url, port, user);
-    s.name = emby::server_name(&app.http, &s.api_base()).await?;
-    if relogin {
-        app.login(&mut s, &password).await?;
-    }
-    app.put_server(s)
-}
-
-/// Logs in again with just the password: the token expired or a new one is wanted.
-#[tauri::command]
-async fn server_login(
-    app: State<'_, App>,
-    id: String,
-    password: String,
-) -> Result<ServerView, Error> {
-    let mut s = app.server(&id)?;
-    app.login(&mut s, &password).await?;
-    // Only the login fields: an edit saved while logging in keeps its address.
-    app.update(|c| {
-        let t = c.servers.iter_mut().find(|t| t.id == id)?;
-        (t.user_id, t.token) = (s.user_id, s.token);
-        Some(t.view())
-    })?
-    .ok_or_else(no_server)
-}
-
-#[tauri::command]
-fn server_remove(app: State<'_, App>, id: String) -> Result<(), Error> {
-    app.update(|c| {
-        c.servers.retain(|s| s.id != id);
-        if c.active.as_deref() == Some(id.as_str()) {
-            c.active = c.servers.first().map(|s| s.id.clone());
-        }
-    })
-}
-
-#[tauri::command]
-fn server_use(app: State<'_, App>, id: String) -> Result<(), Error> {
-    app.update(|c| {
-        if c.servers.iter().any(|s| s.id == id) {
-            c.active = Some(id);
-        }
-    })
-}
-
-#[tauri::command]
-fn settings_set(
-    app: State<'_, App>,
-    mpv_path: Option<String>,
-    preload_percent: u8,
-    update_proxy: Option<String>,
-    cache_whole: bool,
-) -> Result<(), Error> {
-    let update_proxy = update_proxy
-        .map(|p| p.trim().to_owned())
-        .filter(|p| !p.is_empty());
-    if let Some(p) = &update_proxy {
-        updater::proxy_url(p)?;
-    }
-    app.update(|c| {
-        c.mpv_path = mpv_path
-            .map(|p| clean_path(&p).to_owned())
-            .filter(|p| !p.is_empty());
-        c.preload_percent = preload_percent.clamp(50, 99);
-        c.update_proxy = update_proxy;
-        c.cache_whole = cache_whole;
-    })?;
-    if let Some(s) = &app.stream {
-        s.set_whole(cache_whole);
-    }
-    Ok(())
-}
-
-/// The danmaku settings page: API address (`/api/v2` style, may carry a token) and blocked words (one per line,
-/// blanks dropped); applied to the running playback at once. Display settings live in the player's panel.
-#[tauri::command]
-fn danmaku_set(app: State<'_, App>, api: String, words: Vec<String>) -> Result<(), Error> {
-    let api = danmaku::normalize(&api).map_err(Error::Other)?;
-    let words: Vec<String> = words
-        .iter()
-        .map(|w| w.trim())
-        .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect();
-    if let Some(p) = lock(&app.player).as_ref() {
-        let _ = p.ctl.send(player::Ctl::Danmaku {
-            api: danmaku::Api::new(app.http.clone(), &api),
-            words: words.clone(),
-        });
-    }
-    app.update(|c| {
-        c.danmaku.api = api;
-        c.danmaku.words = words;
-    })
 }
 
 /// Bytes per cache manager row; `playing` means the film being played stays in the video cache. The library
 /// cache (list snapshots) lives in the UI's localStorage and is counted there.
 #[derive(Serialize, Default)]
-struct CacheInfo {
+pub struct CacheInfo {
     video: u64,
     images: u64,
     /// External subtitles plus danmaku.
@@ -472,7 +625,7 @@ struct CacheInfo {
 /// What `cache_clear` empties (`subs` = subtitles and danmaku).
 #[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
-enum Clear {
+pub enum Clear {
     Video,
     Images,
     Subs,
@@ -488,7 +641,7 @@ impl Clear {
 
 /// The updater plugin's temp dir, `<productName>-<version>-updater-<random>`: the plugin keeps it forever
 /// (`tempdir().keep()`, ~40 MB per update) and it is useless once the new version is installed.
-fn is_updater_leftover(name: &str) -> bool {
+pub fn is_updater_leftover(name: &str) -> bool {
     name.starts_with("EmbyMini-") && name.contains("-updater-")
 }
 
@@ -576,151 +729,15 @@ fn cache_clear_now(app: &App, kind: Clear) -> CacheInfo {
     cache_info_now(app)
 }
 
-#[tauri::command]
-async fn cache_info(handle: AppHandle) -> CacheInfo {
-    tauri::async_runtime::spawn_blocking(move || cache_info_now(&handle.state::<App>()))
-        .await
-        .unwrap_or_default()
-}
-
-/// Cache manager: clears one row (`all` = every row but the UI-side library cache).
-#[tauri::command]
-async fn cache_clear(handle: AppHandle, kind: Clear) -> CacheInfo {
-    tauri::async_runtime::spawn_blocking(move || cache_clear_now(&handle.state::<App>(), kind))
-        .await
-        .unwrap_or_default()
-}
-
-/// `emby-img` scheme: hands the image to [`images::Images`] (disk cache → upstream). The path carries a server
-/// id, mapped here to that server's API root; unknown servers get a 404 and nothing is fetched elsewhere.
-async fn serve_image(handle: &AppHandle, path: &str) -> tauri::http::Response<Vec<u8>> {
-    let Some(req) = images::Req::parse(path) else {
-        return images::response(Err(400));
-    };
-    let app = handle.state::<App>();
-    let base = {
-        let c = app.cfg();
-        c.servers
-            .iter()
-            .find(|s| s.id == req.server)
-            .map(config::Server::api_base)
-    };
-    let Some(base) = base else {
-        return images::response(Err(404));
-    };
-    images::response(app.images.get(&req, &base).await)
-}
-
-/// Generic Emby request to the active server. On 401 that server's token is cleared and the UI asks to sign in.
-#[tauri::command]
-async fn emby(
-    app: State<'_, App>,
-    method: String,
-    path: String,
-    query: Option<Map<String, Value>>,
-    body: Option<Value>,
-) -> Result<Value, Error> {
-    let (server_id, client) = app.active()?;
-    let method = match method.to_ascii_uppercase().as_str() {
-        "GET" => Method::GET,
-        "POST" => Method::POST,
-        "DELETE" => Method::DELETE,
-        m => return Err(Error::Other(format!("不支持的方法：{m}"))),
-    };
-    let query: Vec<(String, String)> = query
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(_, v)| !v.is_null())
-        .map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned)))
-        .collect();
-    let r = client.call(method, &path, &query, body.as_ref()).await;
-    if matches!(r, Err(Error::Unauthorized)) {
-        // Clear the server that was asked: the user may have switched servers meanwhile
-        app.remember(|c| {
-            if let Some(s) = c.servers.iter_mut().find(|s| s.id == server_id) {
-                s.token.clear();
-            }
-        });
-    }
-    r
-}
-
-/// Plays `item_id` in a new mpv, closing the current player; a later click while this one starts wins.
-#[tauri::command]
-async fn play(
-    handle: tauri::AppHandle,
-    app: State<'_, App>,
-    item_id: String,
-    source_id: Option<String>,
-    from_start: bool,
-) -> Result<(), Error> {
-    let _starting = Starting::enter(&app.starting);
-    let (_, client) = app.active()?;
-    let seq = app.play_seq.fetch_add(1, Ordering::SeqCst) + 1;
-    app.stop_player(); // switching titles: the old mpv quits and reports on its own; only exit waits for it
-    let (preload_percent, volume, dm) = {
-        let c = app.cfg();
-        (f64::from(c.preload_percent), c.volume, c.danmaku.clone())
-    };
-    let opts = player::Options {
-        mpv: app.mpv_path(),
-        config_dir: app.mpv_dir.clone(),
-        preload_percent,
-        volume,
-        cache_dir: app.mpv_cache.clone(),
-        user_conf: Some(app.user_mpv_conf()),
-        stream: app.stream.clone(),
-        danmaku: Some(danmaku::Ctx {
-            api: danmaku::Api::new(app.http.clone(), &dm.api),
-            dir: app.danmaku_dir.clone(),
-            cfg: dm,
-        }),
-        extra_args: Vec::new(),
-    };
-    let Some(session) = app
-        .unless_quit(player::start(
-            client,
-            &item_id,
-            source_id.as_deref(),
-            from_start,
-            opts,
-        ))
-        .await
-    else {
-        log::info!("程序退出，放弃起播：{item_id}");
-        return Ok(());
-    };
-    let session = session?;
-    if *app.quit.borrow() {
-        session.abort().await;
-        return Ok(());
-    }
-    if app.play_seq.load(Ordering::SeqCst) != seq {
-        log::info!("起播期间又点了别的，作废这一次：{item_id}");
-        session.abort().await;
-        return Ok(());
-    }
-    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
-    tauri::async_runtime::spawn(session.run(ctl_rx, ev_tx));
-    let task = tauri::async_runtime::spawn(forward_events(handle, seq, ev_rx));
-    // Just in case another player got registered meanwhile: close it rather than leave an orphaned mpv
-    let old = lock(&app.player).replace(Player { ctl: ctl_tx, task });
-    if let Some(old) = old {
-        app.retire(old);
-    }
-    Ok(())
-}
-
 /// Passes playback events to the UI and saves what belongs in the config. Ends only after `Ended` (the session
 /// drops its sender then), so waiting on it at exit also waits for the reports and the saved volume.
 async fn forward_events(
-    handle: tauri::AppHandle,
+    app: Arc<App>,
     seq: u64,
     mut events: mpsc::UnboundedReceiver<player::Event>,
+    emit: impl Fn(&player::Event),
 ) {
     while let Some(ev) = events.recv().await {
-        let app = handle.state::<App>();
         match ev {
             player::Event::Ended { volume: Some(v) } => app.save_volume(seq, v),
             // Danmaku panel changes only go to the config; the UI does not need them
@@ -736,160 +753,22 @@ async fn forward_events(
             }
             _ => {}
         }
-        let _ = handle.emit("player", &ev);
+        emit(&ev);
     }
-}
-
-fn main() {
-    // Log panics, then hand them to the default hook
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        log::error!("程序出错（panic）：{info}");
-        default_hook(info);
-    }));
-    let ctx = tauri::generate_context!();
-    let root = config::data_root(&ctx.config().identifier);
-    let exit_root = root.clone();
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
-        }))
-        .plugin(log_plugin(root.join("logs")))
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .register_asynchronous_uri_scheme_protocol(images::SCHEME, |ctx, req, responder| {
-            let handle = ctx.app_handle().clone();
-            let path = req.uri().path().to_owned();
-            tauri::async_runtime::spawn(async move {
-                responder.respond(serve_image(&handle, &path).await);
-            });
-        })
-        .setup(move |app| setup(app, &root))
-        .invoke_handler(tauri::generate_handler![
-            config_get,
-            server_add,
-            server_edit,
-            server_login,
-            server_remove,
-            server_use,
-            settings_set,
-            danmaku_set,
-            cache_info,
-            cache_clear,
-            emby,
-            play,
-            updater::update_check,
-            updater::update_install,
-        ])
-        .build(ctx)
-        .unwrap_or_else(|e| panic!("EmbyMini 启动失败：{e}"))
-        .run(move |handle, ev| on_run_event(handle, &ev, &exit_root));
-}
-
-/// The default 40 KB limit deletes the whole log and starts over, losing what troubleshooting needs:
-/// 2 MB, keep the last 3 on rotation, local time.
-fn log_plugin<R: tauri::Runtime>(dir: PathBuf) -> tauri::plugin::TauriPlugin<R> {
-    tauri_plugin_log::Builder::new()
-        .level(log::LevelFilter::Info)
-        .max_file_size(2_000_000)
-        .rotation_strategy(RotationStrategy::KeepSome(3))
-        .timezone_strategy(TimezoneStrategy::UseLocal)
-        .clear_targets()
-        .targets([
-            Target::new(TargetKind::Stdout),
-            Target::new(TargetKind::Folder {
-                path: dir,
-                file_name: None,
-            }),
-        ])
-        .build()
-}
-
-/// Startup: move old config, build the main window, load the config, start the caches and register [`App`].
-fn setup(app: &mut tauri::App, root: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let p = app.path();
-    let old = [
-        p.app_config_dir()?,
-        p.app_local_data_dir()?,
-        p.app_cache_dir()?,
-    ];
-    match config::migrate(root, &old[0], &old) {
-        Ok(true) => log::info!("已把旧版本的配置搬到数据目录"),
-        Ok(false) => {}
-        Err(e) => log::warn!("搬旧版本的配置失败：{e}"),
-    }
-    // WebView2 data (including its image disk cache) defaults to %LOCALAPPDATA% and can only be moved when
-    // the window is built, so the main window is built here
-    let win = app
-        .config()
-        .app
-        .windows
-        .first()
-        .cloned()
-        .ok_or("缺少主窗口配置")?;
-    tauri::WebviewWindowBuilder::from_config(app.handle(), &win)?
-        .data_directory(root.join("webview"))
-        .build()?;
-    let path = root.join("config.json");
-    let cfg =
-        config::load(&path).map_err(|e| format!("读取配置失败（{}）：{e}", path.display()))?;
-    config::save(&path, &cfg)?; // first start: persist the generated device_id
-    if let Ok(v) = std::fs::read_to_string(root.join(RUNNING)) {
-        log::warn!("上次没有正常退出（版本 {v}）");
-    }
-    set_running(root, true);
-    let mpv_dir = app
-        .path()
-        .resource_dir()
-        .ok()
-        .and_then(|d| player::bundled_dir(&d));
-    // The CI smoke test checks the installed paths with this line (no \\?\ prefix): rewording it means updating windows.yml
-    log::info!(
-        "EmbyMini {} 启动；数据目录：{}；自带 mpv 配置：{}",
-        emby::VERSION,
-        root.display(),
-        mpv_dir
-            .as_deref()
-            .map_or("（无）".into(), |d| d.display().to_string())
-    );
-    spawn_cleanups(root.to_path_buf());
-    let http = emby::http_client()?;
-    let images = images::Images::new(root.join("cache").join("images"), images::CAP, http.clone());
-    images.start();
-    let stream = stream::Stream::start(&root.join("cache"), cfg.cache_whole);
-    app.manage(App {
-        path,
-        cfg: Mutex::new(cfg),
-        http,
-        images,
-        stream,
-        danmaku_dir: root.join("cache").join("danmaku"),
-        mpv_dir,
-        mpv_cache: Some(root.join("mpv-cache")),
-        player: Mutex::new(None),
-        play_seq: AtomicU64::new(0),
-        quit: watch::Sender::new(false),
-        starting: AtomicUsize::new(0),
-        closing: Mutex::new(Vec::new()),
-    });
-    Ok(())
 }
 
 /// Background deletion of leftovers from older versions and from the last update.
 fn spawn_cleanups(root: PathBuf) {
     // shortcut: staging and markers left by the old diagnostics (staging up to ~20 MB); drop once most users have upgraded a few versions
-    tauri::async_runtime::spawn_blocking(move || {
+    rt::spawn_blocking(move || {
         for f in ["telemetry", "last-exit.json", "running.json"] {
             remove_path(&root.join(f));
         }
     });
     // The installer may still be running right after an update: wait before deleting its leftovers.
-    tauri::async_runtime::spawn(async {
+    rt::spawn(async {
         tokio::time::sleep(Duration::from_secs(60)).await;
-        let _ = tauri::async_runtime::spawn_blocking(|| {
+        let _ = rt::spawn_blocking(|| {
             for p in temp_entries(&std::env::temp_dir(), is_updater_leftover) {
                 remove_path(&p);
             }
@@ -897,40 +776,6 @@ fn spawn_cleanups(root: PathBuf) {
         .await;
     });
 }
-
-/// Close: hide the window and tell mpv to quit at once, so the user sees it close right away; the slow parts
-/// (window teardown, waiting for the reports) happen after. Each phase is logged with [`exit_mark`].
-fn on_run_event(handle: &AppHandle, ev: &tauri::RunEvent, root: &std::path::Path) {
-    match ev {
-        tauri::RunEvent::WindowEvent {
-            label,
-            event: tauri::WindowEvent::CloseRequested { .. },
-            ..
-        } if label == "main" => {
-            exit_start();
-            exit_mark("close_requested");
-            if let Some(w) = handle.get_webview_window("main") {
-                let _ = w.hide();
-            }
-            exit_mark("hidden");
-            handle.state::<App>().begin_shutdown();
-            exit_mark("mpv_quit_sent");
-        }
-        tauri::RunEvent::WindowEvent {
-            event: tauri::WindowEvent::Destroyed,
-            ..
-        } => exit_mark("window_destroyed"),
-        tauri::RunEvent::ExitRequested { .. } => exit_mark("exit_requested"),
-        tauri::RunEvent::Exit => {
-            exit_start();
-            exit_mark("exit");
-            handle.state::<App>().shutdown(Duration::from_secs(3));
-            set_running(root, false);
-        }
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -984,12 +829,10 @@ mod tests {
         assert_eq!(app.user_mpv_conf(), dir.join("mpv.conf"));
     }
 
-    /// The updater names its temp dir after productName: renaming the product must update the matcher.
+    /// The old updater named its temp dir after the product name ("EmbyMini"); only those dirs match.
     #[test]
     fn updater_leftovers_match_product_name() {
-        let conf: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let name = conf["productName"].as_str().unwrap();
-        assert!(is_updater_leftover(&format!("{name}-0.5.0-updater-a1B2c3")));
+        assert!(is_updater_leftover("EmbyMini-0.5.0-updater-a1B2c3"));
         for other in [
             "EmbyMini-0.5.0-x",
             "Other-0.5.0-updater-x",
@@ -1108,24 +951,21 @@ mod tests {
     fn shutdown_cancels_starting_play() {
         let app = std::sync::Arc::new(test_app(None));
         let a = app.clone();
-        let task = tauri::async_runtime::spawn(async move {
+        let task = rt::spawn(async move {
             let _g = Starting::enter(&a.starting);
             a.unless_quit(std::future::pending::<()>()).await
         });
         while app.starting.load(Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
-        assert_eq!(
-            tauri::async_runtime::block_on(app.unless_quit(async { 1 })),
-            Some(1)
-        );
+        assert_eq!(rt::block_on(app.unless_quit(async { 1 })), Some(1));
         let t0 = std::time::Instant::now();
         app.shutdown(Duration::from_secs(3));
         assert!(t0.elapsed() < Duration::from_secs(1));
         assert_eq!(app.starting.load(Ordering::SeqCst), 0);
-        assert!(tauri::async_runtime::block_on(task).unwrap().is_none());
+        assert!(rt::block_on(task).unwrap().is_none());
         // already exiting: a new play gives up at once
-        let late = tauri::async_runtime::block_on(app.unless_quit(async { 1 }));
+        let late = rt::block_on(app.unless_quit(async { 1 }));
         assert_eq!(late, None);
     }
 
@@ -1136,11 +976,11 @@ mod tests {
         let app = std::sync::Arc::new(test_app(None));
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (a, d) = (app.clone(), done.clone());
-        let _play = tauri::async_runtime::spawn(async move {
+        let _play = rt::spawn(async move {
             let _g = Starting::enter(&a.starting);
             tokio::time::sleep(Duration::from_millis(100)).await;
             let (ctl, mut rx) = mpsc::unbounded_channel();
-            let task = tauri::async_runtime::spawn(async move {
+            let task = rt::spawn(async move {
                 assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
                 d.store(true, Ordering::SeqCst);
             });
@@ -1176,7 +1016,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d = done.clone();
-        let task = tauri::async_runtime::spawn(async move {
+        let task = rt::spawn(async move {
             assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
             tokio::time::sleep(Duration::from_millis(200)).await;
             d.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1186,7 +1026,7 @@ mod tests {
 
         // never finishes: wait at most `wait`
         let (tx, _rx) = mpsc::unbounded_channel();
-        let task = tauri::async_runtime::spawn(std::future::pending::<()>());
+        let task = rt::spawn(std::future::pending::<()>());
         let t0 = std::time::Instant::now();
         app(task, tx).shutdown(Duration::from_millis(300));
         assert!(t0.elapsed() < Duration::from_secs(2));
@@ -1199,7 +1039,7 @@ mod tests {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let d = done.clone();
-            let task = tauri::async_runtime::spawn(async move {
+            let task = rt::spawn(async move {
                 assert!(matches!(rx.recv().await, Some(player::Ctl::Quit)));
                 tokio::time::sleep(delay).await;
                 d.store(true, Ordering::SeqCst);
@@ -1223,12 +1063,12 @@ mod tests {
             ctl: mpsc::unbounded_channel().0,
             task,
         };
-        app.retire(player(tauri::async_runtime::spawn(async {})));
-        while !lock(&app.closing)[0].inner().is_finished() {
+        app.retire(player(rt::spawn(async {})));
+        while !lock(&app.closing)[0].is_finished() {
             std::thread::yield_now();
         }
-        app.retire(player(tauri::async_runtime::spawn(std::future::pending())));
+        app.retire(player(rt::spawn(std::future::pending())));
         assert_eq!(lock(&app.closing).len(), 1);
-        assert!(!lock(&app.closing)[0].inner().is_finished());
+        assert!(!lock(&app.closing)[0].is_finished());
     }
 }

@@ -48,7 +48,7 @@ const DM_MSG: &str = "embymini-danmaku-";
 
 /// The bundled mpv config directory (`<resources>/mpv`), or None if it is missing.
 ///
-/// On Windows Tauri's resource dir comes from `canonicalize(current exe)` and carries the `\\?\` verbatim prefix.
+/// On Windows a resource dir from `canonicalize(current exe)` carries the `\\?\` verbatim prefix.
 /// mpv joins config file names with `/` (`…\mpv/mpv.conf`) and hands that to CreateFileW as is; in a verbatim path
 /// `/` is not a separator, so mpv.conf, scripts and fonts all fail to load and only mpv's own OSC is left.
 /// dunce strips the prefix; `bundled_config_loads` checks this on Windows CI.
@@ -736,7 +736,7 @@ async fn finish(
         st.stop(i); // mpv was closed before it could send end-file
     }
     let status = child.wait().await;
-    crate::exit_mark("mpv_exited");
+    crate::app::exit_mark("mpv_exited");
     if let Some(s) = &st.stream {
         let names: Vec<String> = st
             .queue
@@ -764,7 +764,7 @@ async fn finish(
     } = st;
     drop(reports);
     let _ = reporter.await;
-    crate::exit_mark("reported");
+    crate::app::exit_mark("reported");
     log::info!("播放结束");
     let _ = events.send(Event::Ended { volume });
 }
@@ -3132,7 +3132,12 @@ mod tests {
         errors: Vec<String>,
     }
 
-    /// The mpv to test with: `mpv.exe` in the bundled config dir on Windows (CI downloads it into src-tauri/mpv/
+    /// The repo's resource dir, installed beside the exe: holds the bundled `mpv/` config (and `mpv.exe` on Windows CI).
+    fn resource_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources")
+    }
+
+    /// The mpv to test with: `mpv.exe` in the bundled config dir on Windows (CI downloads it into resources/mpv/
     /// before cargo test), `mpv` from PATH elsewhere.
     fn test_mpv(config_dir: &Path) -> PathBuf {
         if cfg!(windows) {
@@ -3178,8 +3183,7 @@ mod tests {
         // The bundled config says 1GiB; the personal one says 123MiB and also tries to change the UA
         std::fs::write(&conf, "demuxer-max-bytes=123MiB\nuser-agent=Other/1.0\n").unwrap();
         let bundled =
-            dunce::simplified(&std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap())
-                .join("mpv");
+            dunce::simplified(&std::fs::canonicalize(resource_dir()).unwrap()).join("mpv");
         let log = dir.join("mpv.log");
         let opts = Options {
             mpv: test_mpv(&bundled),
@@ -3224,7 +3228,8 @@ mod tests {
     fn lua_harness(script: &str) {
         let harness = format!("{script}_test");
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mpv = test_mpv(&dir.join("mpv"));
+        let mpv_dir = resource_dir().join("mpv");
+        let mpv = test_mpv(&mpv_dir);
         let log =
             std::env::temp_dir().join(format!("embymini-{harness}-{}.log", std::process::id()));
         let mut child = std::process::Command::new(&mpv)
@@ -3245,9 +3250,7 @@ mod tests {
             // An environment variable, not --script-opts: that list splits at commas in the path
             .env(
                 "EMBYMINI_LUATEST_SRC",
-                dir.join("mpv")
-                    .join("scripts")
-                    .join(format!("{script}.lua")),
+                mpv_dir.join("scripts").join(format!("{script}.lua")),
             )
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -3348,14 +3351,11 @@ mod tests {
                 assert!(errors.is_empty(), "mpv 报错：{errors:#?}");
             }
         };
-        // Get the resource dir via canonicalize, as Tauri does (with the \\?\ prefix on Windows)
-        check(&std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap());
+        // Get the resource dir via canonicalize (with the \\?\ prefix on Windows), as an app locating itself does
+        check(&std::fs::canonicalize(resource_dir()).unwrap());
 
         let odd = std::env::temp_dir().join(format!("EmbyMini 测试 {}", std::process::id()));
-        copy_dir(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mpv"),
-            &odd.join("mpv"),
-        );
+        copy_dir(&resource_dir().join("mpv"), &odd.join("mpv"));
         check(&std::fs::canonicalize(&odd).unwrap());
         std::fs::remove_dir_all(&odd).unwrap();
     }
@@ -3493,7 +3493,7 @@ mod tests {
     fn test_opts(extra_args: Vec<String>) -> Options {
         Options {
             mpv: "mpv".into(),
-            config_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mpv")),
+            config_dir: Some(resource_dir().join("mpv")),
             preload_percent: 90.0,
             volume: None,
             cache_dir: None,

@@ -144,7 +144,7 @@ struct Part {
 
 struct Task {
     id: u64,
-    task: tauri::async_runtime::JoinHandle<()>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 struct Preview {
@@ -534,9 +534,9 @@ impl Stream {
         }));
         let _ = std::fs::create_dir_all(&me.video);
         let _ = std::fs::create_dir_all(&me.subs);
-        tauri::async_runtime::spawn(me.clone().accept(l));
+        crate::rt::spawn(me.clone().accept(l));
         let m = me.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::rt::spawn_blocking(move || {
             // Trash dirs a previous run did not finish deleting
             for e in std::fs::read_dir(&m.video).into_iter().flatten().flatten() {
                 if e.file_name().to_string_lossy().starts_with(".trash-") {
@@ -565,7 +565,7 @@ impl Stream {
                 }
             };
             let m = self.clone();
-            tauri::async_runtime::spawn(async move {
+            crate::rt::spawn(async move {
                 let svc = hyper::service::service_fn(move |req| {
                     let m = m.clone();
                     async move { Ok::<_, Infallible>(m.handle(req).await) }
@@ -699,7 +699,7 @@ impl Stream {
             f.bump();
         }
         let me = self.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::rt::spawn_blocking(move || {
             // Every episode change refreshes the cap from free disk space and corrects drift in `total`.
             if !me.sweep(false) {
                 me.recount();
@@ -748,9 +748,9 @@ impl Stream {
                 log::warn!("缓存目录暂时删不掉，每 10 秒重试：{}", stuck.join("、"));
             }
             let me = self.clone();
-            tauri::async_runtime::spawn(async move {
+            crate::rt::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                tauri::async_runtime::spawn_blocking(move || me.sweep(true));
+                crate::rt::spawn_blocking(move || me.sweep(true));
             });
         } else if retry {
             self.sweep_retry.store(false, Ordering::Release);
@@ -808,7 +808,7 @@ impl Stream {
             return;
         };
         let me = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::rt::spawn(async move {
             let mut rx = f.changed.subscribe();
             let t0 = Instant::now();
             loop {
@@ -940,7 +940,7 @@ impl Stream {
         if !head {
             let (tx, rx) = mpsc::channel(4);
             let me = self.clone();
-            tauri::async_runtime::spawn(async move { me.read_loop(f, start, end, role, tx).await });
+            crate::rt::spawn(async move { me.read_loop(f, start, end, role, tx).await });
             *r.body_mut() = Body::Chan(rx);
         }
         r
@@ -1096,7 +1096,7 @@ impl Stream {
         let (role, hi) = match role {
             Role::Main if young => (Role::Main, b + 1),
             Role::Main => {
-                let task = tauri::async_runtime::spawn(self.clone().main_task(f.clone(), b, id));
+                let task = crate::rt::spawn(self.clone().main_task(f.clone(), b, id));
                 let m = Main {
                     t: Task { id, task },
                     at: b,
@@ -1114,7 +1114,7 @@ impl Stream {
         {
             old.push(st.previews.remove(k).t);
         }
-        let task = tauri::async_runtime::spawn(self.clone().preview_task(f.clone(), b, hi, id));
+        let task = crate::rt::spawn(self.clone().preview_task(f.clone(), b, hi, id));
         st.previews.push(Preview {
             t: Task { id, task },
             blocks: b..=hi,
@@ -1561,9 +1561,7 @@ impl Stream {
                     && tokio::fs::rename(&tmp, &path).await.is_ok()
                 {
                     let dir = self.subs.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        crate::images::trim_dir(&dir, SUBS_CAP)
-                    });
+                    crate::rt::spawn_blocking(move || crate::images::trim_dir(&dir, SUBS_CAP));
                 } else {
                     let _ = tokio::fs::remove_file(&tmp).await;
                 }

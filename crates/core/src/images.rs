@@ -1,5 +1,5 @@
 //! Local cache for posters and backdrops, the way native image libraries (Nuke / Kingfisher / Coil) do it:
-//! the UI asks via the `emby-img` scheme → disk cache → otherwise the server-resized size from upstream,
+//! the UI asks with an `emby-img` path → disk cache → otherwise the server-resized size from upstream,
 //! stored before it is handed back.
 //!
 //! - Upstream images much wider than asked (some servers ignore maxWidth) are downsampled before storing
@@ -8,7 +8,6 @@
 //!   need revalidation.
 //! - Disk cap [`CAP`]: above it the least recently used (file mtime, refreshed on hit) go first, down to 90%.
 //! - Concurrent requests for one image fetch it once; at most [`PARALLEL`] upstream fetches at a time.
-//! - Responses are marked immutable for a year, so the WebView's memory cache works within a run.
 //! - Upstream 404s are remembered by "API root + file name" for [`MISS_TTL`] and answered 404 directly (some
 //!   servers list a Logo tag whose image does not exist; the home carousel would refetch it every turn).
 //!   A changed address fetches again; clearing the image cache forgets them.
@@ -43,7 +42,7 @@ pub struct Req {
 }
 
 impl Req {
-    /// Parses the request path (the WebView may encode `/` as `%2F`). Segments allow only ASCII letters, digits
+    /// Parses the request path (`/` may come encoded as `%2F`). Segments allow only ASCII letters, digits
     /// and `-`, so no traversal and no way to build another address.
     pub fn parse(path: &str) -> Option<Self> {
         let path = path
@@ -87,11 +86,6 @@ impl Req {
     }
 }
 
-/// MIME type from the file header (Emby posters are JPEG, logos PNG with alpha); unknown falls back to JPEG.
-fn content_type(b: &[u8]) -> &'static str {
-    image::guess_format(b).map_or("image/jpeg", |f| f.to_mime_type())
-}
-
 /// Only images this many times wider than asked get resized (server-resized ones are stored as is, not re-encoded).
 const RESIZE_OVER: f64 = 1.2;
 
@@ -133,7 +127,7 @@ pub fn downsample(bytes: Vec<u8>, width: u32) -> Vec<u8> {
 }
 
 /// Result of one image request: the bytes, or the HTTP status for the UI.
-type Got = Result<Arc<Vec<u8>>, u16>;
+pub type Got = Result<Arc<Vec<u8>>, u16>;
 
 pub struct Images {
     dir: PathBuf,
@@ -168,7 +162,7 @@ impl Images {
     /// Background job at startup: sum up the existing cache and trim it.
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();
-        tauri::async_runtime::spawn_blocking(move || me.recount());
+        crate::rt::spawn_blocking(move || me.recount());
     }
 
     /// Gets one image: disk cache → upstream. `api_base` is that server's API root (unknown servers get a 404
@@ -341,20 +335,6 @@ pub(crate) async fn cached(path: &Path) -> Option<Vec<u8>> {
     .flatten()
 }
 
-/// Response for the custom scheme.
-pub fn response(got: Got) -> tauri::http::Response<Vec<u8>> {
-    let b = tauri::http::Response::builder();
-    match got {
-        Ok(bytes) => b
-            .status(200)
-            .header("Content-Type", content_type(&bytes))
-            .header("Cache-Control", "public, max-age=31536000, immutable")
-            .body(bytes.to_vec()),
-        Err(status) => b.status(status).body(Vec::new()),
-    }
-    .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -408,7 +388,7 @@ mod tests {
         let small = downsample(big.clone(), 240);
         let img = image::load_from_memory(&small).unwrap();
         assert_eq!(img.dimensions(), (240, 360));
-        assert_eq!(content_type(&small), "image/jpeg");
+        assert_eq!(image::guess_format(&small).unwrap(), ImageFormat::Jpeg);
         assert!(
             small.len() < big.len() / 4,
             "{} → {}",
@@ -420,7 +400,11 @@ mod tests {
             image::Rgba([(x % 255) as u8, (y % 255) as u8, 0, (x % 2 * 255) as u8])
         }));
         let small = downsample(encode(logo, ImageFormat::Png), 480);
-        assert_eq!(content_type(&small), "image/png", "alpha keeps PNG");
+        assert_eq!(
+            image::guess_format(&small).unwrap(),
+            ImageFormat::Png,
+            "alpha keeps PNG"
+        );
         assert_eq!(
             image::load_from_memory(&small).unwrap().dimensions(),
             (480, 160)
@@ -433,15 +417,6 @@ mod tests {
         );
         assert_eq!(downsample(fit.clone(), 240), fit);
         assert_eq!(downsample(b"not an image".to_vec(), 240), b"not an image");
-    }
-
-    #[test]
-    fn sniff_types() {
-        assert_eq!(content_type(b"\x89PNG\r\n\x1a\n"), "image/png");
-        assert_eq!(content_type(b"RIFF1234WEBPVP8 "), "image/webp");
-        assert_eq!(content_type(b"GIF89a"), "image/gif");
-        assert_eq!(content_type(b"\xff\xd8\xff"), "image/jpeg");
-        assert_eq!(content_type(b"????"), "image/jpeg");
     }
 
     fn tmpdir(name: &str) -> PathBuf {

@@ -13,6 +13,7 @@ pub struct Item {
     #[serde(rename = "Type")]
     pub kind: String,
     pub series_name: Option<String>,
+    pub series_id: Option<String>,
     pub production_year: Option<u32>,
     pub official_rating: Option<String>,
     pub community_rating: Option<f32>,
@@ -99,6 +100,9 @@ pub struct Fixture {
     pub series: Item,
     pub movie: Item,
     pub library: Library,
+    /// Full detail (people, seasons with their episodes, similar) of every title a card leads to.
+    #[serde(rename = "details")]
+    pub details: HashMap<String, Item>,
     #[serde(skip)]
     dir: PathBuf,
 }

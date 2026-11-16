@@ -1,6 +1,6 @@
 //! Design pages (step 2½): the new look drawn with static data, to settle it before real pages are built.
 //!
-//! `embymini --design <fixture dir> [--page home|search|favorites|library|series|movie|settings] [--light]`
+//! `embymini --design <fixture dir> [--page home|search|favorites|library|series|movie|settings|item:<title>] [--light]`
 //! The sidebar, cards, back / forward and the theme switch work, so the pages can be walked through.
 
 mod assets;
@@ -115,11 +115,18 @@ impl Gallery {
         }
     }
 
-    /// Opens a card: the fixture's full series / movie when it is that title, else the card's own data.
+    /// Opens a card: an episode opens its series; the full detail when the fixture has it, else the card's own data.
     fn open(&mut self, it: &Item, cx: &mut Context<Self>) {
-        let full = [&self.fx.series, &self.fx.movie]
-            .into_iter()
-            .find(|f| f.id == it.id)
+        let id = it.series_id.as_ref().unwrap_or(&it.id);
+        let full = self
+            .fx
+            .details
+            .get(id)
+            .or_else(|| {
+                [&self.fx.series, &self.fx.movie]
+                    .into_iter()
+                    .find(|f| &f.id == id)
+            })
             .cloned()
             .unwrap_or_else(|| it.clone());
         self.go(Page::Detail(Rc::new(full)), cx);
@@ -506,10 +513,18 @@ pub fn run(opts: Options) {
         .run(move |cx| {
             gpui_kit::init(cx);
             cx.bind_keys([KeyBinding::new("ctrl-b", ToggleSidebar, None)]);
+            // DESIGN_SIZE=WxH opens a taller window for whole-page screenshots
+            let (w, h) = std::env::var("DESIGN_SIZE")
+                .ok()
+                .and_then(|s| {
+                    let (w, h) = s.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?))
+                })
+                .unwrap_or((1440., 900.));
             let window = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1440.), px(900.)),
+                    size(px(w), px(h)),
                     cx,
                 ))),
                 window_min_size: Some(size(px(960.), px(600.))),
@@ -533,7 +548,15 @@ pub fn run(opts: Options) {
                     "series" => Page::Detail(Rc::new(fx.series.clone())),
                     "movie" => Page::Detail(Rc::new(fx.movie.clone())),
                     "settings" => Page::Settings,
-                    _ => Page::Home,
+                    p => match p.strip_prefix("item:") {
+                        // a title by name, for screenshots of its detail page
+                        Some(name) => fx
+                            .details
+                            .values()
+                            .find(|d| d.name == name)
+                            .map_or(Page::Home, |d| Page::Detail(Rc::new(d.clone()))),
+                        None => Page::Home,
+                    },
                 };
                 let focus = cx.focus_handle();
                 window.focus(&focus, cx);

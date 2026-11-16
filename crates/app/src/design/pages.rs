@@ -696,12 +696,17 @@ impl Gallery {
                 ),
         );
         let mut sections = v_flex().pt(px(20.)).gap(px(40.));
-        if !it.episodes.is_empty() {
+        let episodes: &[Item] = it
+            .seasons
+            .get(self.season)
+            .filter(|s| !s.episodes.is_empty())
+            .map_or(&it.episodes, |s| &s.episodes);
+        if !episodes.is_empty() {
             let names: Vec<String> = it.seasons.iter().map(|s| s.name.clone()).collect();
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let e = cx.entity();
             let mut list = v_flex().px(px(PAD - 12.)).gap(px(2.));
-            for (i, ep) in it.episodes.iter().enumerate() {
+            for (i, ep) in episodes.iter().enumerate() {
                 list = list.child(episode_row(i, ep, &fx, t));
             }
             sections = sections.child(
@@ -724,7 +729,7 @@ impl Gallery {
                                     })
                                 },
                             ))
-                            .child(text(13., t.fg2, format!("{} 集", it.episodes.len()))),
+                            .child(text(13., t.fg2, format!("{} 集", episodes.len()))),
                     )
                     .child(list),
             );
@@ -1015,13 +1020,7 @@ fn episode_row(i: usize, ep: &Item, fx: &super::fixture::Fixture, t: T) -> State
         .img(ep.poster.as_ref())
         .or_else(|| fx.img(ep.thumb.as_ref()));
     let n = ep.index_number.unwrap_or(i as u32 + 1);
-    let played = if i == 0 {
-        Some(100.)
-    } else if i == 1 {
-        Some(38.)
-    } else {
-        None
-    };
+    let played = ep.played;
     h_flex()
         .id(("ep", i))
         .p(px(12.))

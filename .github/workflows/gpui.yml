@@ -33,8 +33,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy, rustfmt
+      # Profiles live in Cargo.toml, which the default key does not cover: without this a profile change
+      # restores a stale cache as a full match and never saves the new one
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked -p embymini --all-targets -- -D warnings
@@ -50,8 +53,11 @@ jobs:
         continue-on-error: true
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.100.0
+      # Profiles live in Cargo.toml, which the default key does not cover: without this a profile change
+      # restores a stale cache as a full match and never saves the new one
       - uses: Swatinem/rust-cache@v2
         with:
+          key: ${{ hashFiles('Cargo.toml') }}
           cache-on-failure: true
 
       - name: 编译（ci profile）

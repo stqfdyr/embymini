@@ -15,6 +15,9 @@ use crate::{
     poster,
 };
 
+/// When the rows were ready on the tokio side (f64 bits), to tell a slow load from a slow hand-over to the UI.
+static LOADED_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 enum State {
     Loading,
     Ready(Vec<Row>),
@@ -36,7 +39,16 @@ impl Home {
         cx: &mut Context<Self>,
     ) -> Self {
         let load = cx.spawn(async move |this, cx| {
-            let r = crate::rt().spawn(data::load(source)).await;
+            let r = crate::rt()
+                .spawn(async move {
+                    let r = data::load(source).await;
+                    (r, crate::since_start_ms())
+                })
+                .await
+                .map(|(r, at)| {
+                    LOADED_AT_MS.store(at.to_bits(), Ordering::Relaxed);
+                    r
+                });
             let state = match r {
                 Ok(Ok(rows)) => State::Ready(rows),
                 Ok(Err(e)) => State::Failed(format!("{e:#}").into()),
@@ -288,6 +300,7 @@ impl Bench {
         };
         let report = serde_json::json!({
             "first_frame_ms": self.first_frame_ms,
+            "data_ready_ms": f64::from_bits(LOADED_AT_MS.load(Ordering::Relaxed)),
             "data_ms": self.data_ms,
             "images_ms": self.images_ms,
             "images_loaded": poster::LOADED.load(Ordering::Relaxed),

@@ -22,7 +22,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\target\installer
 OutputBaseFilename=EmbyMini_{#AppVersion}_x64-setup
-SetupIconFile=..\..\src-tauri\icons\icon.ico
+SetupIconFile=..\..\resources\icons\icon.ico
 UninstallDisplayIcon={app}\embymini.exe
 Compression=lzma2/max
 SolidCompression=yes
@@ -39,7 +39,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\..\target\release\embymini.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\..\src-tauri\mpv\*"; DestDir: "{app}\mpv"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\..\resources\mpv\*"; DestDir: "{app}\mpv"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\EmbyMini"; Filename: "{app}\embymini.exe"

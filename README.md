@@ -2,6 +2,8 @@
 
 Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给 mpv。
 
+> 界面正在从 Tauri + Svelte 迁到 [GPUI](https://github.com/longbridge/gpui-kit)，迁完前不发新版。下面的功能、安装和数据位置说的是当前发布版 0.5.0，它的源码在 [`v0.5.0`](https://github.com/stqfdyr/embymini/tree/v0.5.0) 标签。
+
 - 多服务器：地址、端口分开填，随时切换；可编辑（换地址、端口不用重新登录）或重新登录；支持反向代理挂在子路径下的服务器
 - 浏览：首页轮播、继续观看（可移除、可撤销）、各媒体库最新，「我的媒体」「继续观看」可展开成整页网格；媒体库分页、搜索、收藏；剧集详情（季、集、演职人员、类似作品、媒体信息）、整季单集页、演职人员作品页
 - 播放：mpv + ModernZ 界面（顶栏居中标题 + 网速，鼠标一动就出控制栏）；进度条悬停预览画面；直接播原始文件，同一部片有多个版本（1080p / 4K 等）时在详情页选；续播、整季连播、按进度预加载下一集、选集菜单（F8）、换集沿用音轨与字幕、外挂字幕
@@ -19,20 +21,23 @@ Windows 桌面 Emby 客户端：桌面软件风格的浏览界面，播放交给
 ## 目录
 
 ```text
-src-tauri/            Rust 后端（Tauri 2）
-  src/main.rs         命令注册、应用状态、退出时收尾
-  src/updater.rs      检查更新、下载安装
+crates/core/          后端库，不依赖界面框架
+  src/app.rs          应用状态：服务器增删改、设置、缓存管理、起播、退出时收尾
+  src/rt.rs           后端用的 tokio 运行时
   src/config.rs       本地配置：服务器列表、播放设置、地址规范化
   src/emby.rs         Emby HTTP：鉴权头、UA、通用请求、播放用的强类型
   src/status.rs       对外 HTTP 的统一处理：状态码分类、重试、给人看的错误说明
-  src/images.rs       海报、背景图的本地磁盘缓存（emby-img 协议）
+  src/images.rs       海报、背景图的本地磁盘缓存
   src/stream.rs       本地缓存代理：mpv 从 127.0.0.1 读视频和字幕，边播边分块落盘，卡住时对冲重连
   src/player.rs       mpv 外部进程 + JSON IPC：队列、预加载、选轨、进度回传、弹幕的取数与消息
   src/danmaku.rs      弹幕接口：匹配、搜索、拉取、按集缓存
-  mpv/                自带 mpv 配置：mpv.conf、input.conf、ModernZ、thumbfast（进度条预览）、选集菜单与暂停时不藏光标的脚本、
+  src/updater.rs      更新代理设置、下载进度
+  testdata/           单测用的回包样本（只保留测试用到的字段）与 mpv 脚本的 Lua 测试
+crates/app/           桌面程序（GPUI，迁移中：目前是标题栏 + 首页海报行的试验版）
+resources/mpv/        自带 mpv 配置：mpv.conf、input.conf、ModernZ、thumbfast（进度条预览）、选集菜单与暂停时不藏光标的脚本、
                       弹幕（scripts/danmaku.lua：排版、逐帧绘制、设置面板、手动匹配）（安装包里另附 mpv.exe）
-  testdata/           单测用的回包样本（只保留测试用到的字段）
-ui/                   前端（Svelte 5 + Vite）；ui/dev/bridge.ts 是浏览器里开发界面用的转发桥
+resources/icons/      程序图标
+packaging/windows/    Inno Setup 安装脚本
 tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI 用它截图）
 ```
 
@@ -40,17 +45,14 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 
 | 做什么 | 命令 |
 |---|---|
-| 后端单测 | `cargo test --manifest-path src-tauri/Cargo.toml` |
-| 前端类型检查 | `npm --prefix ui run check`（看退出码：svelte-check 与 tsc 两段） |
-| 前端单测 | `npm --prefix ui test` |
-| 没人用的导出、文件、依赖 | `npm --prefix ui run knip` |
-| 浏览器里开发界面 | 导出 `EMBY_SERVER` / `PORT` / `EMBY_USER` / `EMBY_PASS` 后 `cd ui && npx vite`，打开 http://127.0.0.1:5173 |
-| 桌面版开发（Windows） | `ui\node_modules\.bin\tauri dev` |
-| 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_real_server -- --ignored --nocapture` |
-| 本地缓存验收（同上；整片缓存模式，会下载几百 MB） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_cache_proxy -- --ignored --nocapture` |
-| 弹幕端到端（同上，另需 `DANMU_API` = 弹幕接口地址、`DISPLAY`；`EMBY_TEST_ITEM` 指定一集能匹配上的剧） | `cargo test --manifest-path src-tauri/Cargo.toml e2e_danmaku -- --ignored --nocapture` |
-| 测试包 | 手动触发 `windows` workflow；安装包在该次运行的 Artifacts 里（`EmbyMini-setup`） |
-| 发版 | 把 `src-tauri/tauri.conf.json` 与 `src-tauri/Cargo.toml` 的 `version` 改成新版本并推送，再 `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`；构建、冒烟测试通过后自动发 Release（安装包、自动更新用的签名与 `latest.json`、`SHA256SUMS.txt`），版本号带 `-` 的标为预发布。打包需要仓库 Secrets 里的更新签名私钥 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` |
+| 后端单测 | `cargo test -p embymini-core` |
+| 用到 mpv 的测试（需要 PATH 里的 mpv；Windows CI 默认跑） | `cargo test -p embymini-core -- --ignored bundled_config user_conf _script` |
+| 检查 | `cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` |
+| 试验版界面 | `cargo run -p embymini -- --fake`（生成的海报）；导出 `EMBY_SERVER` / `PORT` / `EMBY_USER` / `EMBY_PASS` 后去掉 `--fake` 连真服 |
+| 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test -p embymini-core e2e_real_server -- --ignored --nocapture` |
+| 本地缓存验收（同上；整片缓存模式，会下载几百 MB） | `cargo test -p embymini-core e2e_cache_proxy -- --ignored --nocapture` |
+| 弹幕端到端（同上，另需 `DANMU_API` = 弹幕接口地址、`DISPLAY`；`EMBY_TEST_ITEM` 指定一集能匹配上的剧） | `cargo test -p embymini-core e2e_danmaku -- --ignored --nocapture` |
+| Windows 构建 | 推送 `gpui/**` 分支触发 `gpui` workflow：后端测试、试验版测速与截图、Inno Setup 安装包（在该次运行的 Artifacts 里） |
 
 端到端测试会真实播放并回传进度，结束时把观看记录恢复成测试前的样子。
 
@@ -79,5 +81,5 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 ## 第三方
 
 - [mpv](https://mpv.io)（GPL）：安装包附带 shinchiro 构建
-- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `src-tauri/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电；加弹幕按钮），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文
-- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `src-tauri/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA、标明是预览的请求头和读超时；网络流只取关键帧、同时只有一个取图请求），标 `EmbyMini:`
+- [ModernZ](https://github.com/Samillion/ModernZ) v0.3.3（LGPL-2.1，见 `resources/mpv/MODERNZ-LICENSE`）。`modernz.lua` 有少量改动（顶栏标题居中、加网速；下一集已就绪时下一集按钮变绿带闪电；加弹幕按钮），改动处标 `EmbyMini:`；`modernz-locale.json` 只保留英文和简体中文
+- [thumbfast](https://github.com/po5/thumbfast)（MPL-2.0，见 `resources/mpv/THUMBFAST-LICENSE`）：进度条悬停预览。少量改动（缩略图进程带上主播放器的请求头、UA、标明是预览的请求头和读超时；网络流只取关键帧、同时只有一个取图请求），标 `EmbyMini:`

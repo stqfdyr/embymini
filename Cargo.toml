@@ -1,13 +1,24 @@
-# Workspace for the GPUI app. src-tauri is the current release app and keeps its own lockfile until the switch.
+# crates/core is the backend (no UI framework), crates/app the GPUI desktop app built on it.
 [workspace]
-members = ["crates/app"]
-exclude = ["src-tauri"]
+members = ["crates/app", "crates/core"]
 resolver = "3"
 
 [workspace.package]
+# App version: the installer, the About page and the client version sent to servers all read it
+version = "0.5.99"
 edition = "2024"
 rust-version = "1.92"
 publish = false
+
+# On top of clippy's defaults (CI runs clippy with -D warnings). Tests may unwrap / expect (clippy.toml).
+[workspace.lints.clippy]
+unwrap_used = "warn"                     # use ?, or expect("why this cannot fail")
+allow_attributes = "warn"                # silence with #[expect(lint, reason = "...")]: it warns once stale
+allow_attributes_without_reason = "warn"
+redundant_clone = "warn"
+missing_assert_message = "warn"
+dbg_macro = "warn"
+todo = "warn"
 
 # Profiles follow the usual split: `release` is what ships (slow to build), `ci` is for measuring and testing
 # optimised code quickly, `dev` stays debuggable but keeps hot dependencies fast.
@@ -22,6 +33,12 @@ strip = true
 inherits = "release"
 lto = false
 codegen-units = 16
+
+# CI runs the backend tests in this profile (to share the optimised dependencies): keep the checks local dev-profile
+# runs have, so an overflow in cache or offset math still panics there. Only this crate: dependencies stay shared.
+[profile.ci.package.embymini-core]
+debug-assertions = true
+overflow-checks = true
 
 [profile.dev]
 # Line tables and less: backtraces keep file:line, linking and the target dir stay small

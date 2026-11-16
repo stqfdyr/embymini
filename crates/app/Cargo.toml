@@ -1,11 +1,14 @@
 [package]
 # The binary must stay embymini.exe: the installer and the updater of existing installs expect that name.
 name = "embymini"
-version = "0.5.99"
+version.workspace = true
 description = "Emby 桌面客户端：浏览 + mpv 播放"
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
 # Exact pin: every gpui-kit release may move to a GPUI snapshot with a different API.

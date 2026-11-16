@@ -1,6 +1,6 @@
 -- Screenshots of the bundled mpv config without a server: ModernZ controls, next episode ready (green bolt),
 -- episode menu (CJK and icon fonts).
--- mpv --config-dir=src-tauri/mpv --script=tools/mpv-shot.lua --force-window=yes "av://lavfi:testsrc2=duration=60:size=1920x1080"
+-- mpv --config-dir=resources/mpv --script=tools/mpv-shot.lua --force-window=yes "av://lavfi:testsrc2=duration=60:size=1920x1080"
 -- Writes to $SHOT_DIR (default: current directory) and quits. Used by Windows CI and local Xvfb.
 local dir = os.getenv("SHOT_DIR") or "."
 local function shot(name) mp.commandv("screenshot-to-file", dir .. "/" .. name .. ".png", "window") end

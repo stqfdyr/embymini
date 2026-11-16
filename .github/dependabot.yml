@@ -1,33 +1,16 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /src-tauri
+    directory: /
     schedule:
       interval: monthly
     groups:
       cargo:
         patterns: ["*"]
     ignore:
-      # Tauri's Rust crates and npm packages must share major.minor; bump those together by hand
-      - dependency-name: "tauri*"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-  - package-ecosystem: npm
-    directory: /ui
-    schedule:
-      interval: monthly
-    groups:
-      npm:
-        patterns: ["*"]
-    ignore:
-      # Tauri's Rust crates and npm packages must share major.minor; bump those together by hand
-      - dependency-name: "@tauri-apps/*"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # svelte-check supports TypeScript 5 and 6 only; move to 7 by hand once it does
-      - dependency-name: typescript
-        update-types: ["version-update:semver-major"]
-      # Node types follow the Node major the project runs on; bump them together with it
-      - dependency-name: "@types/node"
-        update-types: ["version-update:semver-major"]
+      # Every gpui-kit release may move to a GPUI snapshot with a different API: pinned exactly, bumped by hand
+      - dependency-name: "gpui-kit*"
+      - dependency-name: "gpui-pre-*"
   - package-ecosystem: github-actions
     directory: /
     schedule:

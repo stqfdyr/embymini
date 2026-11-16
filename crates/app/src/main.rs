@@ -5,6 +5,7 @@
 //! few seconds, writes timings and memory to the file and exits.
 
 mod data;
+mod design;
 mod home;
 mod poster;
 
@@ -32,13 +33,23 @@ fn main() {
     STARTED.set(Instant::now()).ok();
     let mut fake = false;
     let mut bench = None;
+    let mut design: Option<PathBuf> = None;
+    let mut page = String::new();
+    let mut light = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--fake" => fake = true,
             "--bench" => bench = args.next().map(PathBuf::from),
+            "--design" => design = args.next().map(PathBuf::from),
+            "--page" => page = args.next().unwrap_or_default(),
+            "--light" => light = true,
             other => eprintln!("unknown argument {other}"),
         }
+    }
+    if let Some(dir) = design {
+        design::run(design::Options { dir, page, light });
+        return;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

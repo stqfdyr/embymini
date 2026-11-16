@@ -9,7 +9,42 @@ edition = "2024"
 rust-version = "1.92"
 publish = false
 
+# Profiles follow the usual split: `release` is what ships (slow to build), `ci` is for measuring and testing
+# optimised code quickly, `dev` stays debuggable but keeps hot dependencies fast.
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+# Release optimisation without LTO: LTO redoes the whole program on every build and cannot reuse cached
+# dependencies; this one only recompiles the app crate. Numbers measured with it are close to, not equal to, release.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
+[profile.dev]
+# Line tables and less: backtraces keep file:line, linking and the target dir stay small
+debug = "limited"
+
+# Same for build scripts and proc-macros, or Cargo builds the shared ones twice
+[profile.dev.build-override]
+debug = "limited"
+
+# Unoptimised, these make a debug build unusable (image decoding and layout take seconds) or slow every
+# compile (proc-macros); optimise them even in dev. Built once, then cached.
+[profile.dev.package]
+image = { opt-level = 3 }
+zune-jpeg = { opt-level = 3 }
+zune-core = { opt-level = 3 }
+png = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+image-webp = { opt-level = 3 }
+taffy = { opt-level = 3 }
+resvg = { opt-level = 3 }
+tiny-skia = { opt-level = 3 }
+serde_json = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+syn = { opt-level = 3 }
+quote = { opt-level = 3 }
+proc-macro2 = { opt-level = 3 }

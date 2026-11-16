@@ -1,12 +1,44 @@
 # GPUI app on Windows: build, measure (startup, image loading, scrolling, memory), screenshot, build the
 # Inno Setup installer, install / launch / uninstall it, and measure the current release for comparison.
 # Runs on pushes to gpui/** branches only; numbers land in the job summary, files in the "gpui" artifact.
+#
+# Speed: lint and build run as two parallel jobs; dependencies come from the rust-cache (saved even when a later
+# step fails); the build uses the `ci` profile (no LTO, see Cargo.toml); a newer push cancels the older run;
+# Defender real-time scanning, which slows every file Cargo writes, is turned off for the job.
 name: gpui
 on:
   push:
     branches: ['gpui/**']
+    paths-ignore: ['**/*.md', 'ui/**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  lint:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: Set-MpPreference -DisableRealtimeMonitoring $true
+        continue-on-error: true
+      - uses: actions/checkout@v7
+      # Same pinned toolchain as the release workflow
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked -p embymini --all-targets -- -D warnings
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 60
@@ -14,20 +46,21 @@ jobs:
       run:
         shell: pwsh
     steps:
+      - run: Set-MpPreference -DisableRealtimeMonitoring $true
+        continue-on-error: true
       - uses: actions/checkout@v7
-      # Same pinned toolchain as the release workflow
       - uses: dtolnay/rust-toolchain@1.100.0
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
-      - run: cargo clippy --locked -p embymini --all-targets -- -D warnings
-
-      - name: 编译（release）
+      - name: 编译（ci profile）
         run: |
-          $t = Measure-Command { cargo build --locked --release -p embymini | Out-Host }
+          $t = Measure-Command { cargo build --locked --profile ci -p embymini | Out-Host }
           if ($LASTEXITCODE) { throw "cargo build 失败" }
           New-Item -ItemType Directory -Force out | Out-Null
+          New-Item -ItemType Directory -Force target\release | Out-Null
+          Copy-Item target\ci\embymini.exe target\release\embymini.exe -Force
           $exe = Get-Item target\release\embymini.exe
           @{ build_s = [math]::Round($t.TotalSeconds); exe_mb = [math]::Round($exe.Length / 1MB, 1) } | ConvertTo-Json | Set-Content out\build.json
           Get-Content out\build.json
@@ -107,7 +140,7 @@ jobs:
           @"
           | 项 | 值 |
           |---|---|
-          | release 编译 | $($b.build_s) s |
+          | 编译（ci profile，无 LTO） | $($b.build_s) s |
           | exe | $($b.exe_mb) MB |
           | 安装包 | $($i.installer_mb) MB |
           | 首帧 / 数据 / 全部海报 | $($r.first_frame_ms) / $($r.data_ms) / $($r.images_ms) ms（$($r.images_loaded) 张，失败 $($r.images_failed)） |

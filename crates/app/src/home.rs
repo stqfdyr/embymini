@@ -17,6 +17,8 @@ use crate::{
 
 /// When the rows were ready on the tokio side (f64 bits), to tell a slow load from a slow hand-over to the UI.
 static LOADED_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// When the UI-side load task first ran (f64 bits): a late start means the UI thread was busy.
+static TASK_START_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 enum State {
     Loading,
@@ -39,6 +41,7 @@ impl Home {
         cx: &mut Context<Self>,
     ) -> Self {
         let load = cx.spawn(async move |this, cx| {
+            TASK_START_MS.store(crate::since_start_ms().to_bits(), Ordering::Relaxed);
             let r = crate::rt()
                 .spawn(async move {
                     let r = data::load(source).await;
@@ -64,11 +67,12 @@ impl Home {
             .ok();
         });
         let bench = bench.map(|out| {
-            // Wake the view while images load; the scroll phase then drives itself frame by frame.
+            // Wake the view while images load (often enough to time them, rarely enough not to keep the UI
+            // thread busy); the scroll phase then drives itself frame by frame.
             let poll = cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor()
-                        .timer(Duration::from_millis(16))
+                        .timer(Duration::from_millis(100))
                         .await;
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
@@ -216,6 +220,8 @@ fn card(c: &Card, kind: Kind, window: &Window, cx: &App) -> impl IntoElement {
 struct Bench {
     out: PathBuf,
     first_frame_ms: Option<f64>,
+    /// Start time of the first renders, to spot a UI thread stalled between them
+    early_frames_ms: Vec<f64>,
     data_ms: f64,
     images_ms: Option<f64>,
     mem_loaded_mb: f64,
@@ -237,6 +243,7 @@ impl Bench {
         Self {
             out,
             first_frame_ms: None,
+            early_frames_ms: Vec::new(),
             data_ms: 0.0,
             images_ms: None,
             mem_loaded_mb: 0.0,
@@ -252,6 +259,9 @@ impl Bench {
     fn step(&mut self, total: usize, scroll: &ScrollHandle, window: &mut Window) -> bool {
         let now_ms = crate::since_start_ms();
         self.first_frame_ms.get_or_insert(now_ms);
+        if self.early_frames_ms.len() < 8 {
+            self.early_frames_ms.push((now_ms * 10.0).round() / 10.0);
+        }
         if self.images_ms.is_none() {
             let done =
                 poster::LOADED.load(Ordering::Relaxed) + poster::FAILED.load(Ordering::Relaxed);
@@ -300,6 +310,8 @@ impl Bench {
         };
         let report = serde_json::json!({
             "first_frame_ms": self.first_frame_ms,
+            "early_frames_ms": self.early_frames_ms,
+            "task_start_ms": f64::from_bits(TASK_START_MS.load(Ordering::Relaxed)),
             "data_ready_ms": f64::from_bits(LOADED_AT_MS.load(Ordering::Relaxed)),
             "data_ms": self.data_ms,
             "images_ms": self.images_ms,

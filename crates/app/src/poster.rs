@@ -25,8 +25,18 @@ pub static LOADED: AtomicUsize = AtomicUsize::new(0);
 /// Images that failed.
 pub static FAILED: AtomicUsize = AtomicUsize::new(0);
 
-/// At most this many images download or decode at once.
+/// At most this many images download at once.
 const PARALLEL: usize = 8;
+
+/// Decoding and scaling run on at most half the cores, so the UI thread (and a software renderer) always has CPU
+/// left; with every core busy decoding, the window stops drawing until the whole page of posters is done.
+fn decode_slots() -> &'static tokio::sync::Semaphore {
+    static S: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        tokio::sync::Semaphore::new((cores / 2).max(1))
+    })
+}
 
 pub struct Poster;
 
@@ -81,9 +91,12 @@ async fn load((key, w, h): (Key, u32, u32)) -> Result<Arc<RenderImage>> {
             r.bytes().await?.to_vec()
         }
         &Key::Fake { seed, wide } => {
+            let _cpu = decode_slots().acquire().await?;
             tokio::task::spawn_blocking(move || generate(seed, wide)).await??
         }
     };
+    drop(_slot);
+    let _cpu = decode_slots().acquire().await?;
     tokio::task::spawn_blocking(move || decode(&bytes, w, h)).await?
 }
 

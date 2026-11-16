@@ -1,6 +1,7 @@
 node_modules/
 ui/dist/
 src-tauri/target/
+/target/
 src-tauri/gen/
 src-tauri/mpv/mpv.exe
 __pycache__/

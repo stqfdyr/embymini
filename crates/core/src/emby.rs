@@ -605,7 +605,7 @@ pub(crate) mod tests {
         );
         let cdn = MediaSource {
             direct_stream_url: Some("https://cdn.example/v.mkv?api_key=k&t=1".into()),
-            ..bare.clone()
+            ..bare
         };
         assert_eq!(c.stream_url("9", &cdn), "https://cdn.example/v.mkv?t=1");
         assert_eq!(c.token_header(), "X-Emby-Token: tok");

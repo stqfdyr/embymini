@@ -10,6 +10,16 @@ edition = "2024"
 rust-version = "1.92"
 publish = false
 
+# On top of clippy's defaults (CI runs clippy with -D warnings). Tests may unwrap / expect (clippy.toml).
+[workspace.lints.clippy]
+unwrap_used = "warn"                     # use ?, or expect("why this cannot fail")
+allow_attributes = "warn"                # silence with #[expect(lint, reason = "...")]: it warns once stale
+allow_attributes_without_reason = "warn"
+redundant_clone = "warn"
+missing_assert_message = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
 # Profiles follow the usual split: `release` is what ships (slow to build), `ci` is for measuring and testing
 # optimised code quickly, `dev` stays debuggable but keeps hot dependencies fast.
 [profile.release]

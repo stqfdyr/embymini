@@ -58,7 +58,10 @@ const HEDGE: [u64; 3] = [3, 5, 8];
 const OPEN_LIMIT: Duration = Duration::from_secs(30);
 /// A first read's wait for the size: a little past [`OPEN_LIMIT`], so the first request's own verdict lands first.
 const SIZE_WAIT: Duration = Duration::from_secs(OPEN_LIMIT.as_secs() + 5);
-const _: () = assert!(SIZE_WAIT.as_secs() > OPEN_LIMIT.as_secs());
+const _: () = assert!(
+    SIZE_WAIT.as_secs() > OPEN_LIMIT.as_secs(),
+    "SIZE_WAIT must outlast OPEN_LIMIT"
+);
 /// Largest chunk per body frame sent to mpv.
 const READ_CHUNK: u64 = 256 << 10;
 /// Video cache cap when the disk has room.
@@ -900,7 +903,9 @@ impl Stream {
             let mut r = status(416);
             r.headers_mut().insert(
                 hyper::header::CONTENT_RANGE,
-                format!("bytes */{size}").parse().unwrap(),
+                format!("bytes */{size}")
+                    .parse()
+                    .expect("digits and ASCII make a valid header value"),
             );
             return r;
         };
@@ -934,7 +939,9 @@ impl Stream {
             *r.status_mut() = StatusCode::PARTIAL_CONTENT;
             r.headers_mut().insert(
                 hyper::header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{size}").parse().unwrap(),
+                format!("bytes {start}-{end}/{size}")
+                    .parse()
+                    .expect("digits and ASCII make a valid header value"),
             );
         }
         if !head {
@@ -1221,7 +1228,9 @@ impl Stream {
         let r = loop {
             tokio::select! {
                 r = &mut a => match r {
-                    Err(e) if e.transient() && b.is_some() => a = b.take().unwrap(),
+                    Err(e) if e.transient() && b.is_some() => {
+                        a = b.take().expect("the guard checked b is Some");
+                    }
                     r => break r,
                 },
                 r = maybe(&mut b) => match r {

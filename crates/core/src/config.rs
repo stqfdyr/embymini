@@ -481,7 +481,7 @@ mod tests {
         // When the old LOCALAPPDATA dir is the fallback root, it must not delete itself.
         let root2 = old_local.join("data");
         fs::create_dir_all(&old_local).unwrap();
-        assert!(migrate(&root2, &old_cfg, &[old_cfg.clone(), old_local.clone()]).unwrap());
+        assert!(migrate(&root2, &old_cfg, &[old_cfg.clone(), old_local]).unwrap());
         assert!(root2.join("config.json").is_file());
         fs::remove_dir_all(t).unwrap();
     }

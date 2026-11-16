@@ -1,5 +1,5 @@
 //! Local cache for posters and backdrops, the way native image libraries (Nuke / Kingfisher / Coil) do it:
-//! the UI asks with an `emby-img` path → disk cache → otherwise the server-resized size from upstream,
+//! the UI asks with a [`Req`] path → disk cache → otherwise the server-resized size from upstream,
 //! stored before it is handed back.
 //!
 //! - Upstream images much wider than asked (some servers ignore maxWidth) are downsampled before storing
@@ -22,7 +22,6 @@ use tokio::sync::{OnceCell, Semaphore};
 
 use crate::lock;
 
-pub const SCHEME: &str = "emby-img";
 /// Disk cap. A poster (240–480 px) is 20–60 KB, a backdrop (1600 px) 200–400 KB: room for tens of thousands.
 pub const CAP: u64 = 1024 * 1024 * 1024;
 /// Upstream fetches at a time: enough to fill a poster grid without swamping a relay.

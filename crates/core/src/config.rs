@@ -9,7 +9,7 @@ use std::{
 };
 
 /// Marker file in the data dir. The uninstaller deletes `data\` only when it is present, so installing into a
-/// folder that already had someone else's `data` never wipes it. Renaming it needs `windows/hooks.nsh` too.
+/// folder that already had someone else's `data` never wipes it. Renaming it needs the uninstaller (`packaging/windows/embymini.iss`) too.
 pub const MARKER: &str = ".embymini";
 
 /// Data root: everything (config, logs, UI cache, mpv cache) lives in `data\` beside the exe, nothing on the

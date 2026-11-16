@@ -122,7 +122,7 @@ pub enum Ctl {
     Mpv(Value),
 }
 
-/// Playback events for the frontend. The UI acts only on `failed` and `ended`; `started`, `preloaded` and
+/// Playback events for the UI. It acts only on `failed` and `ended`; `started`, `preloaded` and
 /// `stopped` are the milestones tests wait on (they mirror the Sessions reports and cost one small message each).
 #[derive(Serialize, Debug, Clone, PartialEq)]
 #[serde(

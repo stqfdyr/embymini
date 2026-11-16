@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 /// When the user closed the window (or the process began exiting): each close phase logs its time since, to find
-/// where "closing hangs for a moment" is spent. Only the window events start it, never [`App::shutdown`], so an
-/// update whose installer fails to start leaves no stale start behind.
+/// where "closing hangs for a moment" is spent. Only the UI's close handling starts it, never [`App::shutdown`], so
+/// a shutdown that does not end in exit (an update whose installer fails to start) leaves no stale start behind.
 static CLOSE_T0: OnceLock<Instant> = OnceLock::new();
 
 /// Starts the timer; later calls keep the first start.
@@ -32,8 +32,8 @@ pub fn exit_mark(phase: &str) {
     }
 }
 
-/// Running marker (`running` in the data dir, holding the version): written at start, removed on a clean exit
-/// (auto-update included). Still there at start = the last run crashed or was killed.
+/// Running marker (`running` in the data dir, holding the version): written by [`App::open`], removed by
+/// [`App::shutdown`] (a clean exit, auto-update included). Still there at start = the last run crashed or was killed.
 const RUNNING: &str = "running";
 
 pub fn set_running(root: &std::path::Path, on: bool) {
@@ -45,6 +45,8 @@ pub fn set_running(root: &std::path::Path, on: bool) {
     };
 }
 
+/// The async methods use tokio (reqwest, spawned tasks): await them on [`rt`], e.g.
+/// `rt::spawn(async move { app.call(..).await })`, not on the UI's own executor.
 pub struct App {
     path: PathBuf,
     cfg: Mutex<Config>,
@@ -54,7 +56,7 @@ pub struct App {
     /// mpv's cache dir, `mpv-cache` under the data dir, so uninstalling with "delete app data" removes it.
     mpv_cache: Option<PathBuf>,
     player: Mutex<Option<Player>>,
-    /// Disk cache for posters and backdrops (the `emby-img` protocol).
+    /// Disk cache for posters and backdrops.
     images: std::sync::Arc<images::Images>,
     /// Local caching proxy (video, subtitles); None when it failed to start, then playback goes direct.
     stream: Option<stream::Stream>,
@@ -143,7 +145,7 @@ impl App {
         }
     }
 
-    /// First exit step, run as soon as close is clicked (before window teardown and `RunEvent::Exit`): stops
+    /// First exit step, run as soon as close is clicked (before window teardown): stops
     /// starting `play` calls and tells mpv to quit; [`App::shutdown`] waits for the reports. Repeatable.
     pub fn begin_shutdown(&self) {
         self.quit.send_replace(true);
@@ -154,7 +156,8 @@ impl App {
 
     /// Call before exiting: mpv is a separate process that outlives us, while the report tasks die with us and the
     /// resume point is lost. So stop starting `play` calls and wait for them (or one may register a player right
-    /// after), then quit mpv and wait for the Stopped reports. Waits `wait` at most in total.
+    /// after), then quit mpv and wait for the Stopped reports. Waits `wait` at most in total. Ends by removing the
+    /// running marker: this is the clean exit ([`App::cancel_shutdown`] puts it back).
     pub fn shutdown(&self, wait: Duration) {
         self.begin_shutdown();
         rt::block_on(async {
@@ -171,7 +174,15 @@ impl App {
                 }
             }
         });
+        self.mark_running(false);
         exit_mark("shutdown_done");
+    }
+
+    /// Writes or removes the running marker in the data dir (nothing for an App without one, as in tests).
+    fn mark_running(&self, on: bool) {
+        if let Some(root) = self.path.parent() {
+            set_running(root, on);
+        }
     }
 
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, Error> {
@@ -301,10 +312,11 @@ impl App {
         self.path.parent().unwrap_or(Path::new("."))
     }
 
-    /// Undoes [`App::begin_shutdown`] when the program stays in use after all (an update that failed to start):
-    /// otherwise every later play is dropped as "quitting".
+    /// Undoes [`App::begin_shutdown`] / [`App::shutdown`] when the program stays in use after all (an update that
+    /// failed to start): otherwise every later play is dropped as "quitting" and a crash would go unnoticed.
     pub fn cancel_shutdown(&self) {
         self.quit.send_replace(false);
+        self.mark_running(true);
     }
 
     /// Settings page contents.
@@ -469,7 +481,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// A poster or backdrop for the image scheme, from [`images::Images`] (disk cache → upstream). The path carries a
+    /// A poster or backdrop by [`images::Req`] path, from [`images::Images`] (disk cache → upstream). The path carries a
     /// server id, mapped here to that server's API root; unknown servers get a 404 and nothing is fetched elsewhere.
     pub async fn image(&self, path: &str) -> images::Got {
         let Some(req) = images::Req::parse(path) else {
@@ -610,8 +622,8 @@ fn no_server() -> Error {
     Error::Other("服务器不存在".into())
 }
 
-/// Bytes per cache manager row; `playing` means the film being played stays in the video cache. The library
-/// cache (list snapshots) lives in the UI's localStorage and is counted there.
+/// Bytes per cache manager row; `playing` means the film being played stays in the video cache. A UI-side library
+/// cache (list snapshots), if any, is the UI's to count.
 #[derive(Serialize, Default)]
 pub struct CacheInfo {
     video: u64,
@@ -639,8 +651,8 @@ impl Clear {
     }
 }
 
-/// The updater plugin's temp dir, `<productName>-<version>-updater-<random>`: the plugin keeps it forever
-/// (`tempdir().keep()`, ~40 MB per update) and it is useless once the new version is installed.
+/// 0.5.x's updater (the Tauri plugin) temp dir, `<productName>-<version>-updater-<random>`: the plugin keeps it
+/// forever (`tempdir().keep()`, ~40 MB per update) and it is useless once the new version is installed.
 pub fn is_updater_leftover(name: &str) -> bool {
     name.starts_with("EmbyMini-") && name.contains("-updater-")
 }
@@ -780,7 +792,7 @@ fn spawn_cleanups(root: PathBuf) {
 mod tests {
     use super::*;
 
-    /// The updater calls shutdown without exiting when the installer fails: that must not start the close timer.
+    /// A shutdown that does not end in exit (an update whose installer fails) must not start the close timer.
     /// (No test calls `exit_start`, so the global stays unset.)
     #[test]
     fn shutdown_does_not_start_the_close_timer() {
@@ -992,6 +1004,24 @@ mod tests {
         app.shutdown(Duration::from_secs(3));
         assert!(done.load(Ordering::SeqCst));
         assert!(lock(&app.player).is_none());
+    }
+
+    /// shutdown is the clean exit and removes the marker; cancel_shutdown (the program stays open) puts it back.
+    #[test]
+    fn shutdown_clears_the_running_marker_and_cancel_restores_it() {
+        let dir = std::env::temp_dir().join(format!("embymini-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut app = test_app(None);
+        app.path = dir.join("config.json");
+        set_running(&dir, true);
+        app.shutdown(Duration::ZERO);
+        assert!(!dir.join(RUNNING).exists(), "shutdown removes the marker");
+        app.cancel_shutdown();
+        assert!(
+            dir.join(RUNNING).exists(),
+            "cancel_shutdown writes it again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

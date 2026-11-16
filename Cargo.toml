@@ -34,6 +34,12 @@ inherits = "release"
 lto = false
 codegen-units = 16
 
+# CI runs the backend tests in this profile (to share the optimised dependencies): keep the checks local dev-profile
+# runs have, so an overflow in cache or offset math still panics there. Only this crate: dependencies stay shared.
+[profile.ci.package.embymini-core]
+debug-assertions = true
+overflow-checks = true
+
 [profile.dev]
 # Line tables and less: backtraces keep file:line, linking and the target dir stay small
 debug = "limited"

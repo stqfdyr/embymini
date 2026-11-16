@@ -8,9 +8,9 @@
 //!   need revalidation.
 //! - Disk cap [`CAP`]: above it the least recently used (file mtime, refreshed on hit) go first, down to 90%.
 //! - Concurrent requests for one image fetch it once; at most [`PARALLEL`] upstream fetches at a time.
-//! - Upstream 404s are remembered by "API root + file name" for [`MISS_TTL`] and answered 404 directly (some
-//!   servers list a Logo tag whose image does not exist; the home carousel would refetch it every turn).
-//!   A changed address fetches again; clearing the image cache forgets them.
+//! - Upstream 404s are remembered by "API root + file name" for [`MISS_TTL`] and answered
+//!   [`ImageError::Missing`] directly (some servers list a Logo tag whose image does not exist; the home carousel
+//!   would refetch it every turn). A changed address fetches again; clearing the image cache forgets them.
 //! - Images come only from configured servers (the path holds a server id, not an address); not a generic proxy.
 
 use std::collections::HashMap;
@@ -125,8 +125,25 @@ pub fn downsample(bytes: Vec<u8>, width: u32) -> Vec<u8> {
     }
 }
 
-/// Result of one image request: the bytes, or the HTTP status for the UI.
-pub type Got = Result<Arc<Vec<u8>>, u16>;
+/// Why an image could not be had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ImageError {
+    /// The request path is not a [`Req`].
+    #[error("图片路径无效")]
+    BadPath,
+    /// The path names a server that is not configured (removed meanwhile).
+    #[error("没有这个服务器")]
+    UnknownServer,
+    /// Upstream has no such image (404, remembered for [`MISS_TTL`]).
+    #[error("服务器上没有这张图")]
+    Missing,
+    /// Anything else: the upstream status, or `None` for a network or decoding failure.
+    #[error("取图失败{}", .0.map(|s| format!("（{s}）")).unwrap_or_default())]
+    Failed(Option<u16>),
+}
+
+/// Result of one image request: the bytes, or why not.
+pub type Got = Result<Arc<Vec<u8>>, ImageError>;
 
 pub struct Images {
     dir: PathBuf,
@@ -164,15 +181,15 @@ impl Images {
         crate::rt::spawn_blocking(move || me.recount());
     }
 
-    /// Gets one image: disk cache → upstream. `api_base` is that server's API root (unknown servers get a 404
-    /// from the caller).
+    /// Gets one image: disk cache → upstream. `api_base` is that server's API root (the caller answers unknown
+    /// servers with [`ImageError::UnknownServer`]).
     pub async fn get(&self, req: &Req, api_base: &str) -> Got {
         let key = req.file_name();
         let miss_key = format!("{api_base} {key}");
         let epoch = {
             let m = lock(&self.missing);
             if m.1.get(&miss_key).is_some_and(|t| t.elapsed() < MISS_TTL) {
-                return Err(404);
+                return Err(ImageError::Missing);
             }
             m.0
         };
@@ -189,7 +206,7 @@ impl Images {
                 let r = tokio::task::spawn_blocking(move || downsample(b, width))
                     .await
                     .map(Arc::new)
-                    .map_err(|_| 500u16);
+                    .map_err(|_| ImageError::Failed(None));
                 if let Ok(b) = &r {
                     self.store(&path, b).await;
                 }
@@ -198,7 +215,7 @@ impl Images {
             .await
             .clone();
         lock(&self.inflight).remove(&key);
-        if got == Err(404) {
+        if got == Err(ImageError::Missing) {
             let mut m = lock(&self.missing);
             if m.0 == epoch {
                 m.1.retain(|_, t| t.elapsed() < MISS_TTL);
@@ -208,13 +225,18 @@ impl Images {
         got
     }
 
-    /// Fetches the raw bytes. Failures return a status (network errors count as 502) passed on to the UI.
-    async fn fetch(&self, url: &str) -> Result<Vec<u8>, u16> {
+    /// Fetches the raw bytes. An upstream 404 is [`ImageError::Missing`], other statuses and network errors
+    /// [`ImageError::Failed`].
+    async fn fetch(&self, url: &str) -> Result<Vec<u8>, ImageError> {
         // Transient failures retry per crate::status; the slot is released while waiting, so a few
         // rate-limited images do not block the whole page.
         let mut n = 0;
         loop {
-            let slot = self.slots.acquire().await.map_err(|_| 503u16)?;
+            let slot = self
+                .slots
+                .acquire()
+                .await
+                .map_err(|_| ImageError::Failed(None))?;
             let sent = self.http.get(url).send().await;
             match crate::status::retry_wait(&sent, true) {
                 Some(wait) if n < crate::status::RETRIES => {
@@ -228,13 +250,20 @@ impl Images {
             }
             let resp = sent.map_err(|e| {
                 log::warn!("取图失败：{}", e.without_url());
-                502u16
+                ImageError::Failed(None)
             })?;
             let status = resp.status();
-            if !status.is_success() {
-                return Err(status.as_u16());
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(ImageError::Missing);
             }
-            return resp.bytes().await.map(|b| b.to_vec()).map_err(|_| 502u16);
+            if !status.is_success() {
+                return Err(ImageError::Failed(Some(status.as_u16())));
+            }
+            return resp
+                .bytes()
+                .await
+                .map(|b| b.to_vec())
+                .map_err(|_| ImageError::Failed(None));
         }
     }
 
@@ -465,27 +494,27 @@ mod tests {
             "hit refreshes mtime"
         );
         let missing = Req::parse("s/404/Primary/0/t/240").unwrap();
-        assert_eq!(img.get(&missing, &base).await, Err(404));
+        assert_eq!(img.get(&missing, &base).await, Err(ImageError::Missing));
         assert!(
             !dir.join(missing.file_name()).exists(),
             "failures are not stored"
         );
         let before = hits.load(Ordering::SeqCst);
-        assert_eq!(img.get(&missing, &base).await, Err(404));
+        assert_eq!(img.get(&missing, &base).await, Err(ImageError::Missing));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before,
             "404 remembered, upstream not asked"
         );
         img.clear();
-        assert_eq!(img.get(&missing, &base).await, Err(404));
+        assert_eq!(img.get(&missing, &base).await, Err(ImageError::Missing));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 1,
             "asked again after a clear"
         );
         let other = base.replace("/emby", "/emby2");
-        assert_eq!(img.get(&missing, &other).await, Err(404));
+        assert_eq!(img.get(&missing, &other).await, Err(ImageError::Missing));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 2,
@@ -499,9 +528,9 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(30)).await;
         img.clear();
-        assert_eq!(t.await.unwrap(), Err(404));
+        assert_eq!(t.await.unwrap(), Err(ImageError::Missing));
         let gone = Req::parse("s/404/Logo/0/t/240").unwrap();
-        assert_eq!(img.get(&gone, &base).await, Err(404));
+        assert_eq!(img.get(&gone, &base).await, Err(ImageError::Missing));
         assert_eq!(
             hits.load(Ordering::SeqCst),
             before + 4,
@@ -554,7 +583,10 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let req = Req::parse("s/2/Primary/0/t/240").unwrap();
         let (base, hits) = upstream(|_, _| BUSY).await;
-        assert_eq!(images(&dir, CAP).get(&req, &base).await, Err(503));
+        assert_eq!(
+            images(&dir, CAP).get(&req, &base).await,
+            Err(ImageError::Failed(Some(503)))
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1 + crate::status::RETRIES as u64

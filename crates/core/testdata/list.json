@@ -1,0 +1,217 @@
+{
+  "Items": [
+    {
+      "BackdropImageTags": [
+        "f01M7K6482A82W7WNFASJAQQKG5"
+      ],
+      "CanDelete": false,
+      "CanDownload": true,
+      "CommunityRating": 6.8,
+      "DateCreated": "2026-11-17T06:02:32.906571+08:00",
+      "ForcedSortName": "米斯蒂·格林",
+      "GenreItems": [
+        {
+          "Id": "g18",
+          "Name": "剧情"
+        },
+        {
+          "Id": "g35",
+          "Name": "喜剧"
+        }
+      ],
+      "Genres": [
+        "剧情",
+        "喜剧"
+      ],
+      "Id": "m01M7K6482A82W7WNFASJAQQKG5",
+      "ImageTags": {
+        "Logo": "l01M7K6482A82W7WNFASJAQQKG5",
+        "Primary": "p01M7K6482A82W7WNFASJAQQKG5"
+      },
+      "IsFolder": false,
+      "MediaType": "Video",
+      "Name": "米斯蒂·格林",
+      "OriginalTitle": "Misty Green",
+      "Overview": "影片讲述一位才华横溢但事业停滞多年的女演员，在与一位故人重逢后，努力在好莱坞寻求",
+      "PremiereDate": "2026-10-09T00:00:00.0000000Z",
+      "ProductionYear": 2026,
+      "ProviderIds": {
+        "Imdb": "tt34385184",
+        "Tmdb": "1381221"
+      },
+      "RunTimeTicks": 62090000000,
+      "SortName": "米斯蒂·格林",
+      "Type": "Movie",
+      "UserData": {
+        "IsFavorite": false,
+        "ItemId": "m01M7K6482A82W7WNFASJAQQKG5",
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    },
+    {
+      "BackdropImageTags": [
+        "f01KM9WFP3S7J9YKYJMYNX2Y4F1"
+      ],
+      "CanDelete": false,
+      "ChildCount": 4,
+      "CommunityRating": 8.4,
+      "DateCreated": "2026-11-12T11:38:18.3912+08:00",
+      "EndDate": "2026-11-06T00:00:00Z",
+      "ForcedSortName": "塔尔萨之王",
+      "GenreItems": [
+        {
+          "Id": "g18",
+          "Name": "剧情"
+        },
+        {
+          "Id": "g35",
+          "Name": "喜剧"
+        },
+        {
+          "Id": "g80",
+          "Name": "犯罪"
+        }
+      ],
+      "Genres": [
+        "剧情",
+        "喜剧",
+        "犯罪"
+      ],
+      "Id": "m01KM9WFP3S7J9YKYJMYNX2Y4F1",
+      "ImageTags": {
+        "Logo": "l01KM9WFP3S7J9YKYJMYNX2Y4F1",
+        "Primary": "p01KM9WFP3S7J9YKYJMYNX2Y4F1"
+      },
+      "IsFolder": true,
+      "MediaType": "Video",
+      "Name": "塔尔萨之王",
+      "OriginalTitle": "Tulsa King",
+      "Overview": "曾经的纽约黑手党族长德怀特在服刑25年后从监狱获释，却被自己老大流放去了俄克拉荷",
+      "PremiereDate": "2022-11-13T00:00:00.0000000Z",
+      "ProductionYear": 2022,
+      "ProviderIds": {
+        "Douban": "35814636",
+        "Imdb": "tt16358384",
+        "Tmdb": "153312"
+      },
+      "RecursiveItemCount": 34,
+      "SortName": "塔尔萨之王",
+      "Status": "Returning Series",
+      "Type": "Series",
+      "UserData": {
+        "IsFavorite": false,
+        "ItemId": "m01KM9WFP3S7J9YKYJMYNX2Y4F1",
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    },
+    {
+      "BackdropImageTags": [
+        "f01M4T793FQFJA2D8JYADJKMK9M"
+      ],
+      "CanDelete": false,
+      "ChildCount": 1,
+      "CommunityRating": 10,
+      "DateCreated": "2026-11-14T02:19:28.145099+08:00",
+      "EndDate": "2026-10-23T00:00:00Z",
+      "ForcedSortName": "欲望的陷阱",
+      "GenreItems": [
+        {
+          "Id": "g18",
+          "Name": "剧情"
+        },
+        {
+          "Id": "g80",
+          "Name": "犯罪"
+        },
+        {
+          "Id": "g9648",
+          "Name": "悬疑"
+        }
+      ],
+      "Genres": [
+        "剧情",
+        "犯罪",
+        "悬疑"
+      ],
+      "Id": "m01M4T793FQFJA2D8JYADJKMK9M",
+      "ImageTags": {
+        "Logo": "l01M4T793FQFJA2D8JYADJKMK9M",
+        "Primary": "p01M4T793FQFJA2D8JYADJKMK9M"
+      },
+      "IsFolder": true,
+      "MediaType": "Video",
+      "Name": "欲望的陷阱",
+      "OriginalTitle": "욕망의 덫",
+      "Overview": "一桩谋杀冤案，让一个女人失去了一切，整个人生被彻底偷走。为了洗清罪名并夺回未来，",
+      "PremiereDate": "2026-08-10T00:00:00.0000000Z",
+      "ProductionYear": 2026,
+      "ProviderIds": {
+        "Imdb": "tt44093541",
+        "Tmdb": "326991"
+      },
+      "RecursiveItemCount": 58,
+      "SortName": "欲望的陷阱",
+      "Status": "Returning Series",
+      "Type": "Series",
+      "UserData": {
+        "IsFavorite": false,
+        "ItemId": "m01M4T793FQFJA2D8JYADJKMK9M",
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    },
+    {
+      "BackdropImageTags": [
+        "f01KMFX52X3RAT999YN93NBGFC2"
+      ],
+      "CanDelete": false,
+      "ChildCount": 2,
+      "CommunityRating": 8.4,
+      "DateCreated": "2026-07-30T15:59:48.770393+08:00",
+      "EndDate": "2001-10-31T00:00:00Z",
+      "ForcedSortName": "蓝色星球",
+      "GenreItems": [
+        {
+          "Id": "g99",
+          "Name": "纪录"
+        }
+      ],
+      "Genres": [
+        "纪录"
+      ],
+      "Id": "m01KMFX52X3RAT999YN93NBGFC2",
+      "ImageTags": {
+        "Logo": "l01KMFX52X3RAT999YN93NBGFC2",
+        "Primary": "p01KMFX52X3RAT999YN93NBGFC2"
+      },
+      "IsFolder": true,
+      "MediaType": "Video",
+      "Name": "蓝色星球",
+      "OriginalTitle": "The Blue Planet",
+      "Overview": "本节目带您进入令人叹为观止的美丽海洋世界，探索新的物种，造访无人所至的生态，并亲",
+      "PremiereDate": "2001-09-12T00:00:00.0000000Z",
+      "ProductionYear": 2001,
+      "ProviderIds": {
+        "Imdb": "tt0296310",
+        "Tmdb": "13579"
+      },
+      "RecursiveItemCount": 11,
+      "SortName": "蓝色星球",
+      "Status": "Ended",
+      "Type": "Series",
+      "UserData": {
+        "IsFavorite": false,
+        "ItemId": "m01KMFX52X3RAT999YN93NBGFC2",
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    }
+  ],
+  "TotalRecordCount": 29479
+}

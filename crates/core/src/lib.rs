@@ -1,13 +1,18 @@
 //! EmbyMini's backend: servers and config, the Emby API, posters, the local caching proxy, playback in mpv and
-//! danmaku. No UI framework in here: the UI shell holds an [`app::App`] and calls its methods.
+//! danmaku, plus the data layer the pages use (typed browsing requests, paging rules, list snapshots, display
+//! formats). No UI framework in here: the UI shell holds an [`app::App`] and calls its methods.
 
 pub mod app;
+pub mod browse;
 pub mod config;
 pub mod danmaku;
 pub mod emby;
+pub mod fmt;
 pub mod images;
+pub mod pager;
 pub mod player;
 pub mod rt;
+pub mod snapshot;
 pub mod status;
 pub mod stream;
 pub mod updater;

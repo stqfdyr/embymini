@@ -26,6 +26,10 @@ crates/core/          后端库，不依赖界面框架
   src/rt.rs           后端用的 tokio 运行时
   src/config.rs       本地配置：服务器列表、播放设置、地址规范化
   src/emby.rs         Emby HTTP：鉴权头、UA、通用请求、播放用的强类型
+  src/browse.rs       浏览数据：各页面的请求（首页、详情、季与单集、人物、媒体库分页、搜索、收藏）与回包类型
+  src/pager.rs        分页规则（兼容总数不准、无视 StartIndex 的服务器）
+  src/snapshot.rs     列表快照：上次浏览的数据落盘，下次打开先显示、取到新数据再替换
+  src/fmt.rs          显示格式：时长、年份、日期、技术参数行、角标、缓存大小
   src/status.rs       对外 HTTP 的统一处理：状态码分类、重试、给人看的错误说明
   src/images.rs       海报、背景图的本地磁盘缓存
   src/stream.rs       本地缓存代理：mpv 从 127.0.0.1 读视频和字幕，边播边分块落盘，卡住时对冲重连
@@ -49,6 +53,7 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | 用到 mpv 的测试（需要 PATH 里的 mpv；Windows CI 默认跑） | `cargo test -p embymini-core -- --ignored bundled_config user_conf _script` |
 | 检查 | `cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` |
 | 试验版界面 | `cargo run -p embymini -- --fake`（生成的海报）；导出 `EMBY_SERVER` / `PORT` / `EMBY_USER` / `EMBY_PASS` 后去掉 `--fake` 连真服 |
+| 浏览接口真服测试（需要上面四个环境变量；会切换一部电影的收藏再改回去） | `cargo test -p embymini-core browse_real_server -- --ignored` |
 | 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test -p embymini-core e2e_real_server -- --ignored --nocapture` |
 | 本地缓存验收（同上；整片缓存模式，会下载几百 MB） | `cargo test -p embymini-core e2e_cache_proxy -- --ignored --nocapture` |
 | 弹幕端到端（同上，另需 `DANMU_API` = 弹幕接口地址、`DISPLAY`；`EMBY_TEST_ITEM` 指定一集能匹配上的剧） | `cargo test -p embymini-core e2e_danmaku -- --ignored --nocapture` |
@@ -65,7 +70,7 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | `data\config.json` | 服务器列表（含登录 token，不存密码）、播放设置、弹幕设置（含接口地址）与手动匹配记录 |
 | `data\mpv.conf` | 个人 mpv 配置：自己新建，在自带配置之后加载，同名选项以它为准，升级不覆盖 |
 | `data\logs\` | 日志（单个文件 2 MB 轮换，留最近 3 份；本地时间） |
-| `data\webview\` | 界面数据（含上次浏览的列表快照，启动时先显示） |
+| `data\cache\snap\` | 列表快照：上次浏览的首页、详情、媒体库第一页等，启动时先显示（上限 16 MB，按最近写入淘汰） |
 | `data\cache\images\` | 海报、背景图缓存（上限 1 GB，按最近使用淘汰） |
 | `data\cache\video\` | 视频缓存：只留最近播放的那一集和已就绪的下一集，换片时自动删；最多 20 GB，且给磁盘留至少 10 GB |
 | `data\cache\subs\` | 外挂字幕缓存（上限 200 MB，按最近使用淘汰） |

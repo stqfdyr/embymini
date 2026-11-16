@@ -1,0 +1,173 @@
+# GPUI app on Windows: build, measure (startup, image loading, scrolling, memory), screenshot, build the
+# Inno Setup installer, install / launch / uninstall it, and measure the current release for comparison.
+# Runs on pushes to gpui/** branches only; numbers land in the job summary, files in the "gpui" artifact.
+#
+# Speed: lint and build run as two parallel jobs; dependencies come from the rust-cache (saved even when a later
+# step fails); the build uses the `ci` profile (no LTO, see Cargo.toml); a newer push cancels the older run;
+# Defender real-time scanning, which slows every file Cargo writes, is turned off for the job.
+name: gpui
+on:
+  push:
+    branches: ['gpui/**']
+    paths-ignore: ['**/*.md', 'ui/**']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: Set-MpPreference -DisableRealtimeMonitoring $true
+        continue-on-error: true
+      - uses: actions/checkout@v7
+      # Same pinned toolchain as the release workflow
+      - uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: clippy, rustfmt
+      # Profiles live in Cargo.toml, which the default key does not cover: without this a profile change
+      # restores a stale cache as a full match and never saves the new one
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked -p embymini --all-targets -- -D warnings
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: Set-MpPreference -DisableRealtimeMonitoring $true
+        continue-on-error: true
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.100.0
+      # Profiles live in Cargo.toml, which the default key does not cover: without this a profile change
+      # restores a stale cache as a full match and never saves the new one
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('Cargo.toml') }}
+          cache-on-failure: true
+
+      - name: 编译（ci profile）
+        run: |
+          $t = Measure-Command { cargo build --locked --profile ci -p embymini | Out-Host }
+          if ($LASTEXITCODE) { throw "cargo build 失败" }
+          New-Item -ItemType Directory -Force out | Out-Null
+          New-Item -ItemType Directory -Force target\release | Out-Null
+          Copy-Item target\ci\embymini.exe target\release\embymini.exe -Force
+          $exe = Get-Item target\release\embymini.exe
+          @{ build_s = [math]::Round($t.TotalSeconds); exe_mb = [math]::Round($exe.Length / 1MB, 1) } | ConvertTo-Json | Set-Content out\build.json
+          Get-Content out\build.json
+
+      - name: 测速（生成的海报，无服务器）
+        timeout-minutes: 5
+        run: |
+          $p = Start-Process target\release\embymini.exe -ArgumentList '--fake', '--bench', "$PWD\out\bench.json" -PassThru -RedirectStandardError out\bench.log
+          $null = $p.Handle  # without it ExitCode stays empty after the process exits
+          if (-not $p.WaitForExit(180000)) { Stop-Process $p.Id; throw "测速超时" }
+          Get-Content out\bench.log
+          if (-not (Test-Path out\bench.json)) { throw "没有生成 bench.json（退出码 $($p.ExitCode)）" }
+
+      - name: 截图与常驻内存（新版）
+        run: |
+          . ./.github/scripts/measure.ps1
+          $p = Start-Process target\release\embymini.exe -ArgumentList '--fake' -PassThru
+          $null = $p.Handle
+          Start-Sleep 15
+          Save-Screen out\gpui.png
+          Get-Memory 'embymini' | ConvertTo-Json | Set-Content out\mem-gpui.json
+          Get-Content out\mem-gpui.json
+          if ($p.HasExited) { throw "程序自己退出了（退出码 $($p.ExitCode)）" }
+          Stop-Process $p.Id
+
+      - name: 安装包（Inno Setup）
+        run: |
+          # Preinstalled on the runner image; install only when missing
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            # The script and its translation are for 6.x; Chocolatey's latest may be 7
+            choco install innosetup --version 6.7.1 -y --no-progress | Out-Null
+            if ($LASTEXITCODE) { throw "安装 Inno Setup 6 失败" }
+          }
+          $ver = (Select-String -Path crates\app\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$ver" packaging\windows\embymini.iss
+          if ($LASTEXITCODE) { throw "ISCC 失败" }
+          Get-ChildItem target\installer
+
+      - name: 冒烟：静默安装 → 启动 → 卸载
+        run: |
+          . ./.github/scripts/measure.ps1
+          $setup = Get-ChildItem target\installer\*-setup.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          $dir = "$env:LOCALAPPDATA\Programs\EmbyMini"
+          # Only the mpv config is packaged for now (the spike does not play); mpv.exe is fetched once playback lands
+          foreach ($f in 'embymini.exe', 'mpv\mpv.conf', 'unins000.exe') {
+            if (-not (Test-Path "$dir\$f")) { throw "安装后缺少 $dir\$f" }
+          }
+          $p = Start-Process "$dir\embymini.exe" -ArgumentList '--fake' -PassThru
+          $null = $p.Handle
+          Start-Sleep 10
+          Save-Screen out\installed.png
+          if ($p.HasExited) { throw "安装后启动即退出（退出码 $($p.ExitCode)）" }
+          Stop-Process $p.Id
+          Start-Sleep 2
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES' -Wait
+          Start-Sleep 3
+          if (Test-Path "$dir\embymini.exe") { throw "卸载后程序还在" }
+          @{ installer_mb = [math]::Round($setup.Length / 1MB, 1) } | ConvertTo-Json | Set-Content out\installer.json
+
+      # The release being replaced, for comparison: WebView2 runs in child processes, so they are counted too.
+      # It has no server configured and opens on the settings page.
+      - name: 对照：当前发布版的常驻内存
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          . ./.github/scripts/measure.ps1
+          gh release download --repo ${{ github.repository }} --pattern '*-setup.exe' --dir old
+          $setup = Get-ChildItem old\*-setup.exe | Select-Object -First 1
+          Start-Process $setup.FullName -ArgumentList '/S' -Wait
+          $p = Start-Process "$env:LOCALAPPDATA\EmbyMini\embymini.exe" -PassThru
+          Start-Sleep 20
+          Save-Screen out\release.png
+          Get-Memory 'embymini', 'msedgewebview2' | ConvertTo-Json | Set-Content out\mem-release.json
+          Get-Content out\mem-release.json
+          Stop-Process $p.Id
+
+      - name: 汇总
+        if: always()
+        run: |
+          $j = { param($f) if (Test-Path "out\$f") { Get-Content "out\$f" -Raw | ConvertFrom-Json } }
+          $b = & $j build.json; $r = & $j bench.json; $g = & $j mem-gpui.json; $o = & $j mem-release.json; $i = & $j installer.json
+          @"
+          | 项 | 值 |
+          |---|---|
+          | 编译（ci profile，无 LTO） | $($b.build_s) s |
+          | exe | $($b.exe_mb) MB |
+          | 安装包 | $($i.installer_mb) MB |
+          | 首帧 / 数据 / 全部海报 | $($r.first_frame_ms) / $($r.data_ms) / $($r.images_ms) ms（$($r.images_loaded) 张，失败 $($r.images_failed)） |
+          | 滚动帧间隔 p50 / p95 / max | $($r.frame_ms_p50) / $($r.frame_ms_p95) / $($r.frame_ms_max) ms（$($r.frames) 帧，超 33 ms $($r.frames_over_33ms)） |
+          | 新版内存（进程自报） | 海报载完 $($r.mem_mb_images_loaded) MB，结束 $($r.mem_mb_end) MB |
+          | 新版内存（外部量，工作集 / 私有） | $($g.working_set_mb) / $($g.private_mb) MB（$($g.processes) 个进程） |
+          | 发布版内存（含 WebView2） | $($o.working_set_mb) / $($o.private_mb) MB（$($o.processes) 个进程） |
+          "@ -replace '(?m)^ +', '' | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gpui
+          path: |
+            out/
+            target/installer/*.exe

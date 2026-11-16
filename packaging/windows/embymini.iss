@@ -1,4 +1,4 @@
-; Windows installer (Inno Setup 6.5+). Built in CI:
+; Windows installer (Inno Setup 6.5+; ChineseSimplified.isl is the 6.x translation, Inno 7 ships its own). Built in CI:
 ;   iscc /DAppVersion=<version> packaging\windows\embymini.iss
 ; Per-user install, no admin rights. All app data lives in data\ next to the exe (created by the app);
 ; uninstalling asks whether to delete it.
@@ -32,7 +32,7 @@ CloseApplications=force
 RestartApplications=no
 
 [Languages]
-Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chs"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"

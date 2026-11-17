@@ -49,6 +49,7 @@ tools/mpv-shot.lua    不连服务器检查自带 mpv 配置的渲染效果（CI
 | 用到 mpv 的测试（需要 PATH 里的 mpv；Windows CI 默认跑） | `cargo test -p embymini-core -- --ignored bundled_config user_conf _script` |
 | 检查 | `cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` |
 | 试验版界面 | `cargo run -p embymini -- --fake`（生成的海报）；导出 `EMBY_SERVER` / `PORT` / `EMBY_USER` / `EMBY_PASS` 后去掉 `--fake` 连真服 |
+| 设计稿（静态页面，数据来自一个含 `fixture.json` 与 `img/` 的目录，不在仓库里） | `cargo run -p embymini -- --design <目录> [--page home\|library\|series\|movie\|settings…] [--light]` |
 | 真服端到端（需要上面四个环境变量和 PATH 里的 mpv） | `cargo test -p embymini-core e2e_real_server -- --ignored --nocapture` |
 | 本地缓存验收（同上；整片缓存模式，会下载几百 MB） | `cargo test -p embymini-core e2e_cache_proxy -- --ignored --nocapture` |
 | 弹幕端到端（同上，另需 `DANMU_API` = 弹幕接口地址、`DISPLAY`；`EMBY_TEST_ITEM` 指定一集能匹配上的剧） | `cargo test -p embymini-core e2e_danmaku -- --ignored --nocapture` |

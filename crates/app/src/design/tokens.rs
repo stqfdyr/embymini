@@ -5,15 +5,13 @@
 use gpui_kit::{Hsla, rgb, rgba};
 
 /// Horizontal page padding.
-pub const PAD: f32 = 40.;
-/// Height of the top bar (drag area, history, search).
-pub const BAR_H: f32 = 52.;
-/// Sidebar width.
+pub const PAD: f32 = 28.;
+/// Height of the top bar (drag area, history, page switch).
+pub const BAR_H: f32 = 56.;
+/// Sidebar width (hidden until toggled).
 pub const SIDEBAR_W: f32 = 232.;
-/// Width of the collapsed sidebar (icons only).
-pub const RAIL_W: f32 = 64.;
 /// Poster card width in rows; grids stretch it to fill the line.
-pub const POSTER_W: f32 = 156.;
+pub const POSTER_W: f32 = 150.;
 /// Gap between cards in a row.
 pub const GAP: f32 = 16.;
 
@@ -24,7 +22,7 @@ pub struct T {
     pub sidebar: Hsla,
     /// Image placeholders, segmented-control tracks.
     pub surface: Hsla,
-    /// Raised element on a surface (the selected segment).
+    /// Raised element on a surface (the selected segment), dialogs.
     pub raised: Hsla,
     pub border: Hsla,
     /// Hairline around artwork, so dark posters keep an edge on a dark page.
@@ -39,6 +37,8 @@ pub struct T {
     pub hover: Hsla,
     pub primary: Hsla,
     pub on_primary: Hsla,
+    /// Translucent fill of buttons that sit on artwork or the bar.
+    pub glass: Hsla,
 }
 
 fn c(v: u32) -> Hsla {
@@ -57,7 +57,7 @@ impl T {
                 bg: c(0x0a0a0a),
                 sidebar: c(0x0d0d0d),
                 surface: c(0x171717),
-                raised: c(0x2a2a2a),
+                raised: c(0x1c1c1c),
                 border: ca(0xffffff14),
                 edge: ca(0xffffff0f),
                 fg: c(0xfafafa),
@@ -67,6 +67,7 @@ impl T {
                 hover: ca(0xffffff0b),
                 primary: c(0xfafafa),
                 on_primary: c(0x0a0a0a),
+                glass: ca(0x1a1a1ab8),
             }
         } else {
             Self {
@@ -84,6 +85,7 @@ impl T {
                 hover: ca(0x00000008),
                 primary: c(0x171717),
                 on_primary: c(0xfafafa),
+                glass: ca(0xffffffcc),
             }
         }
     }

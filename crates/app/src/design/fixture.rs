@@ -46,6 +46,46 @@ pub struct Item {
     pub episodes: Vec<Item>,
     #[serde(rename = "similar")]
     pub similar: Vec<Item>,
+    /// Unwatched episodes of a series.
+    pub unplayed: Option<u32>,
+    pub watched: bool,
+    /// Resume position in ticks.
+    pub position: Option<u64>,
+    pub premiere_date: Option<String>,
+    #[serde(rename = "links")]
+    pub links: Vec<Link>,
+    #[serde(rename = "studios")]
+    pub studios: Vec<String>,
+    #[serde(rename = "backdrops")]
+    pub backdrops: Vec<Option<String>>,
+    #[serde(rename = "source")]
+    pub source: Option<Source>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct Link {
+    pub name: String,
+}
+
+/// The first media source of a film, or of a series' first episode.
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct Source {
+    pub size: Option<u64>,
+    pub bitrate: Option<u64>,
+    pub container: Option<String>,
+    pub file: Option<String>,
+    pub streams: Vec<Stream>,
+}
+
+/// One video / audio / subtitle stream, already as label–value rows.
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct Stream {
+    pub kind: String,
+    pub default: bool,
+    pub rows: Vec<(String, String)>,
 }
 
 impl Item {
@@ -118,6 +158,15 @@ impl Fixture {
     /// Path of a fixture image, if it was downloaded.
     pub fn img(&self, name: Option<&String>) -> Option<PathBuf> {
         let p = self.dir.join("img").join(name?);
+        p.is_file().then_some(p)
+    }
+
+    /// The blurred copy of a backdrop (made next to it ahead of time; GPUI cannot blur an image at draw time).
+    pub fn blurred(&self, name: Option<&String>) -> Option<PathBuf> {
+        let blur = name?
+            .strip_suffix(".jpg")
+            .map(|s| format!("{s}.blur.jpg"))?;
+        let p = self.dir.join("img").join(blur);
         p.is_file().then_some(p)
     }
 

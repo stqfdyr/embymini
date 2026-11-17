@@ -1,0 +1,101 @@
+{
+  "Items": [
+    {
+      "BackdropImageTags": null,
+      "ChildCount": 3536,
+      "CollectionType": "movies",
+      "DateCreated": "2026-03-10T13:41:13.7370000Z",
+      "DisplayPreferencesId": "c01KKBZNWW9CQEY8MWDF9SDHT8A",
+      "ExternalUrls": null,
+      "ForcedSortName": "华语电影",
+      "Guid": "c01KKBZNWW9CQEY8MWDF9SDHT8A",
+      "Id": "c01KKBZNWW9CQEY8MWDF9SDHT8A",
+      "ImageTags": {
+        "Primary": "c01KKBZNWW9CQEY8MWDF9SDHT8A"
+      },
+      "IsFolder": true,
+      "LockData": false,
+      "LockedFields": null,
+      "Name": "华语电影",
+      "ParentId": "",
+      "PresentationUniqueKey": "c01KKBZNWW9CQEY8MWDF9SDHT8A",
+      "PrimaryImageAspectRatio": 1.7777777777777777,
+      "ProviderIds": null,
+      "RemoteTrailers": null,
+      "SortName": "华语电影",
+      "Taglines": null,
+      "Type": "CollectionFolder",
+      "UserData": {
+        "IsFavorite": false,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    },
+    {
+      "BackdropImageTags": null,
+      "ChildCount": 4112,
+      "CollectionType": "tvshows",
+      "DateCreated": "2026-03-10T14:18:22.8990000Z",
+      "DisplayPreferencesId": "c01KKC1SXSKBDHBWEC9G5M677ZA",
+      "ExternalUrls": null,
+      "ForcedSortName": "华语剧集",
+      "Guid": "c01KKC1SXSKBDHBWEC9G5M677ZA",
+      "Id": "c01KKC1SXSKBDHBWEC9G5M677ZA",
+      "ImageTags": {
+        "Primary": "c01KKC1SXSKBDHBWEC9G5M677ZA"
+      },
+      "IsFolder": true,
+      "LockData": false,
+      "LockedFields": null,
+      "Name": "华语剧集",
+      "ParentId": "",
+      "PresentationUniqueKey": "c01KKC1SXSKBDHBWEC9G5M677ZA",
+      "PrimaryImageAspectRatio": 1.7777777777777777,
+      "ProviderIds": null,
+      "RemoteTrailers": null,
+      "SortName": "华语剧集",
+      "Taglines": null,
+      "Type": "CollectionFolder",
+      "UserData": {
+        "IsFavorite": false,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    },
+    {
+      "BackdropImageTags": null,
+      "ChildCount": 742,
+      "CollectionType": "tvshows",
+      "DateCreated": "2026-03-10T14:19:35.9370000Z",
+      "DisplayPreferencesId": "c01KKC1W5417A9EB6ZP1GKP1C05",
+      "ExternalUrls": null,
+      "ForcedSortName": "综艺节目",
+      "Guid": "c01KKC1W5417A9EB6ZP1GKP1C05",
+      "Id": "c01KKC1W5417A9EB6ZP1GKP1C05",
+      "ImageTags": {
+        "Primary": "c01KKC1W5417A9EB6ZP1GKP1C05"
+      },
+      "IsFolder": true,
+      "LockData": false,
+      "LockedFields": null,
+      "Name": "综艺节目",
+      "ParentId": "",
+      "PresentationUniqueKey": "c01KKC1W5417A9EB6ZP1GKP1C05",
+      "PrimaryImageAspectRatio": 1.7777777777777777,
+      "ProviderIds": null,
+      "RemoteTrailers": null,
+      "SortName": "综艺节目",
+      "Taglines": null,
+      "Type": "CollectionFolder",
+      "UserData": {
+        "IsFavorite": false,
+        "PlayCount": 0,
+        "PlaybackPositionTicks": 0,
+        "Played": false
+      }
+    }
+  ],
+  "TotalRecordCount": 3
+}

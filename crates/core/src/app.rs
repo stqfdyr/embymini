@@ -3,11 +3,13 @@
 //! The UI keeps one [`App`] for the life of the process and forwards each user action to a method here; nothing in
 //! this module knows about the UI framework.
 
+use crate::browse::{self, Item};
 use crate::config::{self, Config, Server, ServerView};
 use crate::emby::{self, Emby, Error};
-use crate::{danmaku, images, lock, player, rt, stream, updater};
+use crate::{danmaku, images, lock, pager, player, rt, snapshot, stream, updater};
 use reqwest::Method;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -62,6 +64,8 @@ pub struct App {
     stream: Option<stream::Stream>,
     /// Danmaku cache dir (`cache/danmaku`), counted under subtitles in cache management.
     danmaku_dir: PathBuf,
+    /// List snapshots (`cache/snap`): the library cache row in cache management.
+    snap: Arc<snapshot::Snapshots>,
     /// Bumped on every play click; a start that finishes after a newer click discards itself.
     play_seq: AtomicU64,
     /// The program is exiting: a starting `play` gives up (see [`App::unless_quit`]).
@@ -265,7 +269,8 @@ impl App {
     }
 
     /// Opens the data dir `root`: loads (and on first start writes) the config, checks and sets the running marker,
-    /// starts the image cache and the caching proxy. `mpv_dir` is the bundled mpv config dir, if any.
+    /// starts the image cache and the caching proxy; list snapshots go to `cache/snap`. `mpv_dir` is the bundled mpv
+    /// config dir, if any.
     pub fn open(root: &Path, mpv_dir: Option<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
         let path = root.join("config.json");
         let cfg =
@@ -297,6 +302,7 @@ impl App {
             images,
             stream,
             danmaku_dir: root.join("cache").join("danmaku"),
+            snap: Arc::new(snapshot::Snapshots::new(root.join("cache").join("snap"))),
             mpv_dir,
             mpv_cache: Some(root.join("mpv-cache")),
             player: Mutex::new(None),
@@ -474,7 +480,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Cache manager: clears one row (`all` = every row but the UI-side library cache).
+    /// Cache manager: clears one row, or every row with `all`.
     pub async fn cache_clear(self: Arc<Self>, kind: Clear) -> CacheInfo {
         rt::spawn_blocking(move || cache_clear_now(&self, kind))
             .await
@@ -482,11 +488,10 @@ impl App {
     }
 
     /// A poster or backdrop by [`images::Req`] path, from [`images::Images`] (disk cache → upstream). The path carries a
-    /// server id, mapped here to that server's API root; unknown servers get a 404 and nothing is fetched elsewhere.
+    /// server id, mapped here to that server's API root; unknown servers get [`images::ImageError::UnknownServer`]
+    /// and nothing is fetched elsewhere.
     pub async fn image(&self, path: &str) -> images::Got {
-        let Some(req) = images::Req::parse(path) else {
-            return Err(400);
-        };
+        let req = images::Req::parse(path).ok_or(images::ImageError::BadPath)?;
         let base = {
             let c = self.cfg();
             c.servers
@@ -494,13 +499,26 @@ impl App {
                 .find(|s| s.id == req.server)
                 .map(config::Server::api_base)
         };
-        let Some(base) = base else {
-            return Err(404);
-        };
+        let base = base.ok_or(images::ImageError::UnknownServer)?;
         self.images.get(&req, &base).await
     }
 
-    /// Generic Emby request to the active server. On 401 that server's token is cleared and the UI asks to sign in.
+    /// Runs `f` with the active server's client. On 401 that server's token is cleared and the UI asks to sign in.
+    async fn authed<T>(&self, f: impl AsyncFnOnce(&Emby) -> Result<T, Error>) -> Result<T, Error> {
+        let (server_id, client) = self.active()?;
+        let r = f(&client).await;
+        if matches!(r, Err(Error::Unauthorized)) {
+            // Clear the server that was asked: the user may have switched servers meanwhile
+            self.remember(|c| {
+                if let Some(s) = c.servers.iter_mut().find(|s| s.id == server_id) {
+                    s.token.clear();
+                }
+            });
+        }
+        r
+    }
+
+    /// Generic Emby request to the active server (pages use the typed ones below).
     pub async fn call(
         &self,
         method: &str,
@@ -508,7 +526,6 @@ impl App {
         query: Option<Map<String, Value>>,
         body: Option<Value>,
     ) -> Result<Value, Error> {
-        let (server_id, client) = self.active()?;
         let method = match method.to_ascii_uppercase().as_str() {
             "GET" => Method::GET,
             "POST" => Method::POST,
@@ -521,16 +538,128 @@ impl App {
             .filter(|(_, v)| !v.is_null())
             .map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned)))
             .collect();
-        let r = client.call(method, path, &query, body.as_ref()).await;
-        if matches!(r, Err(Error::Unauthorized)) {
-            // Clear the server that was asked: the user may have switched servers meanwhile
-            self.remember(|c| {
-                if let Some(s) = c.servers.iter_mut().find(|s| s.id == server_id) {
-                    s.token.clear();
-                }
-            });
-        }
-        r
+        self.authed(async |c| c.call(method, path, &query, body.as_ref()).await)
+            .await
+    }
+
+    // ---- Browsing: one method per page request ([`browse`]), all on the active server ----
+
+    /// Home carousel.
+    pub async fn hero(&self) -> Result<Vec<Item>, Error> {
+        self.authed(async |c| browse::hero(c).await).await
+    }
+
+    /// Home page below the carousel: libraries and continue watching.
+    pub async fn home(&self) -> Result<browse::Home, Error> {
+        self.authed(async |c| browse::home(c).await).await
+    }
+
+    /// The library wall.
+    pub async fn views(&self) -> Result<Vec<Item>, Error> {
+        self.authed(async |c| browse::views(c).await).await
+    }
+
+    /// The real continue-watching count when [`browse::ResumeRow::exact`] is false.
+    pub async fn resume_count(&self) -> Result<browse::Count, Error> {
+        self.authed(async |c| browse::resume_count(c).await).await
+    }
+
+    /// One library's home row.
+    pub async fn library_row(&self, view_id: &str) -> Result<browse::LibraryRow, Error> {
+        self.authed(async |c| browse::library_row(c, view_id).await)
+            .await
+    }
+
+    /// Item detail (hover prefetch and the detail page header).
+    pub async fn item(&self, id: &str) -> Result<Item, Error> {
+        self.authed(async |c| browse::item(c, id).await).await
+    }
+
+    /// An item with default fields: a library's name, a person.
+    pub async fn item_brief(&self, id: &str) -> Result<Item, Error> {
+        self.authed(async |c| browse::item_brief(c, id).await).await
+    }
+
+    /// The detail page; see [`browse::detail`] for `guess_series`.
+    pub async fn detail(
+        &self,
+        id: &str,
+        guess_series: Option<&str>,
+    ) -> Result<browse::Detail, Error> {
+        self.authed(async |c| browse::detail(c, id, guess_series).await)
+            .await
+    }
+
+    /// One season's episodes (the detail page's episode row, loaded on its own).
+    pub async fn episodes(&self, series_id: &str, season_id: &str) -> Result<Vec<Item>, Error> {
+        self.authed(async |c| browse::episodes(c, series_id, season_id).await)
+            .await
+    }
+
+    /// The whole-season page.
+    pub async fn season(
+        &self,
+        series_id: &str,
+        season_id: &str,
+    ) -> Result<browse::SeasonPage, Error> {
+        self.authed(async |c| browse::season(c, series_id, season_id).await)
+            .await
+    }
+
+    pub async fn favorites(&self) -> Result<Vec<Item>, Error> {
+        self.authed(async |c| browse::favorites(c).await).await
+    }
+
+    pub async fn search(&self, term: &str) -> Result<Vec<Item>, Error> {
+        self.authed(async |c| browse::search(c, term).await).await
+    }
+
+    /// One page of a paged list, as its [`pager::Pager`] asked.
+    pub async fn page(&self, list: &browse::List, at: pager::Fetch) -> Result<browse::Page, Error> {
+        self.authed(async |c| browse::page(c, list, at).await).await
+    }
+
+    pub async fn set_favorite(&self, id: &str, on: bool) -> Result<(), Error> {
+        self.authed(async |c| browse::set_favorite(c, id, on).await)
+            .await
+    }
+
+    pub async fn set_played(&self, id: &str, on: bool) -> Result<(), Error> {
+        self.authed(async |c| browse::set_played(c, id, on).await)
+            .await
+    }
+
+    /// Removes from (or with `hide = false` puts back into) continue watching.
+    pub async fn hide_from_resume(&self, id: &str, hide: bool) -> Result<(), Error> {
+        self.authed(async |c| browse::hide_from_resume(c, id, hide).await)
+            .await
+    }
+
+    // ---- List snapshots ([`snapshot`]): keys are scoped to the active server so servers never mix ----
+
+    fn snap_key(&self, key: &str) -> Option<String> {
+        self.cfg().active.as_ref().map(|s| format!("{s}|{key}"))
+    }
+
+    /// The snapshot stored under `key` for the active server, read on a blocking thread.
+    pub async fn snap_read<T: DeserializeOwned + Send + 'static>(&self, key: &str) -> Option<T> {
+        let key = self.snap_key(key)?;
+        let snap = self.snap.clone();
+        rt::spawn_blocking(move || snap.read(&key))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Stores a snapshot for the active server in the background (serialized and written on a blocking thread).
+    /// Fire and forget: two writes to one key in quick succession may land in either order (pages write once per
+    /// fetch, seconds apart).
+    pub fn snap_write<T: Serialize + Send + 'static>(&self, key: &str, value: T) {
+        let Some(key) = self.snap_key(key) else {
+            return;
+        };
+        let snap = self.snap.clone();
+        rt::spawn_blocking(move || snap.write(&key, &value));
     }
 
     /// Plays `item_id` in a new mpv, closing the current player; a later click while this one starts wins.
@@ -622,25 +751,27 @@ fn no_server() -> Error {
     Error::Other("服务器不存在".into())
 }
 
-/// Bytes per cache manager row; `playing` means the film being played stays in the video cache. A UI-side library
-/// cache (list snapshots), if any, is the UI's to count.
-#[derive(Serialize, Default)]
+/// Bytes per cache manager row; `playing` means the film being played stays in the video cache.
+#[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheInfo {
-    video: u64,
-    images: u64,
+    pub video: u64,
+    pub images: u64,
     /// External subtitles plus danmaku.
-    subs: u64,
-    temp: u64,
-    playing: bool,
+    pub subs: u64,
+    /// The library cache: list snapshots ([`snapshot`]).
+    pub snap: u64,
+    pub temp: u64,
+    pub playing: bool,
 }
 
-/// What `cache_clear` empties (`subs` = subtitles and danmaku).
+/// What `cache_clear` empties (`subs` = subtitles and danmaku, `snap` = the library cache).
 #[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Clear {
     Video,
     Images,
     Subs,
+    Snap,
     Temp,
     All,
 }
@@ -708,6 +839,7 @@ fn cache_info_now(app: &App) -> CacheInfo {
         video,
         images: app.images.usage(),
         subs: subs + stream::dir_size(&app.danmaku_dir),
+        snap: app.snap.size(),
         temp: temp_paths(app, &std::env::temp_dir())
             .iter()
             .map(|p| path_size(p))
@@ -731,6 +863,9 @@ fn cache_clear_now(app: &App, kind: Clear) -> CacheInfo {
     }
     if kind.covers(Clear::Images) {
         app.images.clear();
+    }
+    if kind.covers(Clear::Snap) {
+        app.snap.clear();
     }
     if kind.covers(Clear::Temp) {
         for p in temp_paths(app, &std::env::temp_dir()) {
@@ -856,17 +991,25 @@ mod tests {
 
     #[test]
     fn clear_all_covers_every_kind() {
-        for k in [Clear::Video, Clear::Images, Clear::Subs, Clear::Temp] {
+        for k in [
+            Clear::Video,
+            Clear::Images,
+            Clear::Subs,
+            Clear::Snap,
+            Clear::Temp,
+        ] {
             assert!(Clear::All.covers(k) && k.covers(k));
             assert!(!k.covers(Clear::All));
         }
         assert!(!Clear::Subs.covers(Clear::Images));
         let k: Clear = serde_json::from_str(r#""subs""#).unwrap();
         assert_eq!(k, Clear::Subs);
-        assert!(serde_json::from_str::<Clear>(r#""snap""#).is_err());
+        let k: Clear = serde_json::from_str(r#""snap""#).unwrap();
+        assert_eq!(k, Clear::Snap);
+        assert!(serde_json::from_str::<Clear>(r#""library""#).is_err());
     }
 
-    /// Each kind empties only its own row; danmaku counts under subtitles.
+    /// Each kind empties only its own row; danmaku counts under subtitles, list snapshots are their own row.
     #[test]
     fn cache_clear_empties_only_its_kind() {
         let dir = std::env::temp_dir().join(format!("embymini-cache-clear-{}", std::process::id()));
@@ -879,12 +1022,21 @@ mod tests {
         let mut app = test_app(None);
         app.images = images::Images::new(img.clone(), images::CAP, reqwest::Client::new());
         app.danmaku_dir = dm.clone();
+        app.snap = Arc::new(snapshot::Snapshots::new(dir.join("snap")));
+        app.snap.write("k", &"v");
 
-        assert_eq!(cache_info_now(&app).subs, 5);
+        let before = cache_info_now(&app);
+        assert_eq!(before.subs, 5);
+        assert!(before.snap > 0, "snapshots counted");
         let info = cache_clear_now(&app, Clear::Images);
         assert!(!img.join("a").exists());
         assert!(dm.join("b.json").exists());
         assert_eq!(info.subs, 5);
+        assert_eq!(info.snap, before.snap, "images only");
+        let info = cache_clear_now(&app, Clear::Snap);
+        assert_eq!(info.snap, 0, "snapshots cleared");
+        assert!(app.snap.read::<String>("k").is_none(), "nothing reads back");
+        assert!(dm.join("b.json").exists(), "snapshots only");
         std::fs::write(img.join("a"), "img").unwrap();
         let info = cache_clear_now(&app, Clear::Subs);
         assert!(!dm.exists());
@@ -931,6 +1083,87 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Browsing goes to the active server; a 401 clears that server's token, and then nothing is asked until
+    /// the user signs in again.
+    #[tokio::test]
+    async fn browsing_uses_the_active_server() {
+        let (port, heads) = crate::emby::tests::fake(|path| match path {
+            "/emby/users/uid/views" => ("200 OK", crate::emby::tests::testdata("views.json")),
+            _ => ("401 Unauthorized", String::new()),
+        })
+        .await;
+        let app = test_app(None);
+        {
+            let mut c = app.cfg();
+            c.servers
+                .push(crate::emby::tests::server_at("http://127.0.0.1", port));
+            c.active = Some("s".into());
+        }
+        assert!(!app.views().await.unwrap().is_empty(), "views");
+        assert!(
+            matches!(app.favorites().await, Err(Error::Unauthorized)),
+            "401"
+        );
+        assert!(app.cfg().servers[0].token.is_empty(), "token cleared");
+        let asked = heads.lock().unwrap().len();
+        assert!(
+            matches!(app.views().await, Err(Error::Unauthorized)),
+            "signed out"
+        );
+        assert_eq!(
+            heads.lock().unwrap().len(),
+            asked,
+            "no request without a token"
+        );
+    }
+
+    /// The UI spawns these on the runtime, so they must be Send.
+    #[test]
+    fn browse_futures_are_send() {
+        fn send<T: Send>(_: &T) {}
+        let app = test_app(None);
+        let list = browse::List::Resume;
+        let at = pager::Pager::new(None).next_page().expect("first page");
+        send(&app.home());
+        send(&app.detail("x", Some("y")));
+        send(&app.page(&list, at));
+        send(&app.snap_read::<browse::Home>("home"));
+        send(&app.set_favorite("x", true));
+    }
+
+    /// Snapshots are kept per server: another server never sees them.
+    #[test]
+    fn snapshots_are_scoped_to_the_server() {
+        let dir = std::env::temp_dir().join(format!("embymini-app-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = test_app(None);
+        app.snap = Arc::new(snapshot::Snapshots::new(dir.clone()));
+        assert_eq!(
+            rt::block_on(app.snap_read::<Vec<i32>>("home")),
+            None,
+            "no server: nothing"
+        );
+        app.cfg().active = Some("a".into());
+        app.snap_write("home", vec![1, 2]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let got = loop {
+            // written in the background
+            match rt::block_on(app.snap_read::<Vec<i32>>("home")) {
+                Some(v) => break Some(v),
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+                None => break None,
+            }
+        };
+        assert_eq!(got, Some(vec![1, 2]), "read back");
+        app.cfg().active = Some("b".into());
+        assert_eq!(
+            rt::block_on(app.snap_read::<Vec<i32>>("home")),
+            None,
+            "another server"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn playing_while_starting() {
         let app = test_app(None);
@@ -951,6 +1184,8 @@ mod tests {
             images: images::Images::new(PathBuf::new(), images::CAP, reqwest::Client::new()),
             stream: None,
             danmaku_dir: PathBuf::new(),
+            // nothing here writes snapshots: an empty path is never created
+            snap: Arc::new(snapshot::Snapshots::new(PathBuf::new())),
             play_seq: AtomicU64::new(0),
             quit: watch::Sender::new(false),
             starting: AtomicUsize::new(0),

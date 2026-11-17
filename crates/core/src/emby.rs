@@ -1,5 +1,5 @@
 //! Emby HTTP: auth headers, UA, the generic request, and the few typed endpoints playback needs.
-//! Browsing data is only used by the UI, so it has no DTOs here (the UI gets raw JSON via the `emby` command).
+//! Browsing requests and their DTOs are in [`crate::browse`], built on [`Emby::get`] / [`Emby::call`].
 
 use crate::config::Server;
 use crate::status;
@@ -248,10 +248,11 @@ impl Emby {
         request(method.as_str(), path, sent).await
     }
 
-    async fn get<T: DeserializeOwned>(
+    /// GET decoded into `T`; a reply of another shape is an [`Error::Other`] naming the path.
+    pub(crate) async fn get<T: DeserializeOwned, Q: Serialize + ?Sized>(
         &self,
         path: &str,
-        query: &[(&str, &str)],
+        query: &Q,
     ) -> Result<T, Error> {
         decode(path, self.call(Method::GET, path, query, None).await?)
     }
@@ -266,7 +267,7 @@ impl Emby {
         let r: Items = self
             .get(
                 &format!("/Shows/{series_id}/Episodes"),
-                &[("UserId", &self.user_id), ("SeasonId", season_id)],
+                &[("UserId", self.user_id.as_str()), ("SeasonId", season_id)],
             )
             .await?;
         Ok(r.items)
@@ -405,7 +406,8 @@ pub fn subtitle_ext(codec: Option<&str>) -> String {
     }
 }
 
-/// `base` + a path from the UI, which must stay under the API root with no query or fragment.
+/// `base` + a request path, which must stay under the API root with no query or fragment (ids in browse paths
+/// come from server replies and the UI).
 /// Checked after parsing: the parser turns `%2e%2e`, `\` and dots split by tab / newline into `..` and `/`.
 fn api_url(base: &str, path: &str) -> Result<reqwest::Url, Error> {
     let bad = || Error::Other(format!("非法路径：{path}"));
@@ -505,7 +507,7 @@ pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn testdata(name: &str) -> String {
+    pub fn testdata(name: &str) -> String {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join(name);

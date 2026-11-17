@@ -1,0 +1,162 @@
+{
+  "BackdropImageTags": [
+    "f01M7K6482A82W7WNFASJAQQKG5"
+  ],
+  "CanDelete": false,
+  "CanDownload": true,
+  "CommunityRating": 6.8,
+  "DateCreated": "2026-11-17T06:02:32.906571+08:00",
+  "ForcedSortName": "米斯蒂·格林",
+  "GenreItems": [
+    {
+      "Id": "g35",
+      "Name": "喜剧"
+    },
+    {
+      "Id": "g18",
+      "Name": "剧情"
+    }
+  ],
+  "Genres": [
+    "喜剧",
+    "剧情"
+  ],
+  "HasSubtitles": true,
+  "Id": "m01M7K6482A82W7WNFASJAQQKG5",
+  "ImageTags": {
+    "Logo": "l01M7K6482A82W7WNFASJAQQKG5",
+    "Primary": "p01M7K6482A82W7WNFASJAQQKG5"
+  },
+  "IsFolder": false,
+  "MediaSources": [
+    {
+      "Bitrate": 14761999,
+      "Container": "mkv",
+      "DefaultAudioStreamIndex": 1,
+      "DefaultSubtitleStreamIndex": -1,
+      "Id": "m01M7K648A4M4ZHX45J7R7KCNQ1",
+      "ItemId": "m01M7K6482A82W7WNFASJAQQKG5",
+      "MediaStreams": [
+        {
+          "AverageFrameRate": 23.976023976023978,
+          "BitDepth": 8,
+          "BitRate": 14761999,
+          "Codec": "hevc",
+          "Height": 1600,
+          "Index": 0,
+          "IsDefault": false,
+          "IsExternal": false,
+          "IsExternalUrl": false,
+          "IsForced": false,
+          "IsTextSubtitleStream": false,
+          "Profile": "Main",
+          "RealFrameRate": 23.976023976023978,
+          "SupportsExternalStream": false,
+          "Type": "Video",
+          "VideoRange": "SDR",
+          "Width": 3840
+        },
+        {
+          "BitRate": 768000,
+          "ChannelLayout": "5.1(side)",
+          "Channels": 6,
+          "Codec": "eac3",
+          "DisplayTitle": "EAC3 - 5.1(side) - eng",
+          "Index": 1,
+          "IsDefault": true,
+          "IsExternal": false,
+          "IsExternalUrl": false,
+          "IsForced": false,
+          "IsTextSubtitleStream": false,
+          "Language": "eng",
+          "SampleRate": 48000,
+          "SupportsExternalStream": false,
+          "Type": "Audio"
+        },
+        {
+          "Codec": "subrip",
+          "DisplayLanguage": "英文",
+          "DisplayTitle": "英文 (SRT)",
+          "Index": 2,
+          "IsDefault": false,
+          "IsExternal": false,
+          "IsExternalUrl": false,
+          "IsForced": false,
+          "IsTextSubtitleStream": true,
+          "Language": "eng",
+          "SubtitleLocationType": "InternalStream",
+          "SupportsExternalStream": false,
+          "Type": "Subtitle"
+        },
+        {
+          "Codec": "subrip",
+          "DisplayLanguage": "英文",
+          "DisplayTitle": "英文 (SRT) - SDH",
+          "Index": 3,
+          "IsDefault": false,
+          "IsExternal": false,
+          "IsExternalUrl": false,
+          "IsForced": false,
+          "IsTextSubtitleStream": true,
+          "Language": "eng",
+          "SubtitleLocationType": "InternalStream",
+          "SupportsExternalStream": false,
+          "Title": "SDH",
+          "Type": "Subtitle"
+        }
+      ],
+      "Name": "2160p",
+      "Protocol": "File",
+      "RunTimeTicks": 62090000000,
+      "Size": 12034300663,
+      "SupportsDirectPlay": true,
+      "SupportsDirectStream": true,
+      "SupportsTranscoding": false,
+      "Type": "Default"
+    }
+  ],
+  "MediaType": "Video",
+  "Name": "米斯蒂·格林",
+  "OriginalTitle": "Misty Green",
+  "Overview": "影片讲述一位才华横溢但事业停滞多年的女演员，在与一位故人重逢后，努力在好莱坞寻求事业第二春的故事。",
+  "People": [
+    {
+      "Id": "p01KKGEM7302K7CQFAGKPSYK0D2",
+      "Name": "克里斯·洛克",
+      "PrimaryImageTag": "p01KKGEM7302K7CQFAGKPSYK0D2",
+      "Type": "Director"
+    },
+    {
+      "Id": "p01KM2N0C9R99HCYDWZ04SPDGGB",
+      "Name": "Peter Rice",
+      "PrimaryImageTag": "p01KM2N0C9R99HCYDWZ04SPDGGB",
+      "Type": "Director"
+    },
+    {
+      "Id": "p01M7K648A682GRD3G8NSCYCFTD",
+      "Name": "David Brooks",
+      "Type": "Director"
+    },
+    {
+      "Id": "p01M7K648A98MMBNFVMBGBPK1Y9",
+      "Name": "Adam Dicterow",
+      "Type": "Director"
+    }
+  ],
+  "PremiereDate": "2026-10-09T00:00:00.0000000Z",
+  "ProductionYear": 2026,
+  "ProviderIds": {
+    "Imdb": "tt34385184",
+    "Tmdb": "1381221"
+  },
+  "RunTimeTicks": 62090000000,
+  "SortName": "米斯蒂·格林",
+  "Type": "Movie",
+  "UserData": {
+    "IsFavorite": false,
+    "ItemId": "m01M7K6482A82W7WNFASJAQQKG5",
+    "PlayCount": 0,
+    "PlaybackPositionTicks": 0,
+    "Played": false
+  }
+}

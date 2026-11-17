@@ -1702,7 +1702,7 @@ async fn connect(path: &Path, child: &mut Child) -> Result<Box<dyn Io>, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::emby::{MediaSource, PlaybackInfo, tests::fixture};
     use std::time::Instant;
@@ -3463,7 +3463,7 @@ mod tests {
     }
 
     /// Logs in to the real server with the account from the environment.
-    async fn login_from_env() -> Emby {
+    pub(crate) async fn login_from_env() -> Emby {
         use crate::config::{Server, normalize};
         let port = std::env::var("PORT").ok().and_then(|p| p.parse().ok());
         let (url, port) = normalize(&env("EMBY_SERVER"), port).unwrap();

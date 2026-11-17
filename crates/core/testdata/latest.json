@@ -1,0 +1,155 @@
+[
+  {
+    "BackdropImageTags": [
+      "f01M538ZC0ETQBQ78HTZBEKS467"
+    ],
+    "CanDelete": false,
+    "CanDownload": true,
+    "DateCreated": "2026-10-17T05:13:04.270211+08:00",
+    "ForcedSortName": "杯雪·一战成名",
+    "GenreItems": [
+      {
+        "Id": "g28",
+        "Name": "动作"
+      },
+      {
+        "Id": "g80",
+        "Name": "犯罪"
+      }
+    ],
+    "Genres": [
+      "动作",
+      "犯罪"
+    ],
+    "Id": "m01M538ZC0ETQBQ78HTZBEKS467",
+    "ImageTags": {
+      "Primary": "p01M538ZC0ETQBQ78HTZBEKS467"
+    },
+    "IsFolder": false,
+    "MediaType": "Video",
+    "Name": "杯雪·一战成名",
+    "OriginalTitle": "杯雪·一战成名",
+    "Overview": "时秦桧把持朝堂，操控麾下缇骑四处镇压抗金义军。数月前，金使等四十一人命丧七里铺，",
+    "PremiereDate": "2026-09-27T00:00:00.0000000Z",
+    "ProductionYear": 2026,
+    "ProviderIds": {
+      "Tmdb": "1563627"
+    },
+    "RunTimeTicks": 58620000000,
+    "SortName": "杯雪·一战成名",
+    "Status": "Released",
+    "Type": "Movie",
+    "UserData": {
+      "IsFavorite": false,
+      "ItemId": "m01M538ZC0ETQBQ78HTZBEKS467",
+      "PlayCount": 0,
+      "PlaybackPositionTicks": 0,
+      "Played": false
+    }
+  },
+  {
+    "BackdropImageTags": [
+      "f01M634MSC9CGHPBPMDHTNYPB0N"
+    ],
+    "CanDelete": false,
+    "CanDownload": true,
+    "DateCreated": "2026-10-30T00:42:50.169596+08:00",
+    "ForcedSortName": "敦煌英雄",
+    "GenreItems": [
+      {
+        "Id": "g28",
+        "Name": "动作"
+      },
+      {
+        "Id": "g36",
+        "Name": "历史"
+      }
+    ],
+    "Genres": [
+      "动作",
+      "历史"
+    ],
+    "Id": "m01M634MSC9CGHPBPMDHTNYPB0N",
+    "ImageTags": {
+      "Logo": "l01M634MSC9CGHPBPMDHTNYPB0N",
+      "Primary": "p01M634MSC9CGHPBPMDHTNYPB0N"
+    },
+    "IsFolder": false,
+    "MediaType": "Video",
+    "Name": "敦煌英雄",
+    "OriginalTitle": "敦煌英雄",
+    "Overview": "电影讲述的是一个关于“不忘”与“回归”的敦煌故事，取材自沙州（“敦煌”旧称“沙州",
+    "PremiereDate": "2026-09-25T00:00:00.0000000Z",
+    "ProductionYear": 2026,
+    "ProviderIds": {
+      "Imdb": "tt28131387",
+      "Tmdb": "1089598"
+    },
+    "RunTimeTicks": 73800000000,
+    "SortName": "敦煌英雄",
+    "Status": "Released",
+    "Type": "Movie",
+    "UserData": {
+      "IsFavorite": false,
+      "ItemId": "m01M634MSC9CGHPBPMDHTNYPB0N",
+      "PlayCount": 0,
+      "PlaybackPositionTicks": 0,
+      "Played": false
+    }
+  },
+  {
+    "BackdropImageTags": [
+      "f01M5F9XGRT6W7CKCZ6NVEX2KCB"
+    ],
+    "CanDelete": false,
+    "CanDownload": true,
+    "DateCreated": "2026-10-21T21:20:25.37051+08:00",
+    "ForcedSortName": "老江湖",
+    "GenreItems": [
+      {
+        "Id": "g28",
+        "Name": "动作"
+      },
+      {
+        "Id": "g35",
+        "Name": "喜剧"
+      },
+      {
+        "Id": "g80",
+        "Name": "犯罪"
+      }
+    ],
+    "Genres": [
+      "动作",
+      "喜剧",
+      "犯罪"
+    ],
+    "Id": "m01M5F9XGRT6W7CKCZ6NVEX2KCB",
+    "ImageTags": {
+      "Logo": "l01M5F9XGRT6W7CKCZ6NVEX2KCB",
+      "Primary": "p01M5F9XGRT6W7CKCZ6NVEX2KCB"
+    },
+    "IsFolder": false,
+    "MediaType": "Video",
+    "Name": "老江湖",
+    "OriginalTitle": "老江湖",
+    "Overview": "　　一起平平无奇的失窃案，却让即将退休的老警井有正（于谦 饰）发现了蹊跷。随着调",
+    "PremiereDate": "2026-09-25T00:00:00.0000000Z",
+    "ProductionYear": 2026,
+    "ProviderIds": {
+      "Imdb": "tt28100233",
+      "Tmdb": "1086176"
+    },
+    "RunTimeTicks": 60000000000,
+    "SortName": "老江湖",
+    "Status": "Released",
+    "Type": "Movie",
+    "UserData": {
+      "IsFavorite": false,
+      "ItemId": "m01M5F9XGRT6W7CKCZ6NVEX2KCB",
+      "PlayCount": 0,
+      "PlaybackPositionTicks": 0,
+      "Played": false
+    }
+  }
+]
